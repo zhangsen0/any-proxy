@@ -1,6 +1,6 @@
 import { cors, isText, esc, isNavigation, isFingerprinted } from './util.js';
 import { CROSS_PREFIX, mapAbsoluteUrl, rewriteContent, contentKind } from './url.js';
-import { injectLinkFix, buildDocWritePage } from './inject.js';
+import { injectLinkFix, buildDocWritePage, rewriteLocations } from './inject.js';
 
 // 反向代理核心：请求转发、响应重写、WebSocket 透传
 
@@ -356,7 +356,7 @@ async function proxyRequest(request, site, crossHost, ctx) {
       ? cachedHtmlRewrite(site, crossHost, url, text, sitePrefix, base)
       : rewriteContent(text, site, sitePrefix, base, 'html');
   } else {
-    rewritten = isJsFile ? text : rewriteContent(text, site, sitePrefix, base, kind);
+    rewritten = isJsFile ? rewriteLocations(text) : rewriteContent(text, site, sitePrefix, base, kind);
   }
   if (isNavHtml) {
     return new Response(rewritten, { status: upstream.status, headers: headersOut });
