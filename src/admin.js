@@ -5,6 +5,20 @@ import { autoUpdatePreferredDns, filterUsableIps, applyDnsWithSelfCheck } from '
 
 const DEFAULT_PREF_DOMAINS = ['www.cloudflare.com', 'speed.cloudflare.com', 'time.cloudflare.com', 'one.one.one.one', 'www.gstatic.com', 'cdn.jsdelivr.net'];
 
+/**
+ * 与 edgetunnel 订阅密钥保持一致：MD5MD5(文本) = MD5(MD5(文本).hex.slice(7,27)) 的小写十六进制。
+ * 订阅 token = MD5MD5(host + UUID)，host 取请求 hostname（vless.js 在未配置 HOST 变量时的同一口径）。
+ * 禁止硬编码 token：订阅密钥随域名/UUID 变化，写死必然失配。
+ */
+async function md5Hex(s) {
+  const buf = await crypto.subtle.digest('MD5', new TextEncoder().encode(s));
+  return [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, '0')).join('');
+}
+async function md5md5(s) {
+  const first = await md5Hex(s);
+  return (await md5Hex(first.slice(7, 27))).toLowerCase();
+}
+
 // 站点管理：REST API + 服务端渲染的管理页
 
 async function handleAdmin(request, url, env) {
@@ -95,20 +109,24 @@ async function handleAdmin(request, url, env) {
 
   // GET /__api/preferred-candidates -> 从 sub 订阅链接拉取节点 IP 作为浏览器优选候选（不暴露 token）
   if (request.method === 'GET' && path === '/__api/preferred-candidates') {
-    const SUB_TOKEN = 'd662b808e0a23961eb81ce8d40647f4d';
+    // 订阅 token 与 edgetunnel 保持同一口径：MD5MD5(host + UUID)，host = 请求 hostname（未配 HOST 变量时）
+    let subToken = '';
+    try { subToken = await md5md5(`${url.hostname}${env.UUID || ''}`); } catch {}
     const ips = [];
-    try {
-      const sub = await fetch(`https://proxy.520215.xyz/sub?token=${SUB_TOKEN}`, { headers: { 'User-Agent': 'Mozilla/5.0' }, signal: AbortSignal.timeout(8000) });
-      const text = await sub.text();
-      let raw = text.trim();
+    if (subToken) {
       try {
-        if (!raw.includes('vless://')) raw = atob(raw.replace(/-/g, '+').replace(/_/g, '/'));
+        const sub = await fetch(`${url.origin}/sub?token=${subToken}`, { headers: { 'User-Agent': 'Mozilla/5.0' }, signal: AbortSignal.timeout(8000) });
+        const text = await sub.text();
+        let raw = text.trim();
+        try {
+          if (!raw.includes('vless://')) raw = atob(raw.replace(/-/g, '+').replace(/_/g, '/'));
+        } catch {}
+        for (const line of raw.split(/\r?\n/)) {
+          const m = line.match(/@([^:]+):/);
+          if (m && m[1] && /^\d{1,3}(\.\d{1,3}){3}$/.test(m[1]) && !ips.includes(m[1])) ips.push(m[1]);
+        }
       } catch {}
-      for (const line of raw.split(/\r?\n/)) {
-        const m = line.match(/@([^:]+):/);
-        if (m && m[1] && /^\d{1,3}(\.\d{1,3}){3}$/.test(m[1]) && !ips.includes(m[1])) ips.push(m[1]);
-      }
-    } catch {}
+    }
     return json({ ok: true, ips: ips.slice(0, 40) });
   }
 

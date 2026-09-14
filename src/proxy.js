@@ -59,6 +59,39 @@ async function serveCached(ctx, cacheKey, build) {
 }
 
 /**
+ * 请求头值通用还原：把 header 值里出现的代理地址形态还原为目标站地址形态——
+ *   - 跨域通道 https://<代理host>/p/<id>/__x/<host>/<path> -> https://<host>/<path>
+ *   - 主通道   https://<代理host>/p/<id>/<path>            -> <targetBase>/<path>
+ *   - URL 编码（%2Fp%2F<id>...）与无协议变体一并处理
+ * 与路径/body 还原共用同一套前缀规则，不针对任何站点。
+ */
+function restoreHeaderValue(s, proxyHost, sitePrefix, targetBase, targetHost) {
+  if (typeof s !== 'string' || !s) return s;
+  const escHost = proxyHost.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  let out = s;
+  // 跨域通道（必须最先处理，避免被主通道前缀拆分误伤）
+  out = out.replace(
+    new RegExp(`https?://${escHost}${sitePrefix}${CROSS_PREFIX}([^/\\s"']+)(/[^\\s"']*)?`, 'g'),
+    (_m, h, p) => `https://${h}${p || ''}`
+  );
+  out = out.replace(
+    new RegExp(`${escHost}${sitePrefix}${CROSS_PREFIX}([^/\\s"']+)(/[^\\s"']*)?`, 'g'),
+    (_m, h, p) => `${h}${p || ''}`
+  );
+  // 主通道：带协议
+  out = out.split(`https://${proxyHost}${sitePrefix}`).join(targetBase);
+  out = out.split(`http://${proxyHost}${sitePrefix}`).join(targetBase);
+  // URL 编码形式
+  const encAll = encodeURIComponent(sitePrefix);
+  out = out.split(`https://${proxyHost}${encAll}`).join(targetBase);
+  out = out.split(`http://${proxyHost}${encAll}`).join(targetBase);
+  // 无协议（host + 前缀）
+  out = out.split(`${proxyHost}${sitePrefix}`).join(targetHost);
+  out = out.split(`${proxyHost}${encAll}`).join(targetHost);
+  return out;
+}
+
+/**
  * 反向代理核心：把请求转发到目标站，并把响应内容里的 URL 映射回代理命名空间。
  *
  * 通用性约定（不含任何站点 / 域名 / 路径的特判）：
@@ -126,6 +159,16 @@ async function proxyRequest(request, site, crossHost, ctx) {
       headers.set('Referer', targetBase + restoreProxyPath(ref.pathname) + restoreProxyPath(ref.search));
     } catch {}
   }
+  // 通用还原：请求头值里可能夹带代理地址（防盗链、回跳参数等），全部还原为目标域，
+  // 与路径/body 还原共用同一套前缀规则，不针对任何站点、不修改 Host 与长度等数值头。
+  try {
+    headers.forEach((value, key) => {
+      if (key === 'Host' || key === 'Content-Length' || !value) return;
+      const fixed = restoreHeaderValue(value, url.host, sitePrefix, targetBase, targetHost);
+      if (fixed !== value) headers.set(key, fixed);
+    });
+  } catch {}
+
   // 强制上游返回未压缩明文：避免 br/deflate 等编码在读取 body 后与响应头不一致。
   // 内容若被改写，body 已解压，头上的 content-encoding 会变成谎言（浏览器按压缩去解明文 → 全部资源解析失败）。
   headers.set('Accept-Encoding', 'identity');
@@ -200,6 +243,13 @@ async function proxyRequest(request, site, crossHost, ctx) {
   headersOut.delete('Content-Security-Policy');
   headersOut.delete('Content-Security-Policy-Report-Only');
   headersOut.delete('X-Frame-Options');
+  // 代理场景下必然失效/有害的策略头一并清掉：
+  // COEP/CORP 会阻断跨域资源加载，COOP 影响 window.open 的窗口引用，Permissions-Policy 可能限制摄像头等授权
+  headersOut.delete('Cross-Origin-Embedder-Policy');
+  headersOut.delete('Cross-Origin-Embedder-Policy-Report-Only');
+  headersOut.delete('Cross-Origin-Resource-Policy');
+  headersOut.delete('Cross-Origin-Opener-Policy');
+  headersOut.delete('Permissions-Policy');
   rewriteSetCookies(headersOut, upstream, base.prefix);
 
   const ct = headersOut.get('content-type') || '';
@@ -241,7 +291,24 @@ async function proxyRequest(request, site, crossHost, ctx) {
     return new Response(upstream.body, { status: upstream.status, headers: headersOut });
   }
 
-  const text = await upstream.text();
+  // 编码检测：上游非 utf-8（gb2312/GBK 等老站）必须按实际编码解码，否则全文乱码。
+  // 顺序：Content-Type charset -> HTML <meta> charset -> utf-8 兜底。
+  const raw = await upstream.arrayBuffer();
+  let enc = 'utf-8';
+  const ctCharset = ct.match(/charset=([^\s;]+)/i);
+  if (ctCharset) enc = ctCharset[1];
+  else if (isHtml) {
+    try {
+      // meta 标签在 ASCII 范围内，任何编码下前 2KB 都能以 utf-8 预读定位
+      const head = new TextDecoder('utf-8').decode(raw.slice(0, 2048));
+      const metaCharset = head.match(/<meta[^>]+charset\s*=\s*["']?\s*([^\s"';>]+)/i);
+      if (metaCharset) enc = metaCharset[1];
+    } catch {}
+  }
+  let text;
+  try { text = new TextDecoder(enc).decode(raw); } catch { text = new TextDecoder('utf-8').decode(raw); }
+  // 解码后统一声明 utf-8，避免浏览器按上游原始 charset 二次解码已转码的文本
+  if (ct.includes('charset=')) headersOut.set('Content-Type', ct.replace(/charset=[^\s;]+/i, 'charset=utf-8'));
 
   // 关键：body 已被 upstream.text() 解压成明文，必须清掉压缩头与旧长度，
   // 否则浏览器按 gzip 去解明文 → 全部 JS/CSS 解析失败 → 页面永远停在加载态、按钮全死。
