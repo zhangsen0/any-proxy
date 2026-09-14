@@ -1,0 +1,344 @@
+import { cors, isText, esc, isNavigation, isFingerprinted } from './util.js';
+import { CROSS_PREFIX, mapAbsoluteUrl, rewriteContent, contentKind } from './url.js';
+import { injectLinkFix } from './inject.js';
+
+// 反向代理核心：请求转发、响应重写、WebSocket 透传
+
+/**
+ * 反向代理核心：把请求转发到目标站，并把响应内容里的 URL 映射回代理命名空间。
+ *
+ * 通用性约定（不含任何站点 / 域名 / 路径的特判）：
+ *   - 主通道   /p/<id>/<path>              -> 站点自身域
+ *   - 跨域通道 /p/<id>/__x/<host>/<path>   -> 任意第三方域（页面用到的任何外部资源/接口）
+ * 两套通道共用同一套重写规则，因此任何站点的资源、接口、跳转都会留在代理内，不会被浏览器直连。
+ */
+async function proxyRequest(request, site, crossHost) {
+  const url = new URL(request.url);
+  const sitePrefix = `/p/${site.id}`;
+  // origin = 代理自身对外地址。脚本上下文的 URL 需要补成绝对地址（见 url.js absOnOrigin）
+  const base = crossHost
+    ? { host: crossHost, prefix: `${sitePrefix}${CROSS_PREFIX}${crossHost}`, origin: url.origin }
+    : { host: site.host, prefix: sitePrefix, origin: url.origin };
+
+  // 去掉通道前缀后剩下的就是原始路径
+  let rest = url.pathname.slice(base.prefix.length);
+  if (!rest.startsWith('/')) rest = '/';
+  // 自愈：历史链接 / 源站回传可能让前缀重复出现（/p/<id>/p/<id>/xxx），
+  // 逐层剥掉多余的前缀，保证最终送到源站的始终是干净路径
+  while (rest.startsWith(sitePrefix + '/') || rest === sitePrefix) {
+    rest = rest.slice(sitePrefix.length) || '/';
+  }
+
+  const scheme = crossHost ? 'https' : (site.scheme || 'https');
+  const targetHost = base.host;
+  const targetBase = `${scheme}://${targetHost}`;
+
+  /**
+   * 把字符串里回传的代理路径还原为目标站路径（通用，不针对任何站点）。
+   * 场景：页面上的回跳参数（return_to / next / redirect / callback ...）被重写成了
+   * /p/<id>/xxx，表单提交或跳转时又原样带回源站；源站不认识这个前缀，
+   * 会把它当站内路径再拼一次 -> /p/<id>/p/<id>/xxx -> 404。
+   * 同时处理未编码（/p/id/xxx）与 URL 编码（%2Fp%2Fid%2Fxxx）两种形式。
+   */
+  function restoreProxyPath(s) {
+    if (typeof s !== 'string' || !s) return s;
+    let out = s;
+    out = out.split(sitePrefix + '/').join('/');
+    out = out.split(sitePrefix).join('');
+    // 编码形式：%2Fp%2F<id>%2Fxxx -> %2Fxxx
+    const encAll = encodeURIComponent(sitePrefix); // %2Fp%2Fgithub
+    out = out.split(encAll + '%2F').join('%2F');
+    out = out.split(encAll + '%2f').join('%2f');
+    out = out.split(encAll).join('');
+    // 小写编码变体
+    const encLower = encAll.replace(/%2F/g, '%2f');
+    if (encLower !== encAll) {
+      out = out.split(encLower + '%2f').join('%2f');
+      out = out.split(encLower).join('');
+    }
+    return out;
+  }
+
+  const targetSearch = restoreProxyPath(url.search);
+  const targetUrl = targetBase + rest + targetSearch;
+
+  const headers = new Headers(request.headers);
+  headers.set('Host', targetHost);
+  headers.set('Origin', targetBase);
+  if (headers.has('Referer')) {
+    try {
+      const ref = new URL(headers.get('Referer'));
+      // 浏览器侧的 Referer 指向代理域，还原成目标域，避免被上游按来源拒绝
+      headers.set('Referer', targetBase + restoreProxyPath(ref.pathname) + restoreProxyPath(ref.search));
+    } catch {}
+  }
+  // 强制上游返回未压缩明文：避免 br/deflate 等编码在读取 body 后与响应头不一致。
+  // 内容若被改写，body 已解压，头上的 content-encoding 会变成谎言（浏览器按压缩去解明文 → 全部资源解析失败）。
+  headers.set('Accept-Encoding', 'identity');
+  headers.delete('cf-connecting-ip');
+  headers.delete('cf-ray');
+  headers.delete('x-forwarded-for');
+
+  const reqInit = { method: request.method, headers, redirect: 'manual' };
+  if (request.method !== 'GET' && request.method !== 'HEAD') {
+    const ctype = request.headers.get('content-type') || '';
+    // 文本类请求体（登录表单等）里同样可能带回代理路径，一并还原为目标站路径；
+    // 二进制体（上传/媒体）原样透传，不做任何改动
+    if (/urlencoded|text\/|application\/(json|javascript|xml)|application\/x-www-form/i.test(ctype)) {
+      try {
+        const raw = await request.text();
+        const fixed = restoreProxyPath(raw);
+        if (fixed !== raw) {
+          reqInit.body = fixed;
+          headers.delete('content-length');
+        } else {
+          reqInit.body = raw;
+        }
+      } catch {
+        try { reqInit.body = await request.arrayBuffer(); } catch {}
+      }
+    } else {
+      try { reqInit.body = await request.arrayBuffer(); } catch {}
+    }
+  }
+
+  // 上游取一次；网络错误或 5xx/429 重试一次（不区分站点，纯传输层兜底）
+  let upstream = await fetchUpstream(targetUrl, reqInit);
+
+  /**
+   * 代理路径 -> 目标站绝对路径（用于 Location / Referer 还原）
+   *   /p/<id>/foo            -> https://site/foo
+   *   /p/<id>/__x/h/foo      -> https://h/foo
+   */
+  function mapToTargetPath(p) {
+    if (p.startsWith(sitePrefix + CROSS_PREFIX)) {
+      const tail = p.slice(sitePrefix.length + CROSS_PREFIX.length);
+      const i = tail.indexOf('/');
+      const host = i === -1 ? tail : tail.slice(0, i);
+      const path = i === -1 ? '/' : tail.slice(i);
+      return `https://${host}${path}`;
+    }
+    if (p === sitePrefix || p.startsWith(sitePrefix + '/')) return targetBase + p.slice(sitePrefix.length);
+    return targetBase + p;
+  }
+
+  // 重定向：一律折算回代理命名空间（站内走主通道，站外走跨域通道），保证跳转不脱离代理
+  if ([301, 302, 303, 307, 308].includes(upstream.status)) {
+    const loc = upstream.headers.get('Location');
+    if (loc) {
+      let newLoc = loc;
+      try {
+        const lu = new URL(loc, targetBase);
+        if (lu.protocol === 'http:' || lu.protocol === 'https:') {
+          newLoc = mapAbsoluteUrl(lu.toString(), site, sitePrefix, base);
+        }
+      } catch {}
+      const h = new Headers(upstream.headers);
+      rewriteSetCookies(h, upstream, base.prefix);
+      h.set('Location', newLoc);
+      cors(h);
+      return new Response(upstream.body, { status: upstream.status, headers: h });
+    }
+  }
+
+  const headersOut = new Headers(upstream.headers);
+  cors(headersOut);
+  headersOut.delete('Content-Security-Policy');
+  headersOut.delete('Content-Security-Policy-Report-Only');
+  headersOut.delete('X-Frame-Options');
+  rewriteSetCookies(headersOut, upstream, base.prefix);
+
+  const ct = headersOut.get('content-type') || '';
+  const isHtml = ct.includes('text/html');
+  // 只有 HTML 必须 no-store：每次都要拿到最新的重写结果与注入脚本。
+  // JS/CSS/图片若也 no-store，每次导航都得重下全部 bundle，页面会长时间停在加载态。
+  if (isHtml) {
+    headersOut.set('Cache-Control', 'no-store');
+    headersOut.delete('ETag');
+    headersOut.delete('Last-Modified');
+  } else if (upstream.status >= 200 && upstream.status < 300 && isFingerprinted(url.pathname)) {
+    // 内容寻址资源（文件名里带 hash 指纹）：内容一变文件名必变，可放长缓存。
+    // 命中即用浏览器缓存，重复访问不再回源、不再走一遍 Worker 重写。
+    headersOut.set('Cache-Control', 'public, max-age=31536000, immutable');
+  } else if (upstream.status >= 200 && upstream.status < 300) {
+    // 静态资源允许缓存，但覆盖源站的 immutable/超长 max-age：
+    // 一旦改写结果有问题，坏内容会被浏览器锁死一年无法恢复，短缓存 + SWR 兼顾速度与安全
+    headersOut.set('Cache-Control', 'public, max-age=3600, stale-while-revalidate=86400');
+  }
+
+  if (!isText(ct)) return new Response(upstream.body, { status: upstream.status, headers: headersOut });
+
+  // HEAD / 204 / 304 没有正文可改写，直接回源响应，省掉一次无意义的读取 + 全量正则
+  if (request.method === 'HEAD' || upstream.status === 204 || upstream.status === 304) {
+    return new Response(upstream.body, { status: upstream.status, headers: headersOut });
+  }
+
+  // 超大文本直通：整体正则改写会打爆 Worker 的 CPU/内存预算，导致请求超时（页面一直转圈）。
+  // 这类文件通常是单个大 bundle，其内部的绝对 URL 由前端注入脚本的运行时 hook 兜底。
+  const declaredLen = parseInt(upstream.headers.get('content-length') || '0', 10);
+  if (declaredLen > (isHtml ? 3 * 1024 * 1024 : 512 * 1024)) {
+    return new Response(upstream.body, { status: upstream.status, headers: headersOut });
+  }
+
+  const text = await upstream.text();
+
+  // 关键：body 已被 upstream.text() 解压成明文，必须清掉压缩头与旧长度，
+  // 否则浏览器按 gzip 去解明文 → 全部 JS/CSS 解析失败 → 页面永远停在加载态、按钮全死。
+  headersOut.delete('content-encoding');
+  headersOut.delete('content-length');
+
+  const rewritten = rewriteContent(text, site, sitePrefix, base, contentKind(ct));
+  if (isHtml) {
+    // 运行时映射脚本只给「导航文档」注入：XHR/turbo 拉取的 HTML 片段不再重复带 9KB 脚本，
+    // 页面级的注入脚本会持续修复运行时插入的 DOM，行为一致但省掉大量冗余字节
+    if (!isNavigation(request)) return new Response(rewritten, { status: upstream.status, headers: headersOut });
+    return new Response(injectLinkFix(rewritten, site, sitePrefix, base), { status: upstream.status, headers: headersOut });
+  }
+  return new Response(rewritten, { status: upstream.status, headers: headersOut });
+}
+
+/**
+ * 上游 Set-Cookie 落地到代理域：
+ *   - 去掉 Domain（变为 host-only，浏览器才会存到代理域）
+ *   - Path 收敛到该通道前缀，避免不同站点/不同域的 cookie 互相覆盖
+ *   - 逐个输出，绝不合并成逗号分隔头（浏览器解析会丢 cookie）
+ */
+function rewriteSetCookies(out, upstream, cookiePath) {
+  let list = [];
+  try {
+    if (typeof upstream.headers.getSetCookie === 'function') list = upstream.headers.getSetCookie() || [];
+  } catch {}
+  if (!list.length) {
+    const raw = upstream.headers.get('Set-Cookie');
+    if (!raw) return;
+    list = raw.split(/,(?=\s*[A-Za-z_][A-Za-z0-9_.-]*\s*=)/).map(s => s.trim()).filter(Boolean);
+  }
+  if (!list.length) return;
+  out.delete('Set-Cookie');
+  for (const sc of list) {
+    const name = (sc.split('=')[0] || '').trim();
+    // __Host- 前缀 cookie 按规范必须 Path=/ 且无 Domain，改 Path 会被浏览器丢弃（登录态存不住）
+    const path = /^__host-/i.test(name) ? '/' : cookiePath;
+    out.append('Set-Cookie', sc.replace(/;\s*Domain=[^;]+/gi, '').replace(/;\s*Path=[^;]*/gi, '') + `; Path=${path}`);
+  }
+}
+
+/** 上游请求：失败重试一次（网络抖动 / 瞬时 5xx / 限流）；HTTPS 不可用时回退 HTTP（自签或纯 HTTP 源站） */
+
+/** 上游请求：失败重试一次（网络抖动 / 瞬时 5xx / 限流）；HTTPS 不可用时回退 HTTP（自签或纯 HTTP 源站） */
+async function fetchUpstream(targetUrl, reqInit) {
+  let res = null;
+  try {
+    res = await fetch(targetUrl, reqInit);
+    if (res.status >= 500 || res.status === 429) {
+      await new Promise(r => setTimeout(r, 300));
+      res = await fetch(targetUrl, reqInit);
+    }
+  } catch (e) {
+    try {
+      await new Promise(r => setTimeout(r, 300));
+      res = await fetch(targetUrl, reqInit);
+    } catch (e2) {
+      if (targetUrl.startsWith('https://')) {
+        try { return await fetch(targetUrl.replace(/^https:/, 'http:'), reqInit); } catch (e3) {}
+      }
+      throw e2;
+    }
+  }
+  return res;
+}
+
+/**
+ * 后端 HTML 转义（Worker 侧使用，与前端同名函数互不影响）
+ */
+
+function friendlyError(title, msg, retryUrl, status = 502, isDoc = true) {
+  // 非导航请求（脚本/样式/接口等）一律静默失败：
+  // 返回 HTML 会被浏览器当 JS 解析，报 "Unexpected token '<'" 并连同样式/功能一起挂掉
+  if (!isDoc) return new Response(null, { status: 204, headers: { 'Cache-Control': 'no-store' } });
+const retry = retryUrl
+    ? `<a href="${esc(retryUrl)}" style="display:inline-block;background:#2563eb;color:#fff;border-radius:8px;padding:10px 20px;text-decoration:none;font-size:14px;font-weight:600;margin-right:10px;">重试</a>`
+    : '';
+  const html = `<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>${esc(title)} · Any-Proxy</title>
+<style>body{margin:0;font-family:-apple-system,"PingFang SC","Microsoft YaHei",system-ui,sans-serif;background:#f4f6fb;color:#0f172a;min-height:100vh;display:flex;align-items:center;justify-content:center}.box{max-width:520px;background:#fff;border:1px solid #e2e8f0;border-radius:14px;padding:32px 28px;text-align:center}h1{font-size:20px;margin:0 0 12px}p{color:#64748b;font-size:14px;line-height:1.8;word-break:break-all}.links{margin-top:24px}</style>
+</head><body><div class="box"><h1>${esc(title)}</h1><p>${msg}</p><div class="links">${retry}<a href="/" style="display:inline-block;background:transparent;color:#2563eb;border:1px solid #2563eb;border-radius:8px;padding:10px 20px;text-decoration:none;font-size:14px;">← 返回主页</a></div></div></body></html>`;
+  return new Response(html, {
+    status: status,
+    headers: { 'Content-Type': 'text/html; charset=utf-8' },
+  });
+}
+
+/**
+ * 为 edgetunnel 管理面板 / 登录页注入「返回主页」入口，方便回到统一入口。
+ * 优先注入到面板顶部导航（header-buttons），避免被页面 JS 重绘移除；登录页无导航则退回 body 末尾。
+ */
+
+/**
+ * WebSocket 透传：客户端 Upgrade 请求 -> 入站 WebSocketPair -> 出站 WebSocket 到目标站 -> 双向转发。
+ * 主通道与跨域通道（__x）一视同仁，任何目标域的实时通信都经此转发。
+ */
+async function handleWebSocket(request, site, crossHost) {
+  const url = new URL(request.url);
+  const sitePrefix = `/p/${site.id}`;
+  const base = crossHost
+    ? { host: crossHost, prefix: `${sitePrefix}${CROSS_PREFIX}${crossHost}`, origin: url.origin }
+    : { host: site.host, prefix: sitePrefix, origin: url.origin };
+  let rest = url.pathname.slice(base.prefix.length);
+  if (!rest.startsWith('/')) rest = '/';
+  const targetHost = base.host;
+  const targetWs = `wss://${targetHost}${rest}${url.search}`;
+  const pair = new WebSocketPair();
+  const client = pair[0];
+  const server = pair[1];
+  server.accept();
+
+  // 出站 WebSocket 需要的请求头
+  const wsHeaders = {};
+  const ua = request.headers.get('User-Agent');
+  if (ua) wsHeaders['User-Agent'] = ua;
+  const auth = request.headers.get('Authorization');
+  if (auth) wsHeaders.Authorization = auth;
+  const cookie = request.headers.get('Cookie');
+  if (cookie) wsHeaders.Cookie = cookie;
+  const origin = request.headers.get('Origin');
+  wsHeaders.Origin = `https://${targetHost}`;
+
+  let upstream = null;
+  try {
+    upstream = new WebSocket(targetWs, [], wsHeaders);
+  } catch (e) {
+    // 目标不支持 wss 时回退明文 ws（通用传输层回退）
+    try { upstream = new WebSocket(targetWs.replace(/^wss:/, 'ws:'), [], wsHeaders); } catch (e2) {}
+  }
+  if (!upstream) {
+    try { server.close(1011, 'upstream ws failed'); } catch (e2) {}
+    return new Response(null, { status: 101, webSocket: client });
+  }
+
+  // 双向消息转发
+  server.addEventListener('message', (ev) => {
+    if (upstream.readyState === 1) {
+      try { upstream.send(ev.data); } catch (e) {}
+    }
+  });
+  upstream.addEventListener('message', (ev) => {
+    if (server.readyState === 1) {
+      try { server.send(ev.data); } catch (e) {}
+    }
+  });
+  server.addEventListener('close', () => {
+    try { upstream.close(); } catch (e) {}
+  });
+  upstream.addEventListener('close', () => {
+    try { server.close(); } catch (e) {}
+  });
+  upstream.addEventListener('error', () => {
+    try { server.close(); } catch (e) {}
+  });
+
+  return new Response(null, { status: 101, webSocket: client });
+}
+
+export { proxyRequest, rewriteSetCookies, fetchUpstream, friendlyError, handleWebSocket };

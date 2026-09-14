@@ -1,0 +1,95 @@
+name: Diagnose Proxy Output
+
+on:
+  workflow_dispatch:
+
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install puppeteer
+        working-directory: ${{ github.workspace }}
+        run: |
+          npm init -y >/dev/null 2>&1
+          echo "安装 puppeteer..."
+          npm i puppeteer@23 2>&1 | tail -5
+          echo "--- 校验 ---"
+          node -e "require.resolve('puppeteer'); console.log('puppeteer 可用')" || echo "puppeteer 不可用"
+
+      - name: Browser render test (capture console errors)
+        working-directory: ${{ github.workspace }}
+        run: |
+          cat > check.mjs <<'EOF'
+          import puppeteer from 'puppeteer';
+
+          const targets = [
+            'https://proxy.520215.xyz/p/github/zhangsen0/any-proxy',
+            'https://proxy.520215.xyz/p/github/',
+          ];
+
+          const browser = await puppeteer.launch({
+            args: ['--no-sandbox', '--disable-dev-shm-usage'],
+          });
+
+          for (const url of targets) {
+            console.log('\n==========================================');
+            console.log('页面: ' + url);
+            console.log('==========================================');
+            const page = await browser.newPage();
+            await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
+
+            const errs = [], failed = [], bad = [];
+            page.on('console', m => { if (m.type() === 'error') errs.push(m.text().slice(0, 200)); });
+            page.on('pageerror', e => errs.push('PAGEERROR: ' + String(e).slice(0, 200)));
+            page.on('requestfailed', r => failed.push(r.url().slice(0, 120) + ' :: ' + (r.failure()?.errorText || '')));
+            page.on('response', r => {
+              if (r.status() >= 400) bad.push(r.status() + ' ' + r.url().slice(0, 120));
+            });
+
+            await page.goto(url, { waitUntil: 'networkidle2', timeout: 90000 })
+              .catch(e => console.log('goto 异常: ' + e.message.slice(0, 120)));
+            await new Promise(r => setTimeout(r, 8000));
+
+            const info = await page.evaluate(() => ({
+              title: document.title,
+              finalUrl: location.href,
+              stuckLoading: document.body.innerText.includes('One moment please'),
+              bodyTextStart: document.body.innerText.trim().slice(0, 150),
+              scriptCount: document.scripts.length,
+              // React 挂载信号：README 渲染 / react root 有内容
+              hasReadme: !!document.querySelector('article.markdown-body, #readme, [data-target="readme-toc"]'),
+              reactPartials: document.querySelectorAll('[data-target="react-partial"]').length,
+              embeddedData: document.querySelectorAll('script[type="application/json"]').length,
+              buttons: document.querySelectorAll('button').length,
+              links: document.querySelectorAll('a[href]').length,
+              // 检查是否存在注入的映射脚本标识
+              hasHook: typeof window.fetch === 'function' && String(window.fetch).includes('fix'),
+            })).catch(e => ({ err: String(e).slice(0, 150) }));
+
+            console.log('渲染状态: ' + JSON.stringify(info, null, 2));
+            console.log('\n控制台错误 (' + errs.length + '):');
+            errs.slice(0, 15).forEach(e => console.log('  ✗ ' + e));
+            console.log('请求失败 (' + failed.length + '):');
+            failed.slice(0, 15).forEach(f => console.log('  ✗ ' + f));
+            console.log('HTTP >=400 (' + bad.length + '):');
+            bad.slice(0, 15).forEach(b => console.log('  ✗ ' + b));
+
+            await page.close();
+          }
+          await browser.close();
+          EOF
+          node check.mjs 2>&1 | tee /tmp/diag.txt | tail -120
+        continue-on-error: true
+
+      - name: Upload result
+        uses: actions/upload-artifact@v4
+        with:
+          name: diag-result
+          path: /tmp/diag.txt

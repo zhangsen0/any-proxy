@@ -1,0 +1,52 @@
+name: Verify (Cloud)
+
+# 云端自动化校验：单元测试（每次 push）+ 线上端到端校验（部署完成后 / 定时巡检 / 手动）。
+# 本地无需任何环境，所有验证都在 GitHub Actions 上跑。
+on:
+  push:
+    branches: [master]
+  # 部署工作流结束后立即做一次线上校验（push 时部署还没生效，因此 e2e 靠这个触发）
+  workflow_run:
+    workflows: ["Deploy to Cloudflare Workers"]
+    types: [completed]
+  # 定时巡检：线上被改坏（脚本语法损坏 / 按钮点不动）能及时发现
+  schedule:
+    - cron: '23 */6 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: verify
+  cancel-in-progress: true
+
+jobs:
+  # 1) 重写规则单元测试：锁死「JS 注释不能被当成 URL 改写」这类回归
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: 重写规则校验
+        run: node tools/check-rewrite.mjs
+
+  # 2) 线上端到端校验：真实浏览器渲染 + 点击，覆盖「页面能打开但按钮点不动」这类只有跑起来才暴露的问题
+  e2e:
+    needs: unit
+    # push 触发时部署尚未生效，交给 workflow_run 触发的这次来验
+    if: github.event_name != 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: 安装浏览器
+        run: npm i puppeteer@23 --no-audit --no-fund 2>&1 | tail -3
+      - name: 等待部署生效
+        run: sleep 40
+      - name: 线上校验
+        env:
+          PROXY_HOST: ${{ vars.PROXY_HOST || 'proxy.520215.xyz' }}
+        run: node tools/check-e2e.mjs

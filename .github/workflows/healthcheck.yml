@@ -1,0 +1,146 @@
+name: Health Check & Auto Repair
+
+# 定时健康检查：runner 从外部网络真实访问 proxy.520215.xyz，
+# 若 A 记录中的 IP 出现 1034（Edge IP Restricted）/不可达，自动扫描 CF 泛播候选、
+# 重写「已验证可用集」(GOOD_IPS) 与 A 记录，实现自动自愈。
+# 优选池的读写一律经 Worker 公开 API（/__api/pool-config、/__api/preferred-ips），
+# 存储后端（KV / D1）由 Worker 侧 STORAGE_BACKEND 统一决定，健康检查不依赖 KV Namespace。
+on:
+  schedule:
+    # 每 12 小时第 17 分钟触发（UTC）；也可在 Actions 页手动触发（workflow_dispatch）
+    - cron: '17 */12 * * *'
+  workflow_dispatch:   # 支持手动触发
+
+jobs:
+  healthcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Health check & auto repair
+        env:
+          CF_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CF_ZONE_ID: ${{ secrets.CF_ZONE_ID }}
+          # 写回 GOOD_IPS 需经 Worker 登录（管理口令），存储后端无关
+          PASSWORD: ${{ secrets.PASSWORD }}
+          # 候选域名池（改 DNS 用的域名）可在 GitHub 仓库 Settings→Secrets and variables→Actions→Variables 配置 PREF_DOMAINS
+          PREF_DOMAINS_VAR: ${{ vars.PREF_DOMAINS }}
+          # 反代域名（健康检查验证/修复的域名）可在 Actions→Variables 配置 PROXY_HOST；留空回退 proxy.520215.xyz
+          PROXY_HOST: ${{ vars.PROXY_HOST }}
+        run: |
+          set -e
+          ZONE="$CF_ZONE_ID"
+          HOST="${PROXY_HOST:-proxy.520215.xyz}"
+          echo "健康检查域名: $HOST"
+          AUTH="Authorization: Bearer $CF_API_TOKEN"
+          BASE="https://api.cloudflare.com/client/v4"
+
+          # ---- 1) 读取当前 A 记录并逐个真实验证（curl --resolve = SNI=域名，能暴露 1034）----
+          echo "== 当前 A 记录 =="
+          IPS=$(curl -s -m 15 -H "$AUTH" "$BASE/zones/$ZONE/dns_records?name=$HOST&type=A" \
+            | python3 -c "import sys,json;[print(r['content']) for r in json.load(sys.stdin).get('result',[])]")
+          echo "$IPS"
+          BAD=""
+          while IFS= read -r ip; do
+            [ -z "$ip" ] && continue
+            code=$(curl -s -m 8 --resolve "$HOST:443:$ip" -o /dev/null -w "%{http_code}" "https://$HOST/__api/config" || echo 000)
+            echo "  $ip -> $code"
+            [ "$code" != "200" ] && BAD=1
+          done <<< "$IPS"
+
+          if [ -z "$BAD" ]; then
+            echo "✅ 健康：所有 A 记录均返回 200，无需处理"
+            exit 0
+          fi
+          echo "⚠️ 检测到异常 IP（1034/不可达），开始自动修复…"
+
+          # ---- 2) 候选从「优选 IP 池」获取：经 Worker 公开 API 读取（GOOD_IPS / PREF_IPS / PREF_DOMAINS），
+          #      存储后端由 Worker 侧统一选择，不再直连 KV Namespace ----
+          TS=$(date +%s)
+          POOL=$(curl -s -m 10 "https://$HOST/__api/pool-config?t=$TS" || true)
+          GOOD_API=$(echo "$POOL" | python3 -c "import sys,json;d=json.load(sys.stdin);print(' '.join(d.get('good_ips',[])))" 2>/dev/null || true)
+          DOMAINS_API=$(echo "$POOL" | python3 -c "import sys,json;d=json.load(sys.stdin);print(' '.join(d.get('pref_domains',[])))" 2>/dev/null || true)
+          ADD_API=$(curl -s -m 10 "https://$HOST/__api/preferred-ips?t=$TS" | python3 -c "import sys,json;d=json.load(sys.stdin);print(' '.join(d.get('ips',[])))" 2>/dev/null || true)
+          CAND=$(echo "$GOOD_API $ADD_API" | tr ' ' '\n' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | sort -u | tr ' ' '\n')
+          echo "优选 IP 池候选: $(echo $CAND | wc -w) 个"
+          # 池不足时兜底：解析候选域名池得到动态 IP（不写死 IP 列表）。
+          # 配置优先级：GitHub 仓库变量 PREF_DOMAINS（Settings→Variables）→ Worker 侧 PREF_DOMAINS（面板可配）→ 内置兜底（下行）
+          if [ "$(echo $CAND | wc -w)" -lt 5 ]; then
+            PREF_DOMAINS="$PREF_DOMAINS_VAR"
+            if [ -z "$PREF_DOMAINS" ]; then
+              PREF_DOMAINS="$DOMAINS_API"
+            fi
+            [ -z "$PREF_DOMAINS" ] && PREF_DOMAINS="www.cloudflare.com speed.cloudflare.com time.cloudflare.com one.one.one.one www.gstatic.com cdn.jsdelivr.net"
+            for d in $PREF_DOMAINS; do
+              CAND="$CAND $(getent ahostsv4 "$d" 2>/dev/null | awk '{print $1}' | sort -u)"
+            done
+            CAND=$(echo "$CAND" | tr ' ' '\n' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | sort -u | tr ' ' '\n')
+            echo "域名解析兜底后候选: $(echo $CAND | wc -w) 个"
+          fi
+          if [ -z "$CAND" ]; then
+            echo "❌ 无任何可扫描候选，跳过本次修复"
+            exit 1
+          fi
+          GOOD=""
+          for ip in $CAND; do
+            (
+              code=$(curl -s -m 6 --resolve "$HOST:443:$ip" -o /dev/null -w "%{http_code}" "https://$HOST/__api/config" || echo 000)
+              if [ "$code" = "200" ]; then echo "$ip" >> /tmp/good_ips.txt; fi
+            ) &
+            # 限制并发 10
+            while [ "$(jobs -r | wc -l)" -ge 10 ]; do wait -n; done
+          done
+          wait
+          if [ -f /tmp/good_ips.txt ]; then
+            GOOD=$(sort -u /tmp/good_ips.txt | head -6 | tr ' ' '\n')
+          fi
+          echo "扫描到可用 IP: ${GOOD:-无}"
+          if [ -z "$GOOD" ]; then
+            echo "❌ 未找到任何可用 IP，保留当前记录，请人工介入"
+            exit 1
+          fi
+
+          # ---- 3) 重写已验证可用集 GOOD_IPS：登录后经 Worker API 写入（后端 KV / D1 均一致）----
+          COOKIE=""
+          if [ -n "$PASSWORD" ]; then
+            COOKIE=$(curl -s -m 10 -c - -X POST -H "Content-Type: application/json" \
+              -d "{\"password\":\"$PASSWORD\"}" "https://$HOST/__api/login" | grep ap_auth | awk '{print $6"="$7}' || true)
+          fi
+          if [ -z "$COOKIE" ]; then
+            echo "⚠️ 无法登录 Worker，GOOD_IPS 未写回（候选池将只依赖域名解析兜底）"
+          else
+            GOOD_BODY=$(python3 -c "import sys,json;print(json.dumps({'good_ips': sys.stdin.read().split()}))" <<< "$GOOD")
+            curl -s -m 15 -X POST -H "Content-Type: application/json" -H "Cookie: $COOKIE" \
+              -d "$GOOD_BODY" "https://$HOST/__api/pool-config" -o /dev/null -w "GOOD_IPS 更新: %{http_code}\n"
+          fi
+
+          # ---- 4) 更新 A 记录（前 2 个可用 IP）----
+          RECS=$(curl -s -m 15 -H "$AUTH" "$BASE/zones/$ZONE/dns_records?name=$HOST&type=A" \
+            | python3 -c "import sys,json;[print(r['id']) for r in json.load(sys.stdin).get('result',[])]")
+          NEW_IPS=$(echo "$GOOD" | tr ' ' '\n' | head -2)
+          i=0
+          for rid in $RECS; do
+            newip=$(echo "$NEW_IPS" | sed -n "$((i+1))p")
+            if [ -n "$newip" ]; then
+              curl -s -m 15 -X PATCH -H "$AUTH" -H "Content-Type: application/json" \
+                "$BASE/zones/$ZONE/dns_records/$rid" \
+                -d "{\"content\":\"$newip\",\"name\":\"$HOST\",\"type\":\"A\",\"ttl\":300,\"proxied\":false}" \
+                -o /dev/null -w "A 记录 $((i+1)) -> $newip: %{http_code}\n"
+            fi
+            i=$((i+1))
+          done
+
+          # ---- 5) 等 DNS 生效后复验 ----
+          echo "等待 DNS 生效（10s）…"
+          sleep 10
+          OK=1
+          for ip in $NEW_IPS; do
+            code=$(curl -s -m 8 --resolve "$HOST:443:$ip" -o /dev/null -w "%{http_code}" "https://$HOST/__api/config" || echo 000)
+            echo "  复验 $ip -> $code"
+            [ "$code" != "200" ] && OK=0
+          done
+          if [ "$OK" = "1" ]; then
+            echo "✅ 修复完成：A 记录已指向可用 IP"
+          else
+            echo "⚠️ 复验未完全通过，请关注后续检查"
+          fi

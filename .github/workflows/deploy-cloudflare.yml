@@ -1,0 +1,42 @@
+name: Deploy to Cloudflare Workers
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+concurrency:
+  group: workers-deploy
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      PASSWORD: ${{ secrets.PASSWORD }}
+      UUID: ${{ secrets.UUID }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CF_ZONE_ID: ${{ secrets.CF_ZONE_ID || '3e768047adb7722044400a312bbe7a2e' }}
+      # GitHub 仓库 Variables.STORAGE_BACKEND 可选 kv，默认 d1（D1 为默认后端，部署前自动应用迁移）
+      STORAGE_BACKEND: ${{ vars.STORAGE_BACKEND || 'd1' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Deploy Worker to Cloudflare
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          wranglerVersion: "3.114.0"
+          preCommands: |
+            # D1 后端部署前先应用迁移（CREATE TABLE IF NOT EXISTS，幂等）；kv 后端无需 D1 表，跳过
+            if [ "$STORAGE_BACKEND" = "d1" ]; then npx wrangler d1 migrations apply any-proxy-db --remote; fi
+          command: deploy --var STORAGE_BACKEND:$STORAGE_BACKEND
+          postCommands: |
+            echo "$PASSWORD" | npx wrangler secret put PASSWORD
+            echo "$UUID" | npx wrangler secret put UUID
+            echo "$CLOUDFLARE_API_TOKEN" | npx wrangler secret put CF_API_TOKEN
+            echo "$CF_ZONE_ID" | npx wrangler secret put CF_ZONE_ID
