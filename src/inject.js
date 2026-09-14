@@ -316,8 +316,9 @@ function buildDocWritePage(html, site, sitePrefix, base, pageUrl) {
   if (html.charCodeAt(0) === 0xFEFF) html = html.substring(1);
   // 原始 HTML 字节数组内联（照抄 cf-proxy-ex 1449-1452）
   const arr = Array.from(new TextEncoder().encode(html)).join(',');
-  // cf-proxy-ex 注入脚本原文（原样复制：httpRequestInjection + htmlCovPathInject + 执行段）
+  // ============ cf-proxy-ex httpRequestInjection 原文（770 行，一字不动） ============
   const CORE = `
+
 //---***========================================***---information---***========================================***---
 var nowURL = new URL(window.location.href);
 var proxy_host = nowURL.host; //代理的host - proxy.com
@@ -339,25 +340,36 @@ var proxy_host_with_schema = proxy_protocol + "//" + proxy_host + "/"; //代理�
 
 
 //被代理的【完整】地址 如：https://example.com/1?q#1
-// ===== 兼容层：original_website_* 动态解析（适配 /p/<id>/ 前缀形态）=====
 Object.defineProperty(window, 'original_website_url_str', {
-    get: function() { return getOriginalUrl(window.location.href); }
+    get: function() {
+        return window.location.href.substring(proxy_host_with_schema.length);
+    }
 });
+
 Object.defineProperty(window, 'original_website_url', {
-    get: function() { return new URL(original_website_url_str); }
+    get: function() {
+        return new URL(original_website_url_str);
+    }
 });
+
+//被代理的Host proxied_website.com
 Object.defineProperty(window, 'original_website_host', {
     get: function() {
         var h = original_website_url_str.substring(original_website_url_str.indexOf("://") + "://".length);
         return h.split('/')[0];
     }
 });
+
+//加上https的被代理的host， https://proxied_website.com/
 Object.defineProperty(window, 'original_website_host_with_schema', {
     get: function() {
         return original_website_url_str.substring(0, original_website_url_str.indexOf("://")) + "://" + original_website_host + "/";
     }
 });
 
+
+
+//---***========================================***---通用func---***========================================***---
 function changeURL(relativePath) {
     if (relativePath == null) return null;
 
@@ -1077,45 +1089,9 @@ console.log("WINDOW CORS ERROR EVENT ADDED");
 
 
 `;
-  const COMPAT = `
-// ===== 兼容层：覆盖 changeURL/getOriginalUrl（cf-proxy-ex 原文在上方保留，同名函数覆盖生效；适配 /p/<id>/ 多站点形态）=====
-function changeURL(raw){
-    if(!raw || typeof raw!=='string') return raw;
-    if(raw.charAt(0)==='#') return raw;
-    if(/^(data|blob|javascript|mailto|tel|about|file|chrome|edge):/i.test(raw)) return raw;
-    var u;
-    try{
-      if(/^https?:\\/\\//i.test(raw)) u = new URL(raw);
-      else if(raw.indexOf('//')===0) u = new URL('https:'+raw);
-      else u = new URL(raw, PAGE);
-    }catch(e){ return raw; }
-    var rest = u.pathname + u.search + u.hash;
-    if(u.pathname === P || u.pathname.indexOf(P + '/') === 0 ||
-       u.pathname === B || u.pathname.indexOf(B + '/') === 0) return location.origin + rest;
-    if(sub(u.host, H) || sub(u.host, BH)) return location.origin + P + rest;
-    return location.origin + P + X + u.host + rest;
-  }
-function getOriginalUrl(raw){
-    if(!raw || typeof raw!=='string') return raw;
-    if(raw.indexOf('#')===0 || !/^https?:/i.test(raw)) return raw;
-    try{
-      var u = new URL(raw);
-      if(!sub(u.hostname, location.hostname)) return raw;
-      var p = u.pathname, q = u.search + u.hash;
-      if(p === P || p.indexOf(P + '/') === 0) return 'https://' + H + (p.length > P.length ? p.slice(P.length) : '/') + q;
-      if(p === B || p.indexOf(B + '/') === 0) return 'https://' + BH + (p.length > B.length ? p.slice(B.length) : '/') + q;
-      if(p.indexOf(P + X) === 0){
-        var r = p.slice((P + X).length);
-        var i = r.indexOf('/');
-        var host = i < 0 ? r : r.slice(0, i);
-        var path = i < 0 ? '/' : r.slice(i);
-        return 'https://' + host + path + q;
-      }
-    }catch(e){}
-    return raw;
-  }
-`;
-  const HTML = `function parseAndInsertDoc(htmlString) {
+  // ============ cf-proxy-ex htmlCovPathInject 原文（69 行，一字不动） ============
+  const HTML = `
+function parseAndInsertDoc(htmlString) {
   // First, modify the HTML string to update all URLs and remove integrity
   const parser = new DOMParser();
   const tempDoc = parser.parseFromString(htmlString, 'text/html');
@@ -1171,8 +1147,11 @@ function replaceContentPaths(content){
   content = content.replaceAll(regex, (match) => {
     if (match.startsWith("http://www.w3.org/") || match.startsWith("https://www.w3.org/")) return match; // w3范式
     
-    var a = changeURL(match);
-      return a === match ? match : a;
+    if (match.startsWith("http")) {
+      return proxy_host_with_schema + match;
+    } else {
+      return proxy_host + "/" + match;
+    }
   });
 
 
@@ -1180,6 +1159,58 @@ function replaceContentPaths(content){
   return content;
 
 
+}
+`;
+  // ============ 兼容层：只加不改，后定义同名函数覆盖原文（适配 /p/<id>/ 多站点形态） ============
+  const COMPAT = `
+// 覆盖 changeURL：通用多站点 URL 转换（主通道 /p/<id>/、跨域通道 /p/<id>/__x/<host>/）
+function changeURL(raw){
+    if(!raw || typeof raw!=='string') return raw;
+    if(raw.charAt(0)==='#') return raw;
+    if(/^(data|blob|javascript|mailto|tel|about|file|chrome|edge):/i.test(raw)) return raw;
+    var u;
+    try{
+      if(/^https?:\\/\\//i.test(raw)) u = new URL(raw);
+      else if(raw.indexOf('//')===0) u = new URL('https:'+raw);
+      else u = new URL(raw, PAGE);
+    }catch(e){ return raw; }
+    var rest = u.pathname + u.search + u.hash;
+    if(u.pathname === P || u.pathname.indexOf(P + '/') === 0 ||
+       u.pathname === B || u.pathname.indexOf(B + '/') === 0) return location.origin + rest;
+    if(sub(u.host, H) || sub(u.host, BH)) return location.origin + P + rest;
+    return location.origin + P + X + u.host + rest;
+  }
+// 覆盖 getOriginalUrl：从代理 URL 反向解析原始站 URL
+function getOriginalUrl(raw){
+    if(!raw || typeof raw!=='string') return raw;
+    if(raw.indexOf('#')===0 || !/^https?:/i.test(raw)) return raw;
+    try{
+      var u = new URL(raw);
+      if(!sub(u.hostname, location.hostname)) return raw;
+      var p = u.pathname, q = u.search + u.hash;
+      if(p === P || p.indexOf(P + '/') === 0) return 'https://' + H + (p.length > P.length ? p.slice(P.length) : '/') + q;
+      if(p === B || p.indexOf(B + '/') === 0) return 'https://' + BH + (p.length > B.length ? p.slice(B.length) : '/') + q;
+      if(p.indexOf(P + X) === 0){
+        var r = p.slice((P + X).length);
+        var i = r.indexOf('/');
+        var host = i < 0 ? r : r.slice(0, i);
+        var path = i < 0 ? '/' : r.slice(i);
+        return 'https://' + host + path + q;
+      }
+    }catch(e){}
+    return raw;
+  }
+// 覆盖 replaceContentPaths：原文用 proxy_host_with_schema 拼单站点绝对地址，这里改为 changeURL 通用转换
+function replaceContentPaths(content){
+  if (!content || typeof content !== "string") return content;
+  let regex = new RegExp(\`(https?:\\\\/\\\\/[^\\s'"]+)\`, 'g');
+  if (!regex.test(content)) return content;
+  content = content.replaceAll(regex, (match) => {
+    if (match.startsWith("http://www.w3.org/") || match.startsWith("https://www.w3.org/")) return match;
+    var a = changeURL(match);
+    return a === match ? match : a;
+  });
+  return content;
 }
 `;
   const inject = '<!DOCTYPE html>\n<script>\n(function(){\n' +
