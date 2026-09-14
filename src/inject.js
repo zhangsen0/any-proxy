@@ -79,7 +79,7 @@ function injectLinkFix(html, site, sitePrefix, base) {
       try{ return abs(new URL(h)); }catch(e){ return h; }
     }
     if(h.indexOf('//')===0){ if(!REL.test(h)) return h; try{ return abs(new URL('https:'+h)); }catch(e){ return h; } }
-    if(h.charAt(0)==='/' && !inNs(h)) return B + h;     // 根相对：相对当前响应所属域
+    if(h.charAt(0)==='/' && !inNs(h)) return (sub(BH, H) ? P : B) + h; // 根相对：当前响应域是站点域则归主通道，否则按所属域
     // 修复相对路径（如 ./issues、issues、../settings）无法走代理的问题
     // 相对 URL 浏览器会按当前页地址解析，但某些框架（如 Turbo）会直接拼接导致跳出代理
     if(h.charAt(0) !== '#' && h.charAt(0) !== '?' && !/^[a-z][a-z0-9+.-]*:/i.test(h) && h.indexOf('//') !== 0){

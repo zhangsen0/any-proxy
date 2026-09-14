@@ -154,6 +154,10 @@ function rewriteContent(content, site, sitePrefix, base, kind = 'html') {
   if (!RE_ANY_URLISH.test(content)) return content;
   const prefix = base.prefix;
   const origin = base.origin;
+  // 根相对链接按「当前响应所属域」映射；若该域就是站点域（跨域通道回源站点自身，
+  // 如 www.github.com 301 到 github.com 后落在 /p/<id>/__x/github.com/），
+  // 统一归主通道 /p/<id>/，保证 URL 形态一致、不出现无谓的 __x 嵌套。
+  const rootPrefix = base && isSiteHost(base.host, site.host) ? sitePrefix : prefix;
   const mapAbs = (raw) => mapAbsoluteUrl(raw, site, sitePrefix, base);
   // 协议相对：只有 // 之后紧跟合法主机名才认定为 URL，否则原样保留（注释 / 表达式等一律不动）
   const mapRel = (raw) => (isSchemeRelative(raw) ? mapAbs('https:' + raw) : raw);
@@ -186,7 +190,7 @@ function rewriteContent(content, site, sitePrefix, base, kind = 'html') {
       let nv;
       if (/^https?:/i.test(v)) nv = mapAbs(v);
       else if (v.startsWith('//')) nv = mapRel(v);
-      else if (v.startsWith('/') && !mapped(v.slice(1))) nv = prefix + v;
+      else if (v.startsWith('/') && !mapped(v.slice(1))) nv = rootPrefix + v;
       else return m;
       return 'url(' + q + nv + q + ')';
     });
@@ -219,7 +223,7 @@ function rewriteContent(content, site, sitePrefix, base, kind = 'html') {
   // HTML 属性中的根相对路径
   out = out.replace(RE_ATTR_ROOT, (m, pre, p) => {
     if (mapped(p)) return m;
-    return pre + prefix + '/' + p;
+    return pre + rootPrefix + '/' + p;
   });
   // srcset / data-srcset：逗号分隔的多资源列表，逐项重写
   out = out.replace(RE_SRCSET, (m, pre, val, post) => {
@@ -229,7 +233,7 @@ function rewriteContent(content, site, sitePrefix, base, kind = 'html') {
       if (!u) return it;
       if (u.startsWith('//')) parts[0] = mapRel(u);
       else if (/^https?:/i.test(u)) parts[0] = mapAbs(u);
-      else if (u.startsWith('/') && !mapped(u.slice(1))) parts[0] = prefix + u;
+      else if (u.startsWith('/') && !mapped(u.slice(1))) parts[0] = rootPrefix + u;
       return parts.join(' ');
     });
     return pre + rewritten.join(', ') + post;
@@ -237,7 +241,7 @@ function rewriteContent(content, site, sitePrefix, base, kind = 'html') {
   // CSS url(/...)
   out = out.replace(RE_CSS_URL_ROOT, (m, p) => {
     if (mapped(p)) return m;
-    return 'url(' + prefix + '/' + p;
+    return 'url(' + rootPrefix + '/' + p;
   });
   // 内联脚本内容按脚本规则回填（输出绝对地址，保证 new URL("...") 之类单参数用法可用）
   if (blocks.length) out = out.replace(HOLDER, (m, d) => rewriteLiteral(blocks[Number(d)]));

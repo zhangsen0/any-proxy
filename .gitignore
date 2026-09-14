@@ -5,3 +5,7 @@ node_modules
 # 本地开发脚本生成的临时产物
 tools/.worker.local.mjs
 .tmp-old/
+
+# Python
+__pycache__/
+*.pyc
