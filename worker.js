@@ -23,8 +23,16 @@ import { scheduledDnsCheck } from './src/dns.js';
 
 export default {
   async fetch(request, env, ctx) {
-    bindRuntime(env);
-    return handleRequest(request, env, ctx);
+    try {
+      bindRuntime(env);
+      return await handleRequest(request, env, ctx);
+    } catch (e) {
+      // 全局兜底：任何未捕获异常返回 500 + 错误信息，避免 CF 层 530（并发突发时曾集体 530）
+      return new Response('proxy error: ' + String(e && e.message || e).slice(0, 500), {
+        status: 500,
+        headers: { 'content-type': 'text/plain; charset=utf-8' },
+      });
+    }
   },
   /** 定时任务：自动优选 IP 并更新 DNS（实际执行间隔由前端可配，默认 12 小时） */
   async scheduled(event, env, ctx) {
