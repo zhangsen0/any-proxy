@@ -20,7 +20,7 @@ migrations_dir = "migrations"
 
 [[kv_namespaces]]
 binding = "SITES"
-id = "037a6791bce743009fc8d6694f7a1dbb"
+id = "2a940bcb0dae4b448e8def3ebf4fe27d"
 
 # 可配置变量
 [vars]
