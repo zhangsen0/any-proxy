@@ -58,7 +58,7 @@
 git push origin master
 ```
 
-GitHub Actions 自动执行：应用 D1 迁移（d1 后端）→ `wrangler deploy` → 写入 Secrets。之后每次 push 自动重新部署，也可在 Actions 页手动触发。
+GitHub Actions 自动执行：按 `STORAGE_BACKEND` 裁剪 `wrangler.toml`（**只绑定实际使用的后端**，d1 保留 D1 并应用迁移、kv 保留 KV）→ `wrangler deploy` → 写入 Secrets。之后每次 push 自动重新部署，也可在 Actions 页手动触发。
 
 ---
 

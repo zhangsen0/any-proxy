@@ -10,7 +10,7 @@ workers_dev = true
 [triggers]
 crons = ["*/5 * * * *"]
 
-# 两种存储均绑定；STORAGE_BACKEND=d1|kv 由 GitHub 仓库 Variables 选择（默认 d1）
+# 双绑定为模板：部署时由 GitHub Actions 按 STORAGE_BACKEND 裁剪，只保留使用的后端（d1 默认 / kv 可选）
 # D1 为默认后端：kv 表由 migrations/0001_init.sql 建立，部署时自动应用
 [[d1_databases]]
 binding = "DB"

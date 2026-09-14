@@ -32,8 +32,27 @@ jobs:
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           wranglerVersion: "3.114.0"
           preCommands: |
-            # D1 后端部署前先应用迁移（CREATE TABLE IF NOT EXISTS，幂等）；kv 后端无需 D1 表，跳过
-            if [ "$STORAGE_BACKEND" = "d1" ]; then npx wrangler d1 migrations apply any-proxy-db --remote; fi
+            # 按 STORAGE_BACKEND 裁剪 wrangler.toml，只绑定实际使用的后端（避免未使用绑定的缺失/权限校验失败）：
+            #   d1（默认）→ 保留 D1、先应用迁移建表，删除 KV 绑定
+            #   kv        → 保留 KV，删除 D1 绑定
+            if [ "$STORAGE_BACKEND" = "kv" ]; then
+              python3 - <<'PY'
+            import re
+            p = 'wrangler.toml'
+            s = open(p, encoding='utf-8').read()
+            s = re.sub(r'\[\[d1_databases\]\].*?(?=\n\[\[|\n\[|\Z)', '', s, flags=re.S)
+            open(p, 'w', encoding='utf-8').write(s)
+            PY
+            else
+              npx wrangler d1 migrations apply any-proxy-db --remote
+              python3 - <<'PY'
+            import re
+            p = 'wrangler.toml'
+            s = open(p, encoding='utf-8').read()
+            s = re.sub(r'\[\[kv_namespaces\]\].*?(?=\n\[\[|\n\[|\Z)', '', s, flags=re.S)
+            open(p, 'w', encoding='utf-8').write(s)
+            PY
+            fi
           command: deploy --var STORAGE_BACKEND:$STORAGE_BACKEND
           postCommands: |
             echo "$PASSWORD" | npx wrangler secret put PASSWORD
