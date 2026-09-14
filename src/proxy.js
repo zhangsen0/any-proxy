@@ -361,10 +361,12 @@ async function proxyRequest(request, site, crossHost, ctx) {
   if (isNavHtml) {
     return new Response(rewritten, { status: upstream.status, headers: headersOut });
   }
-  // 文本资源（JS/CSS/JSON）：fingerprinted 走共享缓存
+  // 文本资源（JS/CSS/JSON）：fingerprinted 资源加长缓存头（浏览器/CDN 层缓存），
+  // 二次访问零回源、零 Cache API 开销——并发突发时不再因每次请求的 Cache API
+  // get/put 放大 worker 延迟导致 CF 530（React 全家桶 JS 曾集体 530 阻断水合）。
   if (request.method === 'GET' && upstream.status === 200 && isFingerprinted(url.pathname)) {
-    return serveCached(ctx, cacheKeyOf(targetUrl), () =>
-      new Response(rewritten, { status: upstream.status, headers: headersOut }));
+    headersOut.set('Cache-Control', 'public, max-age=604800, immutable');
+    headersOut.set('CDN-Cache-Control', 'public, max-age=604800, immutable');
   }
   return new Response(rewritten, { status: upstream.status, headers: headersOut });
 }
