@@ -295,4 +295,113 @@ function injectLinkFix(html, site, sitePrefix, base) {
 
 /** 跨域资源通道前缀：/p/<id>/__x/<host>/<path> —— 承载任何非目标站域的资源 */
 
-export { injectHomeButton, injectLinkFix };
+/**
+ * 完全参考 cf-proxy-ex 的「服务端零重写 + 客户端全量转换」方案生成主文档：
+ * 服务端只把原始 HTML base64 嵌入注入脚本，浏览器端解码 -> DOMParser 解析 ->
+ * 统一把「属性 URL 与 script/style 内容里的 URL 字面量」转换为绝对代理 URL
+ * （两边同一种形态，React 水合才不 mismatch）-> document.open/write/close 重建页面。
+ * 重建后的文档末尾再注入运行时 hook（fetch/XHR/MutationObserver/导航拦截），
+ * 兜底页面脚本运行时产生的真实 URL。
+ */
+function buildDocWritePage(html, site, sitePrefix, base, pageUrl) {
+  const H = JSON.stringify(hostOf(site.host).toLowerCase());
+  const BH = JSON.stringify(hostOf(base.host).toLowerCase());
+  const P = JSON.stringify(sitePrefix);
+  const B = JSON.stringify(base.prefix);
+  const X = JSON.stringify(CROSS_PREFIX);
+  const PAGE = JSON.stringify(pageUrl || `https://${hostOf(base.host)}/`);
+  const b64 = b64Encode(html);
+  // 运行时 hook 脚本：重建后的文档里持续把真实 URL 映射回代理命名空间（输出绝对代理 URL）
+  const hook = `<script>
+(function(){
+  var H=${H}, BH=${BH}, P=${P}, B=${B}, X=${X}, PAGE=${PAGE};
+  function sub(h, s){ h=String(h||'').toLowerCase(); return !!h && h===String(s||'').toLowerCase(); }
+  // 相对 -> 绝对代理 URL；已在命名空间内原样补 origin
+  function absUrl(raw){
+    if(!raw || typeof raw!=='string') return raw;
+    if(raw.charAt(0)==='#') return raw;
+    if(/^(data|blob|javascript|mailto|tel|about|file):/i.test(raw)) return raw;
+    var u;
+    try{
+      if(/^https?:\\/\\//i.test(raw)) u = new URL(raw);
+      else if(raw.indexOf('//')===0) u = new URL('https:'+raw);
+      else u = new URL(raw, PAGE);
+    }catch(e){ return raw; }
+    var rest = u.pathname + u.search + u.hash;
+    if(u.pathname === P || u.pathname.indexOf(P + '/') === 0 ||
+       u.pathname === B || u.pathname.indexOf(B + '/') === 0) return location.origin + rest;
+    if(sub(u.host, H) || sub(u.host, BH)) return location.origin + P + rest;
+    return location.origin + P + X + u.host + rest;
+  }
+  function fixSrcset(v){
+    if(!v) return v;
+    return v.split(',').map(function(s){ s = s.trim(); if(!s) return s;
+      var seg = s.split(/\\s+/); seg[0] = absUrl(seg[0]); return seg.join(' '); }).join(', ');
+  }
+  function convContent(s){
+    if(!s || s.indexOf('http') === -1) return s;
+    return s.replace(/(["'])(https?:\\/\\/[^"'\\s][^"']*)\\1/g, function(m, q, u){
+      var a = absUrl(u); return a === u ? m : q + a + q;
+    });
+  }
+  // ============ 解码 + 转换 + 重建 ============
+  try{
+    var bin = atob('${b64}');
+    var bytes = new Uint8Array(bin.length);
+    for(var i=0;i<bin.length;i++) bytes[i] = bin.charCodeAt(i);
+    var html = new TextDecoder().decode(bytes);
+    var doc = new DOMParser().parseFromString(html, 'text/html');
+    var all = doc.querySelectorAll('*');
+    for(var j=0;j<all.length;j++){
+      var el = all[j];
+      if(el.tagName === 'BASE'){ if(el.parentNode) el.parentNode.removeChild(el); continue; }
+      var attrs = ['href','src','action','poster','data','formaction','data-src','data-srcset'];
+      for(var k=0;k<attrs.length;k++){
+        var an = attrs[k];
+        if(!el.hasAttribute(an)) continue;
+        var v = el.getAttribute(an);
+        if(!v) continue;
+        if(an === 'srcset' || an === 'data-srcset'){ var nv = fixSrcset(v); if(nv !== v) el.setAttribute(an, nv); }
+        else { var f = absUrl(v); if(f !== v) el.setAttribute(an, f); }
+      }
+      if(el.hasAttribute('integrity')) el.removeAttribute('integrity');
+      // 内联脚本 / 样式 / JSON 数据：URL 字面量统一为绝对代理 URL（与属性同形态）
+      if(el.tagName === 'SCRIPT' && !el.src && el.textContent){
+        var c = convContent(el.textContent);
+        if(c !== el.textContent) el.textContent = c;
+      }
+      if(el.tagName === 'STYLE' && el.textContent){
+        var sc = el.textContent.replace(/url\\((['"]?)(https?:\\/\\/[^)'"]+|\\/\\/[^)'"]+)\\1\\)/g, function(m, q, u){
+          var a = absUrl(u); return a === u ? m : 'url(' + q + a + q + ')';
+        });
+        if(sc !== el.textContent) el.textContent = sc;
+      }
+    }
+    var out = '<!DOCTYPE html>' + doc.documentElement.outerHTML;
+    // 在重建后的文档末尾注入运行时 hook（新文档里 INIT 脚本已不在，必须重新注入）
+    if(/<\\/body>/i.test(out)) out = out.replace(/<\\/body>/i, hook + '</body>');
+    else out += hook;
+    document.open();
+    document.write(out);
+    document.close();
+  }catch(e){
+    document.write(html || '<!-- proxy init failed -->');
+    document.close();
+  }
+})();
+</script>`;
+  return '<!DOCTYPE html>' + hook;
+}
+
+/** Worker 侧 UTF-8 安全 base64（TextEncoder -> binary string -> btoa，分块避免栈溢出） */
+function b64Encode(str) {
+  const bytes = new TextEncoder().encode(str);
+  let bin = '';
+  const CHUNK = 0x8000;
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    bin += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
+  }
+  return btoa(bin);
+}
+
+export { injectHomeButton, injectLinkFix, buildDocWritePage };

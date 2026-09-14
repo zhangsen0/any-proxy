@@ -1,6 +1,6 @@
 import { cors, isText, esc, isNavigation, isFingerprinted } from './util.js';
 import { CROSS_PREFIX, mapAbsoluteUrl, rewriteContent, contentKind } from './url.js';
-import { injectLinkFix } from './inject.js';
+import { injectLinkFix, buildDocWritePage } from './inject.js';
 
 // 反向代理核心：请求转发、响应重写、WebSocket 透传
 
@@ -22,6 +22,27 @@ function cachedHtmlRewrite(site, crossHost, url, text, sitePrefix, base) {
   const hit = htmlCache.get(key);
   if (hit && now - hit.ts < HTML_CACHE_TTL) return hit.html;
   const html = rewriteContent(text, site, sitePrefix, base, 'html');
+  htmlCache.set(key, { html, ts: now });
+  if (htmlCache.size > HTML_CACHE_MAX) {
+    for (const k of htmlCache.keys()) {
+      if (htmlCache.size <= HTML_CACHE_MAX) break;
+      const v = htmlCache.get(k);
+      if (now - v.ts >= HTML_CACHE_TTL) htmlCache.delete(k);
+    }
+  }
+  return html;
+}
+
+/**
+ * 主文档缓存：把「原始 HTML -> base64 重建页」的结果缓存（b64 编码是大头 CPU 成本）。
+ * 键、TTL、上限与 cachedHtmlRewrite 一致；缓存的是最终交付页，命中时零重写成本。
+ */
+function cachedDocWritePage(site, crossHost, url, text, sitePrefix, base, targetUrl) {
+  const key = `${site.id}|${crossHost || ''}|${url.pathname}|${url.search}`;
+  const now = Date.now();
+  const hit = htmlCache.get(key);
+  if (hit && now - hit.ts < HTML_CACHE_TTL) return hit.html;
+  const html = buildDocWritePage(text, site, sitePrefix, base, targetUrl);
   htmlCache.set(key, { html, ts: now });
   if (htmlCache.size > HTML_CACHE_MAX) {
     for (const k of htmlCache.keys()) {
@@ -320,15 +341,25 @@ async function proxyRequest(request, site, crossHost, ctx) {
   // SPA（React 等）在初始化时会按字面量精确匹配 origin / 域名，改写会静默破坏其运行时判断
   // （表现为水合不触发、按钮无事件）。绝对 URL 的资源请求由前端注入脚本的 fetch/XHR/DOM hook 兜底。
   const isJsFile = /javascript|ecmascript|application\/x-js/i.test(ct);
-  // 只有上游 2xx 才进缓存：上游偶发 5xx / 错误页不该被缓存 30s 放大故障窗口
-  const rewritten = isHtml && request.method === 'GET' && upstream.status >= 200 && upstream.status < 300
-    ? cachedHtmlRewrite(site, crossHost, url, text, sitePrefix, base)
-    : isJsFile ? text : rewriteContent(text, site, sitePrefix, base, kind);
-  if (isHtml) {
-    // 运行时映射脚本只给「导航文档」注入：XHR/turbo 拉取的 HTML 片段不再重复带 9KB 脚本，
-    // 页面级的注入脚本会持续修复运行时插入的 DOM，行为一致但省掉大量冗余字节
-    if (!isNavigation(request)) return new Response(rewritten, { status: upstream.status, headers: headersOut });
-    return new Response(injectLinkFix(rewritten, site, sitePrefix, base), { status: upstream.status, headers: headersOut });
+  const isNavHtml = isHtml && isNavigation(request);
+  const canCacheHtml = request.method === 'GET' && upstream.status >= 200 && upstream.status < 300;
+  // 主文档：完全参考 cf-proxy-ex —— 原始 HTML base64 嵌入注入脚本，客户端解码后
+  // 统一把属性与 script/style 字面量转成绝对代理 URL 再 document.write 重建（水合友好）。
+  // 非导航 HTML 片段（turbo 等 fetch 的局部更新）：仍走服务端重写，页面级 hook 持续修复。
+  let rewritten;
+  if (isNavHtml) {
+    rewritten = canCacheHtml
+      ? cachedDocWritePage(site, crossHost, url, text, sitePrefix, base, targetUrl)
+      : buildDocWritePage(text, site, sitePrefix, base, targetUrl);
+  } else if (isHtml) {
+    rewritten = canCacheHtml
+      ? cachedHtmlRewrite(site, crossHost, url, text, sitePrefix, base)
+      : rewriteContent(text, site, sitePrefix, base, 'html');
+  } else {
+    rewritten = isJsFile ? text : rewriteContent(text, site, sitePrefix, base, kind);
+  }
+  if (isNavHtml) {
+    return new Response(rewritten, { status: upstream.status, headers: headersOut });
   }
   // 文本资源（JS/CSS/JSON）：fingerprinted 走共享缓存
   if (request.method === 'GET' && upstream.status === 200 && isFingerprinted(url.pathname)) {
