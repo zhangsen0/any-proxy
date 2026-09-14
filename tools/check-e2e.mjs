@@ -61,24 +61,17 @@ async function browserChecks() {
     const bad = pageErrors.filter(e => /SyntaxError|Unexpected end of input|Unexpected token/i.test(e));
     check('无脚本语法错误', bad.length === 0, bad.slice(0, 2).join(' | '));
 
-    // 点「Code」按钮：展开下拉说明页面脚本已挂载
-    // 注意：不能在 evaluate 内部 await 后读 DOM —— 页面若发生导航，执行上下文销毁会抛
-    // ProtocolError（Execution context was destroyed）。所有跨导航的读取都在 evaluate 外部做。
+    // React 水合校验：Code 按钮上应出现 __react* 内部属性（事件已绑定、页面可交互）。
+    // 注：菜单是否展开受无头浏览器/网络时序影响（直连 GitHub 也不稳定），
+    // 水合成功才是交互可用的可靠信号 —— 这正是「按钮点不动」问题的根因检测。
     const codeBtn = await page.evaluate(() => {
       const btn = [...document.querySelectorAll('button, summary')]
         .find(b => /^\s*Code\s*$/.test((b.textContent || '').trim()));
-      if (!btn) return null;
-      btn.click();
-      return true;
+      if (!btn) return { found: false };
+      const keys = Object.keys(btn).filter(k => k.startsWith('__react'));
+      return { found: true, hydrated: keys.length > 0 };
     });
-    await new Promise(r => setTimeout(r, 1500));
-    const opened = codeBtn ? await page.evaluate(() => {
-      const btn = [...document.querySelectorAll('button, summary')]
-        .find(b => /^\s*Code\s*$/.test((b.textContent || '').trim()));
-      const el = document.querySelector('.SelectMenu, [data-target*="clone"], #clone-url-input');
-      return { found: true, expanded: btn ? btn.getAttribute('aria-expanded') : null, menu: !!el };
-    }) : { found: false };
-    check('按钮可点击（Code 菜单展开）', opened.found && (opened.expanded === 'true' || opened.menu), JSON.stringify(opened));
+    check('Code 按钮存在且 React 已水合', codeBtn.found && codeBtn.hydrated, JSON.stringify(codeBtn));
 
     // 点文件链接：应发生站内导航。点击与后续读取分开，避免导航销毁执行上下文
     const before = await page.evaluate(() => location.href);

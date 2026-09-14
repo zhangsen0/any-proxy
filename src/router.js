@@ -137,7 +137,7 @@ async function handleRequest(request, env, ctx) {
       return handleWebSocket(request, site, crossHost);
     }
     try {
-      return await proxyRequest(request, site, crossHost);
+      return await proxyRequest(request, site, crossHost, ctx);
     } catch (e) {
       return friendlyError('代理请求失败', `无法连接到目标站 <b>${esc(crossHost || site.host)}</b>：${esc(e && e.message || '网络错误')}`, request.url, 502, isNavigation(request));
     }

@@ -33,6 +33,31 @@ function cachedHtmlRewrite(site, crossHost, url, text, sitePrefix, base) {
   return html;
 }
 
+/** 缓存键：给 URL 加版本参数，重写规则升级后旧缓存自动失效（不用于请求上游） */
+function cacheKeyOf(u) {
+  const x = new URL(u);
+  x.searchParams.set('__apv', '1');
+  return x.toString();
+}
+
+/**
+ * 经 CF Cache API 提供不可变资源（fingerprinted：文件名含 hash，内容永不变）。
+ * 跨隔离共享：首次回源后所有请求直接命中，避免每个用户每次都要 Worker 回源 + 重写，
+ * 也避免大 bundle（数百 KB）在浏览器端等 4-7 秒才执行、拖垮 React 水合。
+ * 只命中 200 的 GET；miss 时构建响应并 waitUntil 写入缓存。
+ */
+async function serveCached(ctx, cacheKey, build) {
+  if (!ctx || !cacheKey || typeof caches === 'undefined') return build();
+  const key = new Request(cacheKey);
+  const hit = await caches.default.match(key).catch(() => null);
+  if (hit) return hit;
+  const res = build();
+  if (res && res.status === 200) {
+    try { ctx.waitUntil(caches.default.put(key, res.clone())); } catch {}
+  }
+  return res;
+}
+
 /**
  * 反向代理核心：把请求转发到目标站，并把响应内容里的 URL 映射回代理命名空间。
  *
@@ -41,7 +66,7 @@ function cachedHtmlRewrite(site, crossHost, url, text, sitePrefix, base) {
  *   - 跨域通道 /p/<id>/__x/<host>/<path>   -> 任意第三方域（页面用到的任何外部资源/接口）
  * 两套通道共用同一套重写规则，因此任何站点的资源、接口、跳转都会留在代理内，不会被浏览器直连。
  */
-async function proxyRequest(request, site, crossHost) {
+async function proxyRequest(request, site, crossHost, ctx) {
   const url = new URL(request.url);
   const sitePrefix = `/p/${site.id}`;
   // origin = 代理自身对外地址。脚本上下文的 URL 需要补成绝对地址（见 url.js absOnOrigin）
@@ -195,7 +220,14 @@ async function proxyRequest(request, site, crossHost) {
     headersOut.set('Cache-Control', 'public, max-age=3600, stale-while-revalidate=86400');
   }
 
-  if (!isText(ct)) return new Response(upstream.body, { status: upstream.status, headers: headersOut });
+  if (!isText(ct)) {
+    // 非文本资源（图片/字体/音视频）：fingerprinted 走共享缓存，其余直接回源
+    if (request.method === 'GET' && upstream.status === 200 && isFingerprinted(url.pathname)) {
+      return serveCached(ctx, cacheKeyOf(targetUrl), () =>
+        new Response(upstream.body, { status: upstream.status, headers: headersOut }));
+    }
+    return new Response(upstream.body, { status: upstream.status, headers: headersOut });
+  }
 
   // HEAD / 204 / 304 没有正文可改写，直接回源响应，省掉一次无意义的读取 + 全量正则
   if (request.method === 'HEAD' || upstream.status === 204 || upstream.status === 304) {
@@ -226,6 +258,11 @@ async function proxyRequest(request, site, crossHost) {
     // 页面级的注入脚本会持续修复运行时插入的 DOM，行为一致但省掉大量冗余字节
     if (!isNavigation(request)) return new Response(rewritten, { status: upstream.status, headers: headersOut });
     return new Response(injectLinkFix(rewritten, site, sitePrefix, base), { status: upstream.status, headers: headersOut });
+  }
+  // 文本资源（JS/CSS/JSON）：fingerprinted 走共享缓存
+  if (request.method === 'GET' && upstream.status === 200 && isFingerprinted(url.pathname)) {
+    return serveCached(ctx, cacheKeyOf(targetUrl), () =>
+      new Response(rewritten, { status: upstream.status, headers: headersOut }));
   }
   return new Response(rewritten, { status: upstream.status, headers: headersOut });
 }
