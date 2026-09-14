@@ -18,6 +18,7 @@ jobs:
       PASSWORD: ${{ secrets.PASSWORD }}
       UUID: ${{ secrets.UUID }}
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
       CF_ZONE_ID: ${{ secrets.CF_ZONE_ID || '3e768047adb7722044400a312bbe7a2e' }}
       # GitHub 仓库 Variables.STORAGE_BACKEND 可选 kv，默认 d1（D1 为默认后端，部署前自动应用迁移）
       STORAGE_BACKEND: ${{ vars.STORAGE_BACKEND || 'd1' }}
@@ -25,19 +26,26 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Deploy Worker to Cloudflare
-        uses: cloudflare/wrangler-action@v3
+      - name: Setup Node
+        uses: actions/setup-node@v4
         with:
-          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          wranglerVersion: "3.114.0"
-          preCommands: |
-            # 按 STORAGE_BACKEND 裁剪 wrangler.toml，只绑定实际使用的后端（d1 默认 / kv 可选），
-            # d1 模式同时应用 D1 迁移；控制逻辑见 .github/scripts/prepare-deploy.py
-            python3 .github/scripts/prepare-deploy.py
-          command: deploy --var STORAGE_BACKEND:$STORAGE_BACKEND
-          postCommands: |
-            echo "$PASSWORD" | npx wrangler secret put PASSWORD
-            echo "$UUID" | npx wrangler secret put UUID
-            echo "$CLOUDFLARE_API_TOKEN" | npx wrangler secret put CF_API_TOKEN
-            echo "$CF_ZONE_ID" | npx wrangler secret put CF_ZONE_ID
+          node-version: 20
+
+      - name: Install wrangler (pinned)
+        # 固定 wrangler 版本，避免 wrangler-action 内部 npx 动态下载被 CI 交互确认拦截
+        run: npm install -g wrangler@3.114.0
+
+      - name: Prepare config
+        # 按 STORAGE_BACKEND 裁剪 wrangler.toml，只绑定实际使用的后端（d1 默认 / kv 可选），
+        # d1 模式同时应用 D1 迁移；控制逻辑见 .github/scripts/prepare-deploy.py
+        run: python3 .github/scripts/prepare-deploy.py
+
+      - name: Deploy Worker
+        run: wrangler deploy --var STORAGE_BACKEND:$STORAGE_BACKEND
+
+      - name: Put secrets
+        run: |
+          echo "$PASSWORD" | wrangler secret put PASSWORD
+          echo "$UUID" | wrangler secret put UUID
+          echo "$CLOUDFLARE_API_TOKEN" | wrangler secret put CF_API_TOKEN
+          echo "$CF_ZONE_ID" | wrangler secret put CF_ZONE_ID
