@@ -5,6 +5,35 @@ import { injectLinkFix } from './inject.js';
 // 反向代理核心：请求转发、响应重写、WebSocket 透传
 
 /**
+ * HTML 重写结果缓存（通用，作用于任何站点）。
+ * 大 HTML（数百 KB）的多轮正则重写会吃满 Worker 的 CPU 预算（免费计划约 10ms/请求），
+ * 同一页面被多次访问时（刷新、多用户）重复重写是纯浪费。缓存命中时整轮重写被跳过，
+ * 只剩轻量的注入脚本（<1ms），大幅降低 504 概率。
+ *   - TTL 30s：站点配置 / 源站内容更新最多延迟 30s 生效（反代场景可接受）
+ *   - 上限 50 条：防内存膨胀（每条数百 KB，远低于 Worker 内存预算）
+ *   - 只缓存 GET 的 HTML；注入脚本不进缓存，每次按当前请求现做
+ */
+const HTML_CACHE_TTL = 30_000;
+const HTML_CACHE_MAX = 50;
+const htmlCache = new Map();
+function cachedHtmlRewrite(site, crossHost, url, text, sitePrefix, base) {
+  const key = `${site.id}|${crossHost || ''}|${url.pathname}|${url.search}`;
+  const now = Date.now();
+  const hit = htmlCache.get(key);
+  if (hit && now - hit.ts < HTML_CACHE_TTL) return hit.html;
+  const html = rewriteContent(text, site, sitePrefix, base, 'html');
+  htmlCache.set(key, { html, ts: now });
+  if (htmlCache.size > HTML_CACHE_MAX) {
+    for (const k of htmlCache.keys()) {
+      if (htmlCache.size <= HTML_CACHE_MAX) break;
+      const v = htmlCache.get(k);
+      if (now - v.ts >= HTML_CACHE_TTL) htmlCache.delete(k);
+    }
+  }
+  return html;
+}
+
+/**
  * 反向代理核心：把请求转发到目标站，并把响应内容里的 URL 映射回代理命名空间。
  *
  * 通用性约定（不含任何站点 / 域名 / 路径的特判）：
@@ -187,7 +216,10 @@ async function proxyRequest(request, site, crossHost) {
   headersOut.delete('content-encoding');
   headersOut.delete('content-length');
 
-  const rewritten = rewriteContent(text, site, sitePrefix, base, contentKind(ct));
+  const kind = contentKind(ct);
+  const rewritten = isHtml && request.method === 'GET'
+    ? cachedHtmlRewrite(site, crossHost, url, text, sitePrefix, base)
+    : rewriteContent(text, site, sitePrefix, base, kind);
   if (isHtml) {
     // 运行时映射脚本只给「导航文档」注入：XHR/turbo 拉取的 HTML 片段不再重复带 9KB 脚本，
     // 页面级的注入脚本会持续修复运行时插入的 DOM，行为一致但省掉大量冗余字节

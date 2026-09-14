@@ -106,13 +106,30 @@ function contentKind(ct) {
  * 内联正则字面量每执行一次都要新建 RegExp 对象，反代是每请求的热路径，
  * 提升到模块级可以省掉这层重复开销（同时规则集中一处，便于维护）。
  */
-const RE_BASE = /<base\b[^>]*>(?:\s*<\/base>)?/gi;
-const RE_INTEGRITY = /\s+integrity\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)/gi;
-const RE_ABS_URL = /https?:\/\/[^\s"'<>\\)\]]+/g;
-const RE_SCHEME_REL = /(^|[\s"'=(])\/\/[^\s"'<>\\)\]]+/g;
-const RE_ATTR_ROOT = /((?:src|href|action|poster|data-src|content)=["'])\/([^"']*)/g;
-const RE_SRCSET = /((?:srcset|data-srcset)=["'])([^"']*)(["'])/g;
-const RE_CSS_URL_ROOT = /url\(\s*["']?\/([^)"']*)/g;
+// ---- 文档级重写（合并为少量轮次，避免大 HTML 上多轮全文扫描打爆 Worker CPU 预算）----
+// 剥离类：<base> 会成为相对 URL 的解析基准；integrity 在内容被改写后必然校验失败。
+// 两类都是「直接删除」，合并进一个正则一次扫描完成。
+const RE_STRIP = /<base\b[^>]*>(?:\s*<\/base>)?|\s+integrity\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)/gi;
+/** RE_STRIP 的快速预筛：先 O(n) 检查是否含 base / integrity，避免无谓的全文正则扫描 */
+const RE_STRIP_TEST = /<base\b|integrity\s*=/i;
+/**
+ * 全部 URL 形态的单轮替换（命名分组，回调按形态分发）：
+ *   abs     https://host/... / http://host/...        —— 绝对 URL
+ *   rel      //host/...（前置字符 relpre 原样保留）    —— 协议相对 URL
+ *   attr     src/href/action/poster/data-src/content="/path" —— 属性根相对
+ *   srcset   srcset/data-srcset="..."                  —— 逗号分隔的多资源列表
+ *   cssroot  url(/path)（前引号 cssq 原样保留）        —— CSS 根相对
+ * 分支互斥与顺序约束：
+ *   - attr / cssroot 用 (?!\/) 排除 // 开头，避免把协议相对 URL 误判为根相对路径
+ *   - 属性值里的绝对 / 协议相对 URL 由 abs / rel 分支处理，attr 分支只认「/」开头
+ */
+const RE_ALL_URL = new RegExp([
+  '(?<abs>https?:\\/\\/[^\\s"\'<>\\\\\\)\\]]+)',
+  '|(?<relpre>^|[\\s"\'=(])(?<rel>\\/\\/[^\\s"\'<>\\\\\\)\\]]+)',
+  '|(?<attr>(?:src|href|action|poster|data-src|content)=["\'])\\/(?!\\/)(?<attrpath>[^"\']*)',
+  '|(?<srcset>(?:srcset|data-srcset)=["\'])(?<ssval>[^"\']*)(?<ssq>["\'])',
+  '|url\\(\\s*(?<cssq>["\']?)\\/(?!\\/)(?<csspath>[^)"\']*)',
+].join(''), 'g');
 // JS/JSON 字符串可能来自 HTML 属性或序列化配置，边界引号会写成 \\\"；保留转义形式，避免漏改 URL。
 const RE_LITERAL_URL = /(\\?["'])(https?:\/\/|\/\/)([^'"\s\\]+)\\?\1/g;
 const RE_CSS_URL = /url\(\s*(['"]?)([^'")]+)\1\s*\)/g;
@@ -210,38 +227,36 @@ function rewriteContent(content, site, sitePrefix, base, kind = 'html') {
     return '<script' + attrs + '>\u0000' + i + '\u0000</script>';
   });
 
-  // <base> 会成为页面相对 URL 的解析基准，从而使相对链接绕过代理
-  out = out.replace(RE_BASE, '');
-  // 内容被代理改写后 SRI 校验必然失败，去掉 integrity 以免脚本/样式被浏览器丢弃
-  out = out.replace(RE_INTEGRITY, '');
+  // 剥离 <base> 与 integrity（一次扫描，避免多轮全文正则）。
+  // 先做 O(n) 快速预筛：绝大多数文档没有这两种结构，直接跳过全文正则。
+  if (RE_STRIP_TEST.test(content)) out = out.replace(RE_STRIP, '');
 
-  // 绝对 URL
-  out = out.replace(RE_ABS_URL, mapAbs);
-  // 协议相对 //host/...（前置字符保证不匹配到已生成的 /p/... 路径）
-  out = out.replace(RE_SCHEME_REL, (m, pre) => pre + mapRel(m.slice(pre.length)));
-
-  // HTML 属性中的根相对路径
-  out = out.replace(RE_ATTR_ROOT, (m, pre, p) => {
-    if (mapped(p)) return m;
-    return pre + rootPrefix + '/' + p;
-  });
-  // srcset / data-srcset：逗号分隔的多资源列表，逐项重写
-  out = out.replace(RE_SRCSET, (m, pre, val, post) => {
-    const rewritten = val.split(',').map(s => s.trim()).filter(Boolean).map(it => {
-      const parts = it.split(/\s+/);
-      const u = parts[0] || '';
-      if (!u) return it;
-      if (u.startsWith('//')) parts[0] = mapRel(u);
-      else if (/^https?:/i.test(u)) parts[0] = mapAbs(u);
-      else if (u.startsWith('/') && !mapped(u.slice(1))) parts[0] = rootPrefix + u;
-      return parts.join(' ');
-    });
-    return pre + rewritten.join(', ') + post;
-  });
-  // CSS url(/...)
-  out = out.replace(RE_CSS_URL_ROOT, (m, p) => {
-    if (mapped(p)) return m;
-    return 'url(' + rootPrefix + '/' + p;
+  // 单轮替换全部 URL 形态：绝对 / 协议相对 / 属性根相对 / srcset / CSS url(/...)
+  out = out.replace(RE_ALL_URL, (m, ...args) => {
+    const g = args[args.length - 1];
+    if (g.abs !== undefined) return mapAbs(g.abs);
+    if (g.rel !== undefined) return g.relpre + mapRel(g.rel);
+    if (g.attr !== undefined) {
+      if (mapped(g.attrpath)) return m;
+      return g.attr + rootPrefix + '/' + g.attrpath;
+    }
+    if (g.srcset !== undefined) {
+      const rewritten = g.ssval.split(',').map(s => s.trim()).filter(Boolean).map(it => {
+        const parts = it.split(/\s+/);
+        const u = parts[0] || '';
+        if (!u) return it;
+        if (u.startsWith('//')) parts[0] = mapRel(u);
+        else if (/^https?:/i.test(u)) parts[0] = mapAbs(u);
+        else if (u.startsWith('/') && !mapped(u.slice(1))) parts[0] = rootPrefix + u;
+        return parts.join(' ');
+      });
+      return g.srcset + rewritten.join(', ') + g.ssq;
+    }
+    if (g.csspath !== undefined) {
+      if (mapped(g.csspath)) return m;
+      return 'url(' + g.cssq + rootPrefix + '/' + g.csspath;
+    }
+    return m;
   });
   // 内联脚本内容按脚本规则回填（输出绝对地址，保证 new URL("...") 之类单参数用法可用）
   if (blocks.length) out = out.replace(HOLDER, (m, d) => rewriteLiteral(blocks[Number(d)]));
