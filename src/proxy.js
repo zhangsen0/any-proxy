@@ -217,7 +217,8 @@ async function proxyRequest(request, site, crossHost) {
   headersOut.delete('content-length');
 
   const kind = contentKind(ct);
-  const rewritten = isHtml && request.method === 'GET'
+  // 只有上游 2xx 才进缓存：上游偶发 5xx / 错误页不该被缓存 30s 放大故障窗口
+  const rewritten = isHtml && request.method === 'GET' && upstream.status >= 200 && upstream.status < 300
     ? cachedHtmlRewrite(site, crossHost, url, text, sitePrefix, base)
     : rewriteContent(text, site, sitePrefix, base, kind);
   if (isHtml) {
