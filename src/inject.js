@@ -325,7 +325,7 @@ function buildDocWritePage(html, site, sitePrefix, base, pageUrl) {
     if(/^(data|blob|javascript|mailto|tel|about|file|chrome|edge):/i.test(raw)) return raw;
     var u;
     try{
-      if(/^https?:\/\//i.test(raw)) u = new URL(raw);
+      if(/^https?:\\/\\//i.test(raw)) u = new URL(raw);
       else if(raw.indexOf('//')===0) u = new URL('https:'+raw);
       else u = new URL(raw, PAGE);
     }catch(e){ return raw; }
@@ -358,12 +358,12 @@ function buildDocWritePage(html, site, sitePrefix, base, pageUrl) {
   function absSrcset(v){
     if(!v) return v;
     return v.split(',').map(function(s){ s = s.trim(); if(!s) return s;
-      var seg = s.split(/\s+/); seg[0] = absUrl(seg[0]); return seg.join(' '); }).join(', ');
+      var seg = s.split(/\\s+/); seg[0] = absUrl(seg[0]); return seg.join(' '); }).join(', ');
   }
   function origSrcset(v){
     if(!v) return v;
     return v.split(',').map(function(s){ s = s.trim(); if(!s) return s;
-      var seg = s.split(/\s+/); seg[0] = getOriginal(seg[0]); return seg.join(' '); }).join(', ');
+      var seg = s.split(/\\s+/); seg[0] = getOriginal(seg[0]); return seg.join(' '); }).join(', ');
   }
   // ---------- ProxyLocation：get 返回原始 URL，set 写回代理 ----------
   var ORIG = null;
@@ -606,7 +606,7 @@ function buildDocWritePage(html, site, sitePrefix, base, pageUrl) {
     if(/^(data|blob|javascript|mailto|tel|about|file):/i.test(raw)) return raw;
     var u;
     try{
-      if(/^https?:\/\//i.test(raw)) u = new URL(raw);
+      if(/^https?:\\/\\//i.test(raw)) u = new URL(raw);
       else if(raw.indexOf('//')===0) u = new URL('https:'+raw);
       else u = new URL(raw, PAGE);
     }catch(e){ return raw; }
@@ -619,7 +619,7 @@ function buildDocWritePage(html, site, sitePrefix, base, pageUrl) {
   function fixSrcset(v){
     if(!v) return v;
     return v.split(',').map(function(s){ s = s.trim(); if(!s) return s;
-      var seg = s.split(/\s+/); seg[0] = absUrl(seg[0]); return seg.join(' '); }).join(', ');
+      var seg = s.split(/\\s+/); seg[0] = absUrl(seg[0]); return seg.join(' '); }).join(', ');
   }
   function convContent(s){
     if(!s) return s;
@@ -630,7 +630,7 @@ function buildDocWritePage(html, site, sitePrefix, base, pageUrl) {
     s = s.split('location.replace(').join('__apLocation.replace(');
     s = s.split('location.assign(').join('__apLocation.assign(');
     if(s.indexOf('http') === -1) return s;
-    return s.replace(/(["'])(https?:\/\/[^"'\s][^"']*)\1/g, function(m, q, u){
+    return s.replace(/(["'])(https?:\\/\\/[^"'\\s][^"']*)\\1/g, function(m, q, u){
       var a = absUrl(u); return a === u ? m : q + a + q;
     });
   }
@@ -659,15 +659,16 @@ function buildDocWritePage(html, site, sitePrefix, base, pageUrl) {
         if(c !== el.textContent) el.textContent = c;
       }
       if(el.tagName === 'STYLE' && el.textContent){
-        var sc = el.textContent.replace(/url\((['"]?)(https?:\/\/[^)'"]+|\/\/[^)'"]+)\1\)/g, function(m, q, u){
+        var sc = el.textContent.replace(/url\((['"]?)(https?:\\/\\/[^)'"]+|\\/\\/[^)'"]+)\\1\)/g, function(m, q, u){
           var a = absUrl(u); return a === u ? m : 'url(' + q + a + q + ')';
         });
         if(sc !== el.textContent) el.textContent = sc;
       }
     }
     var out = '<!DOCTYPE html>' + doc.documentElement.outerHTML;
-    if(/<\/body>/i.test(out)) out = out.replace(/<\/body>/i, hook + '</body>');
-    else out += hook;
+    var HOOK = ${JSON.stringify(hook).replace(/<\/script>/gi, '<\\/script>')};
+    if(/<\\/body>/i.test(out)) out = out.replace(/<\\/body>/i, HOOK + '</body>');
+    else out += HOOK;
     document.open();
     document.write(out);
     document.close();
