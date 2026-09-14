@@ -316,10 +316,14 @@ async function proxyRequest(request, site, crossHost, ctx) {
   headersOut.delete('content-length');
 
   const kind = contentKind(ct);
+  // 外部脚本文件原样透传（不做 URL 字面量改写）：
+  // SPA（React 等）在初始化时会按字面量精确匹配 origin / 域名，改写会静默破坏其运行时判断
+  // （表现为水合不触发、按钮无事件）。绝对 URL 的资源请求由前端注入脚本的 fetch/XHR/DOM hook 兜底。
+  const isJsFile = /javascript|ecmascript|application\/x-js/i.test(ct);
   // 只有上游 2xx 才进缓存：上游偶发 5xx / 错误页不该被缓存 30s 放大故障窗口
   const rewritten = isHtml && request.method === 'GET' && upstream.status >= 200 && upstream.status < 300
     ? cachedHtmlRewrite(site, crossHost, url, text, sitePrefix, base)
-    : rewriteContent(text, site, sitePrefix, base, kind);
+    : isJsFile ? text : rewriteContent(text, site, sitePrefix, base, kind);
   if (isHtml) {
     // 运行时映射脚本只给「导航文档」注入：XHR/turbo 拉取的 HTML 片段不再重复带 9KB 脚本，
     // 页面级的注入脚本会持续修复运行时插入的 DOM，行为一致但省掉大量冗余字节
