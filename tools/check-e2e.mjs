@@ -62,27 +62,35 @@ async function browserChecks() {
     check('无脚本语法错误', bad.length === 0, bad.slice(0, 2).join(' | '));
 
     // 点「Code」按钮：展开下拉说明页面脚本已挂载
-    const opened = await page.evaluate(async () => {
+    // 注意：不能在 evaluate 内部 await 后读 DOM —— 页面若发生导航，执行上下文销毁会抛
+    // ProtocolError（Execution context was destroyed）。所有跨导航的读取都在 evaluate 外部做。
+    const codeBtn = await page.evaluate(() => {
       const btn = [...document.querySelectorAll('button, summary')]
         .find(b => /^\s*Code\s*$/.test((b.textContent || '').trim()));
-      if (!btn) return { found: false };
+      if (!btn) return null;
       btn.click();
-      await new Promise(r => setTimeout(r, 1000));
-      const el = document.querySelector('.SelectMenu, [data-target*="clone"], #clone-url-input');
-      return { found: true, expanded: btn.getAttribute('aria-expanded'), menu: !!el };
+      return true;
     });
+    await new Promise(r => setTimeout(r, 1500));
+    const opened = codeBtn ? await page.evaluate(() => {
+      const btn = [...document.querySelectorAll('button, summary')]
+        .find(b => /^\s*Code\s*$/.test((b.textContent || '').trim()));
+      const el = document.querySelector('.SelectMenu, [data-target*="clone"], #clone-url-input');
+      return { found: true, expanded: btn ? btn.getAttribute('aria-expanded') : null, menu: !!el };
+    }) : { found: false };
     check('按钮可点击（Code 菜单展开）', opened.found && (opened.expanded === 'true' || opened.menu), JSON.stringify(opened));
 
-    // 点文件链接：应发生站内导航
-    const nav = await page.evaluate(async () => {
-      const before = location.href;
+    // 点文件链接：应发生站内导航。点击与后续读取分开，避免导航销毁执行上下文
+    const before = await page.evaluate(() => location.href);
+    const clicked = await page.evaluate(() => {
       const a = [...document.querySelectorAll('a')].find(x => /^(README\.md|wrangler\.toml|worker\.js)$/.test((x.textContent || '').trim()));
-      if (!a) return { found: false, before };
+      if (!a) return false;
       a.click();
-      await new Promise(r => setTimeout(r, 2500));
-      return { found: true, before, after: location.href };
+      return true;
     });
-    check('链接可跳转', nav.found && nav.after !== nav.before && nav.after.includes(`/p/${SITE}/`), JSON.stringify(nav).slice(0, 160));
+    await new Promise(r => setTimeout(r, 2500));
+    const after = await page.evaluate(() => location.href).catch(() => before);
+    check('链接可跳转', clicked && after !== before && after.includes(`/p/${SITE}/`), JSON.stringify({ clicked, before, after }).slice(0, 160));
   } finally {
     await browser.close();
   }
