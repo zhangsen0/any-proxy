@@ -62,20 +62,39 @@ async function listAll() {
     cursor = page.list_complete === true ? '' : (page.cursor || '');
   } while (cursor && keys.length < 5000);
 
+  const now = nowMs();
   const items = (await Promise.all(keys.map(async (k) => {
     try {
       const v = await runtime.KV.get(k.name);
       return v ? JSON.parse(v) : null;
     } catch { return null; }
   }))).filter(Boolean);
-  items.sort((a, b) => String(b.created_at || '').localeCompare(String(a.created_at || '')));
-  return items;
+
+  // 机会式清理：过期记录直接删除（停用但未过期的保留，便于管理员重新启用）。
+  // 无需 Cron 触发器，管理员下次打开列表或客户端拉取过期链接时自然回收，避免 D1 堆积垃圾数据。
+  const live = [];
+  for (const item of items) {
+    if (item && item.expires_at && new Date(item.expires_at).getTime() <= now) {
+      try { await runtime.KV.delete(PREFIX + item.id); } catch {}
+    } else if (item) {
+      live.push(item);
+    }
+  }
+  live.sort((a, b) => String(b.created_at || '').localeCompare(String(a.created_at || '')));
+  return live;
 }
 
 async function get(id) {
   try {
     const v = await runtime.KV.get(PREFIX + String(id));
-    return v ? JSON.parse(v) : null;
+    if (!v) return null;
+    const rec = JSON.parse(v);
+    // 拉取命中已过期记录时顺手删除，避免失效链接长期残留。
+    if (rec && rec.expires_at && new Date(rec.expires_at).getTime() <= nowMs()) {
+      try { await runtime.KV.delete(PREFIX + String(id)); } catch {}
+      return null;
+    }
+    return rec;
   } catch { return null; }
 }
 
