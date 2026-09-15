@@ -325,18 +325,36 @@ export default {
 					响应.headers.set('Set-Cookie', 'auth=; Path=/; Max-Age=0; HttpOnly');
 					return 响应;
 				} else if (访问路径 === 'sub') {//处理订阅请求
-					const 订阅TOKEN = await MD5MD5(host + userID), 作为优选订阅生成器 = ['1', 'true'].includes(env.BEST_SUB) && url.searchParams.get('host') === 'example.com' && url.searchParams.get('uuid') === '00000000-0000-4000-8000-000000000000' && UA.toLowerCase().includes('tunnel (https://github.com/' + 特征码字典[1] + '/edge');
 					const 请求TOKEN = url.searchParams.get('token');
-					const 用户客户端请求订阅 = 请求TOKEN === 订阅TOKEN;
 					const 当前日序号 = Math.floor(Date.now() / 86400000);
-					const 订阅转换后端TOKEN种子 = base64SecretEncode(订阅TOKEN, userID);
+					// 临时订阅：外部转换后端回调 /sub 携带的是「临时 UUID」衍生的日 token，
+					// 主 userID 校验不会命中；仅当主 token 未命中时，按活跃临时 UUID 重算日 token，
+					// 命中则本请求改用该临时 UUID 生成订阅内容。
+					let 生效userID = userID;
+					const 主订阅TOKEN = await MD5MD5(host + userID);
+					const 主种子 = base64SecretEncode(主订阅TOKEN, userID);
+					const [主今日, 主昨日] = await Promise.all([
+						MD5MD5(主种子 + 当前日序号), MD5MD5(主种子 + (当前日序号 - 1)),
+					]);
+					if (请求TOKEN && 请求TOKEN !== 主订阅TOKEN && 请求TOKEN !== 主今日 && 请求TOKEN !== 主昨日 && 额外合法UUID集合.size) {
+						for (const tu of 额外合法UUID集合) {
+							const tSubToken = await MD5MD5(host + tu);
+							const tSeed = base64SecretEncode(tSubToken, tu);
+							const tToday = await MD5MD5(tSeed + 当前日序号);
+							const tYesterday = await MD5MD5(tSeed + (当前日序号 - 1));
+							if (请求TOKEN === tToday || 请求TOKEN === tYesterday) { 生效userID = tu; break; }
+						}
+					}
+					const 订阅TOKEN = await MD5MD5(host + 生效userID), 作为优选订阅生成器 = ['1', 'true'].includes(env.BEST_SUB) && url.searchParams.get('host') === 'example.com' && url.searchParams.get('uuid') === '00000000-0000-4000-8000-000000000000' && UA.toLowerCase().includes('tunnel (https://github.com/' + 特征码字典[1] + '/edge');
+					const 用户客户端请求订阅 = 请求TOKEN === 订阅TOKEN;
+					const 订阅转换后端TOKEN种子 = base64SecretEncode(订阅TOKEN, 生效userID);
 					const [今日订阅转换后端专属TOKEN, 昨日订阅转换后端专属TOKEN] = await Promise.all([
 						MD5MD5(订阅转换后端TOKEN种子 + 当前日序号),
 						MD5MD5(订阅转换后端TOKEN种子 + (当前日序号 - 1)),
 					]);
 					const 订阅转换后端请求订阅 = 请求TOKEN === 今日订阅转换后端专属TOKEN || 请求TOKEN === 昨日订阅转换后端专属TOKEN;
 					if (用户客户端请求订阅 || 订阅转换后端请求订阅 || 作为优选订阅生成器) {
-						config_JSON = await 读取config_JSON(env, host, userID, UA);
+						config_JSON = await 读取config_JSON(env, host, 生效userID, UA);
 						if (作为优选订阅生成器) ctx.waitUntil(请求日志记录(env, request, 访问IP, 'Get_Best_SUB', config_JSON, false));
 						else ctx.waitUntil(请求日志记录(env, request, 访问IP, 'Get_SUB', config_JSON));
 						const ua = UA.toLowerCase();
@@ -452,7 +470,7 @@ export default {
 									try {
 										const 代理协议 = 链式代理匹配[1].toLowerCase(), 代理参数 = 链式代理匹配[2];
 										const 链式代理数据 = { type: 代理协议, ...获取SOCKS5账号(代理参数, 获取代理默认端口(代理协议)) };
-										完整节点路径 = `/video/${base64SecretEncode(JSON.stringify(链式代理数据), userID) + (config_JSON.启用0RTT ? '?ed=2560' : '')}`;
+										完整节点路径 = `/video/${base64SecretEncode(JSON.stringify(链式代理数据), 生效userID) + (config_JSON.启用0RTT ? '?ed=2560' : '')}`;
 										节点备注 = 节点备注.replace(链式代理匹配[0], '').trim() || 节点地址;
 									} catch (error) {
 										console.warn(`[订阅内容] 链式代理解析失败，已忽略该指令: ${链式代理匹配[0]} (${error && error.message ? error.message : error})`);
