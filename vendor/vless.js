@@ -1,5 +1,28 @@
 ﻿const Version = '2026-09-04 16:24:13';
 let config_JSON, 缓存SOCKS5白名单 = null, 调试日志打印 = false;
+// ===== any-proxy 临时订阅补丁：允许 tempsub:* 记录中未过期、未停用的 UUID 同时作为合法用户（主 UUID 行为不变）=====
+let 额外合法UUID集合 = new Set();
+async function 加载临时UUID集合(env) {
+	const now = Date.now();
+	if (加载临时UUID集合._cacheAt && now - 加载临时UUID集合._cacheAt < 60000 && 加载临时UUID集合._cache) return 加载临时UUID集合._cache;
+	const s = new Set();
+	try {
+		if (env && env.KV && typeof env.KV.list === 'function') {
+			const page = await env.KV.list({ prefix: 'tempsub:', limit: 100 });
+			for (const k of (page.keys || [])) {
+				try {
+					const v = await env.KV.get(k.name);
+					if (!v) continue;
+					const o = JSON.parse(v);
+					if (o && o.uuid && !o.disabled && (!o.expires_at || new Date(o.expires_at).getTime() > Date.now())) s.add(String(o.uuid).toLowerCase());
+				} catch {}
+			}
+		}
+	} catch {}
+	加载临时UUID集合._cacheAt = now;
+	加载临时UUID集合._cache = s;
+	return s;
+}
 let SOCKS5白名单 = ['*tapecontent.net', '*cloudatacdn.com', '*loadshare.org', '*cdn-centaurus.com', 'scholar.google.com'];
 const Pages静态页面 = 'https://edt-pages.github.io';
 ///////////////////////////////////////////////////////全局常量和工具函数///////////////////////////////////////////////
@@ -32,6 +55,7 @@ export default {
 		const uuidRegex = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$/;
 		const envUUID = env.UUID || env.uuid;
 		const userID = (envUUID && uuidRegex.test(envUUID)) ? envUUID.toLowerCase() : [userIDMD5.slice(0, 8), userIDMD5.slice(8, 12), '4' + userIDMD5.slice(13, 16), '8' + userIDMD5.slice(17, 20), userIDMD5.slice(20)].join('-');
+		额外合法UUID集合 = await 加载临时UUID集合(env);
 		const hosts = env.HOST ? (await 整理成数组(env.HOST)).map(h => h.toLowerCase().replace(/^https?:\/\//, '').split('/')[0].split(':')[0]) : [url.hostname];
 		const host = hosts[0];
 		const 访问路径 = url.pathname.slice(1).toLowerCase();
@@ -1665,7 +1689,14 @@ async function 处理WS请求(request, yourUUID, url, 反代上下文 = {}) {
 		}
 		if (await 写入远端(chunk)) return;
 		if (判断协议类型 === '木马') {
-			const 解析结果 = 解析木马请求(chunk, yourUUID);
+			let effectiveUUID = yourUUID;
+			let 解析结果 = 解析木马请求(chunk, yourUUID);
+			if (解析结果?.hasError && 额外合法UUID集合.size) {
+				for (const tu of 额外合法UUID集合) {
+					const rt = 解析木马请求(chunk, tu);
+					if (!rt.hasError) { 解析结果 = rt; effectiveUUID = tu; break; }
+				}
+			}
 			if (解析结果?.hasError) throw new Error(解析结果.message || 'Invalid trojan request');
 			const { port, hostname, rawClientData, isUDP } = 解析结果;
 			if (isSpeedTestSite(hostname) && 反代上下文.代理类型 === null) {
@@ -1680,12 +1711,18 @@ async function 处理WS请求(request, yourUUID, url, 反代上下文 = {}) {
 				if (有效数据长度(rawClientData) > 0) return 转发木马UDP数据(rawClientData, serverSock, 木马UDP上下文, request);
 				return;
 			}
-			await forwardataTCP(hostname, port, rawClientData, serverSock, null, remoteConnWrapper, yourUUID, request, 反代上下文, true, 当前块字节 || 数据转Uint8Array(chunk));
+			await forwardataTCP(hostname, port, rawClientData, serverSock, null, remoteConnWrapper, effectiveUUID, request, 反代上下文, true, 当前块字节 || 数据转Uint8Array(chunk));
 		} else {
 			判断是否是木马 = false;
 			当前块字节 = 当前块字节 || 数据转Uint8Array(chunk);
 			const bytes = 当前块字节;
-			const 解析结果 = 解析魏烈思请求(bytes, yourUUID);
+			let effectiveUUID = yourUUID;
+			try {
+				const hex = [...bytes.subarray(1, 17)].map(b => b.toString(16).padStart(2, '0')).join('');
+				const puuid = (hex.slice(0, 8) + '-' + hex.slice(8, 12) + '-' + hex.slice(12, 16) + '-' + hex.slice(16, 20) + '-' + hex.slice(20, 32)).toLowerCase();
+				if (额外合法UUID集合.has(puuid)) effectiveUUID = puuid;
+			} catch {}
+			const 解析结果 = 解析魏烈思请求(bytes, effectiveUUID);
 			if (解析结果?.hasError) throw new Error(解析结果.message || 'Invalid 魏烈思 request');
 			const { port, hostname, version, isUDP, rawClientData } = 解析结果;
 			const respHeader = new Uint8Array([version, 0]);
@@ -1702,7 +1739,7 @@ async function 处理WS请求(request, yourUUID, url, 反代上下文 = {}) {
 				if (判断是否是木马) return 转发木马UDP数据(rawData, serverSock, 木马UDP上下文, request);
 				return forwardataudp(rawData, serverSock, respHeader, request);
 			}
-			await forwardataTCP(hostname, port, rawData, serverSock, respHeader, remoteConnWrapper, yourUUID, request, 反代上下文);
+			await forwardataTCP(hostname, port, rawData, serverSock, respHeader, remoteConnWrapper, effectiveUUID, request, 反代上下文);
 		}
 	};
 

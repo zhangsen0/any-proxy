@@ -3,7 +3,8 @@ import { json, b64, esc, isNavigation } from './util.js';
 import { bindRuntime, runtime } from './runtime.js';
 import { getSite } from './sites.js';
 import { isAuthed, handleLogin, handleLogout, loginPage } from './auth.js';
-import { adminPage, handleAdmin } from './admin.js';
+import { adminPage, handleAdmin, tempSubPage } from './admin.js';
+import { get as getTempSub, isActive as isTempSubActive, subToken as tempSubToken } from './tempsubs.js';
 import { proxyRequest, friendlyError, handleWebSocket } from './proxy.js';
 import { injectHomeButton } from './inject.js';
 import { CROSS_PREFIX } from './url.js';
@@ -56,6 +57,27 @@ async function handleRequest(request, env, ctx) {
 
   // edgetunnel 管理面板使用根路径（页面 JS 内 API 均为 /admin/...，无法加前缀），
   // 将 /admin /login /logout 转发给代理引擎（与 any-proxy 的 /__admin /__login 不冲突）
+  // 临时订阅拉取：/tsub/<id>（其后的查询参数透传给 /sub）。
+  // 命中有效临时记录后，以该记录的 UUID 作为 env.UUID 调用代理引擎，
+  // 生成与主订阅完全一致、仅 UUID 不同的节点；不修改任何面板配置。
+  const tsubMatch = path.match(/^\/tsub\/([^/]+)(\/.*)?$/);
+  if (tsubMatch) {
+    const rec = await getTempSub(decodeURIComponent(tsubMatch[1]));
+    if (!isTempSubActive(rec)) {
+      return new Response('subscription unavailable: expired or disabled', {
+        status: 403,
+        headers: { 'content-type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' },
+      });
+    }
+    // 与主订阅同一口径计算 token：MD5MD5(host + uuid)，host 取请求 hostname。
+    const token = await tempSubToken(url.hostname, rec.uuid);
+    const subUrl = new URL(request.url);
+    subUrl.pathname = '/sub';
+    subUrl.searchParams.set('token', token);
+    const subReq = new Request(subUrl.toString(), request);
+    return await vlessHandler.fetch(subReq, { ...env, KV: runtime.KV, UUID: rec.uuid }, ctx);
+  }
+
   if (path === '/login' || path === '/admin' || path.startsWith('/admin/') || path === '/logout' || path === '/sub' || path.startsWith('/sub/')) {
     // 统一登出：面板/主页任何登出入口都同时清除两个子系统的 cookie，并回主页
     if (path === '/logout') {
@@ -99,6 +121,14 @@ async function handleRequest(request, env, ctx) {
   if (path === '/' || path === '/__admin') {
     const resp = await adminPage(authed, url.origin, env);
     // 防缓存：历史出现浏览器/CF边缘缓存旧版HTML导致列表一直加载中
+    resp.headers.set('Cache-Control', 'no-store');
+    return resp;
+  }
+
+  // 临时订阅管理页：仅登录后可访问
+  if (path === '/__tsub') {
+    if (!authed) return Response.redirect(new URL('/__login', request.url).toString(), 302);
+    const resp = await tempSubPage(url.origin);
     resp.headers.set('Cache-Control', 'no-store');
     return resp;
   }

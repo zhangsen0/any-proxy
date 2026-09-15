@@ -2,6 +2,7 @@ import { json, esc, kvKey, validTarget } from './util.js';
 import { runtime } from './runtime.js';
 import { listSites, getSite, autoSlug, validSlug, buildTarget, addSite } from './sites.js';
 import { autoUpdatePreferredDns, filterUsableIps, applyDnsWithSelfCheck } from './dns.js';
+import * as tempsubs from './tempsubs.js';
 
 const DEFAULT_PREF_DOMAINS = ['www.cloudflare.com', 'speed.cloudflare.com', 'time.cloudflare.com', 'one.one.one.one', 'www.gstatic.com', 'cdn.jsdelivr.net'];
 
@@ -283,6 +284,45 @@ async function handleAdmin(request, url, env) {
     }
   }
 
+  // ===================== 临时订阅管理 API（均需登录，已由 router.js 拦截）=====================
+  // 列表：返回每条记录及其当前状态与完整订阅链接
+  if (path === '/__api/tempsubs') {
+    if (request.method === 'GET') {
+      const items = await tempsubs.listAll();
+      const out = items.map((r) => ({
+        ...r,
+        active: tempsubs.isActive(r),
+        sub_url: `${url.origin}/tsub/${encodeURIComponent(r.id)}`,
+      }));
+      return json({ ok: true, items: out });
+    }
+    if (request.method === 'POST') {
+      let body = {};
+      try { body = await request.json(); } catch {}
+      const rec = await tempsubs.create({ name: body.name, days: body.days });
+      return json({ ok: true, item: { ...rec, active: true, sub_url: `${url.origin}/tsub/${encodeURIComponent(rec.id)}` } }, 201);
+    }
+  }
+
+  const tm = path.match(/^\/__api\/tempsubs\/([^/]+)$/);
+  if (tm) {
+    const id = decodeURIComponent(tm[1]);
+    const rec = await tempsubs.get(id);
+    if (!rec) return json({ error: '临时订阅不存在或已删除' }, 404);
+
+    if (request.method === 'DELETE') {
+      await tempsubs.remove(id);
+      return json({ ok: true });
+    }
+
+    if (request.method === 'PUT') {
+      let body = {};
+      try { body = await request.json(); } catch { return json({ error: 'invalid json' }, 400); }
+      const updated = await tempsubs.update(id, { name: body.name, days: body.days, disabled: body.disabled });
+      return json({ ok: true, item: { ...updated, active: tempsubs.isActive(updated), sub_url: `${url.origin}/tsub/${encodeURIComponent(updated.id)}` } });
+    }
+  }
+
   return json({ error: 'not found' }, 404);
 }
 
@@ -403,6 +443,15 @@ async function adminPage(authed, origin, env) {
       <div class="notice" style="font-size:12px;">VLESS / Trojan / SS 节点订阅、流量日志与优选 IP 配置（edgetunnel），与站点管理共用同一套登录。</div>
     </div>
     <a class="ghost-link" href="/admin" target="_blank" rel="noopener">打开代理面板 →</a>
+  </div>` : ''}
+
+  ${authed ? `
+  <div class="card" style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;">
+    <div>
+      <h2 style="margin:0 0 4px;">临时订阅管理</h2>
+      <div class="notice" style="font-size:12px;">创建限时有效的临时订阅链接（独立 UUID，默认 1 天到期），可改有效期、手动置为失效或删除；节点配置与代理面板一致。</div>
+    </div>
+    <a class="ghost-link" href="/__tsub" target="_blank" rel="noopener">打开临时订阅管理 →</a>
   </div>` : ''}
 
   ${authed ? `
@@ -921,4 +970,204 @@ if (addBtn) addBtn.addEventListener('click', async (e) => {
   });
 }
 
-export { handleAdmin, adminPage };
+// ===================== 临时订阅管理页 =====================
+// 独立页面 /__tsub：创建 / 改有效期 / 停用启用 / 删除临时订阅链接。
+// 服务端先渲染首屏列表，前端 JS 负责增删改后刷新，与主页风格一致。
+
+function statusBadge(rec) {
+  if (rec.disabled) return '<span class="badge off">已停用</span>';
+  if (!tempsubs.isActive(rec)) return '<span class="badge off">已过期</span>';
+  const left = new Date(rec.expires_at).getTime() - Date.now();
+  const d = Math.floor(left / 86400000);
+  const h = Math.floor((left % 86400000) / 3600000);
+  const remain = d > 0 ? `剩 ${d} 天 ${h} 时` : `剩 ${h} 时 ${Math.floor((left % 3600000) / 60000)} 分`;
+  return `<span class="badge on">有效 · ${remain}</span>`;
+}
+
+async function tempSubPage(origin) {
+  let listHtml = '<div class="empty">加载中…</div>';
+  try {
+    const items = await tempsubs.listAll();
+    listHtml = items.length ? items.map((r) => {
+      const url = `${origin}/tsub/${encodeURIComponent(r.id)}`;
+      return `<div class="tsub">
+  <div class="tsub-head">
+    <span class="tsub-name">${esc(r.name)} ${statusBadge(r)}</span>
+    <span style="display:inline-flex;gap:6px;flex-wrap:wrap;">
+      <button type="button" class="mini" data-renew="${esc(r.id)}">改有效期</button>
+      <button type="button" class="mini" data-toggle="${esc(r.id)}" data-disabled="${r.disabled ? '1' : '0'}">${r.disabled ? '恢复启用' : '置为失效'}</button>
+      <button type="button" class="danger mini" data-del="${esc(r.id)}">删除</button>
+    </span>
+  </div>
+  <div class="tsub-meta">UUID：<code>${esc(r.uuid)}</code></div>
+  <div class="tsub-meta">创建：${esc(r.created_at.replace('T', ' ').slice(0, 19))} · 到期：${esc(String(r.expires_at).replace('T', ' ').slice(0, 19))}</div>
+  <div class="tsub-meta">订阅链接：<code class="sub-url">${esc(url)}</code></div>
+  <div class="tsub-actions">
+    <button type="button" class="mini" data-copy="${esc(url)}" data-msg="m-${esc(r.id)}">复制订阅链接</button>
+    <span class="msg" id="m-${esc(r.id)}"></span>
+  </div>
+</div>`;
+    }).join('') : '<div class="empty">还没有临时订阅，创建一个吧。</div>';
+  } catch {
+    listHtml = '<div class="empty">列表加载失败，请刷新重试。</div>';
+  }
+
+  const html = `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>临时订阅管理 · Any-Proxy</title>
+<style>
+:root { --bg:#f4f6fb; --card:#fff; --line:#e2e8f0; --txt:#0f172a; --muted:#64748b; --accent:#2563eb; --accent-hover:#1d4ed8; --ok:#16a34a; --err:#dc2626; --input:#f1f5f9; --radius:14px; --radius-sm:10px; --shadow:0 1px 2px rgba(15,23,42,.04),0 6px 18px rgba(15,23,42,.06); }
+:root[data-theme="dark"] { --bg:#0f172a; --card:#1e293b; --line:#334155; --txt:#e2e8f0; --muted:#94a3b8; --accent:#38bdf8; --accent-hover:#7dd3fc; --ok:#4ade80; --err:#f87171; --input:#0b1220; }
+* { box-sizing:border-box; }
+body { margin:0; font-family:-apple-system,"PingFang SC","Microsoft YaHei",system-ui,sans-serif; background:var(--bg); color:var(--txt); min-height:100vh; font-size:14px; line-height:1.6; }
+.wrap { max-width:860px; margin:0 auto; padding:32px 16px 64px; }
+.topbar { display:flex; justify-content:space-between; align-items:center; gap:12px; margin-bottom:20px; flex-wrap:wrap; }
+h1 { font-size:20px; margin:0; }
+a.back { color:var(--accent); text-decoration:none; font-size:13px; }
+.card { background:var(--card); border:1px solid var(--line); border-radius:var(--radius); padding:20px; margin-bottom:16px; box-shadow:var(--shadow); }
+.card h2 { font-size:15px; margin:0 0 10px; }
+.hint { font-size:12px; color:var(--muted); margin:4px 0 0; }
+label { display:block; font-size:13px; color:var(--muted); margin:12px 0 6px; }
+input { width:100%; padding:10px 12px; border-radius:var(--radius-sm); border:1px solid var(--line); background:var(--input); color:var(--txt); font-size:14px; outline:none; }
+.row { display:flex; gap:10px; margin-top:14px; flex-wrap:wrap; align-items:center; }
+button { padding:9px 16px; border:none; border-radius:var(--radius-sm); font-size:14px; cursor:pointer; background:var(--accent); color:#fff; font-weight:600; }
+button:hover { background:var(--accent-hover); }
+button.mini { padding:6px 12px; font-size:12px; background:transparent; color:var(--accent); border:1px solid var(--accent); font-weight:400; }
+button.mini:hover { background:rgba(37,99,235,.1); }
+button.danger.mini { color:var(--err); border-color:var(--err); }
+button.danger.mini:hover { background:rgba(220,38,38,.1); }
+button.ghost { background:transparent; color:var(--muted); border:1px solid var(--line); }
+.tsub { border:1px solid var(--line); border-radius:var(--radius-sm); padding:14px; margin-bottom:12px; }
+.tsub-head { display:flex; justify-content:space-between; gap:10px; flex-wrap:wrap; align-items:center; }
+.tsub-name { font-weight:600; }
+.tsub-meta { color:var(--muted); font-size:12px; margin-top:6px; word-break:break-all; }
+.tsub-actions { display:flex; gap:8px; margin-top:10px; align-items:center; }
+code { font-family:ui-monospace,Menlo,Consolas,monospace; font-size:12px; }
+.sub-url { color:var(--accent); }
+.badge { display:inline-block; font-size:11px; padding:2px 8px; border-radius:999px; margin-left:6px; vertical-align:middle; }
+.badge.on { background:rgba(22,163,74,.12); color:var(--ok); }
+.badge.off { background:rgba(220,38,38,.12); color:var(--err); }
+.msg { font-size:12px; min-height:16px; }
+.msg.ok { color:var(--ok); } .msg.err { color:var(--err); }
+.empty { color:var(--muted); text-align:center; padding:24px 0; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="topbar">
+    <h1>临时订阅管理</h1>
+    <a class="back" href="/__admin">← 返回主页</a>
+  </div>
+
+  <div class="card">
+    <h2>创建临时订阅</h2>
+    <div class="hint">新建一条独立 UUID 的订阅链接，默认 1 天后到期；节点配置与代理面板完全一致。</div>
+    <label for="newName">备注名称（可选）</label>
+    <input id="newName" placeholder="例如：同事小王">
+    <label for="newDays">有效期（天，默认 1）</label>
+    <input id="newDays" type="number" min="1" max="3650" value="1" style="max-width:220px;">
+    <div class="row">
+      <button type="button" id="createBtn">创建</button>
+      <span class="msg" id="createMsg"></span>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>订阅列表</h2>
+    <div class="hint">「改有效期」可按天数重置到期时间；「置为失效」立即停用该链接（可再启用）；删除后链接永久失效。</div>
+    <div id="list" style="margin-top:12px;">${listHtml}</div>
+  </div>
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+async function api(path, opts = {}) {
+  const headers = { 'Content-Type': 'application/json', ...(opts.headers || {}) };
+  const res = await fetch(path, { ...opts, headers });
+  const data = await res.json().catch(() => ({}));
+  return { ok: res.ok, status: res.status, data };
+}
+function esc(s) { return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+function setMsg(id, text, isErr) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.textContent = text; el.className = 'msg ' + (isErr ? 'err' : 'ok');
+}
+function copyText(text, btn, msgId) {
+  const done = () => { if (btn) { const o = btn.textContent; btn.textContent = '已复制'; setTimeout(() => btn.textContent = o, 1500); } };
+  if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(text).then(done).catch(()=>{});
+  else { const ta = document.createElement('textarea'); ta.value = text; document.body.appendChild(ta); ta.select(); document.execCommand('copy'); document.body.removeChild(ta); done(); }
+}
+async function load() {
+  const box = $('#list');
+  const r = await api('/__api/tempsubs?t=' + Date.now());
+  if (r.status === 401) { location.href = '/__login'; return; }
+  if (!r.ok || !r.data) { box.innerHTML = '<div class="empty">加载失败，请刷新重试。</div>'; return; }
+  const items = r.data.items || [];
+  if (!items.length) { box.innerHTML = '<div class="empty">还没有临时订阅，创建一个吧。</div>'; return; }
+  box.innerHTML = items.map(x => {
+    const url = x.sub_url;
+    const badge = x.disabled ? '<span class="badge off">已停用</span>'
+      : (!x.active ? '<span class="badge off">已过期</span>'
+      : '<span class="badge on">有效</span>');
+    return '<div class="tsub">'
+      + '<div class="tsub-head"><span class="tsub-name">' + esc(x.name) + ' ' + badge + '</span>'
+      + '<span style="display:inline-flex;gap:6px;flex-wrap:wrap;">'
+      + '<button type="button" class="mini" data-renew="' + esc(x.id) + '">改有效期</button>'
+      + '<button type="button" class="mini" data-toggle="' + esc(x.id) + '" data-disabled="' + (x.disabled?'1':'0') + '">' + (x.disabled?'恢复启用':'置为失效') + '</button>'
+      + '<button type="button" class="danger mini" data-del="' + esc(x.id) + '">删除</button>'
+      + '</span></div>'
+      + '<div class="tsub-meta">UUID：<code>' + esc(x.uuid) + '</code></div>'
+      + '<div class="tsub-meta">创建：' + esc(String(x.created_at).replace('T',' ').slice(0,19)) + ' · 到期：' + esc(String(x.expires_at).replace('T',' ').slice(0,19)) + '</div>'
+      + '<div class="tsub-meta">订阅链接：<code class="sub-url">' + esc(url) + '</code></div>'
+      + '<div class="tsub-actions"><button type="button" class="mini" data-copy="' + esc(url) + '" data-msg="m-' + esc(x.id) + '">复制订阅链接</button><span class="msg" id="m-' + esc(x.id) + '"></span></div>'
+      + '</div>';
+  }).join('');
+  bindActions(box);
+}
+function bindActions(box) {
+  box.querySelectorAll('[data-copy]').forEach(b => b.onclick = () => copyText(b.dataset.copy, b, b.dataset.msg));
+  box.querySelectorAll('[data-del]').forEach(b => b.onclick = async () => {
+    if (!confirm('确认删除该临时订阅？链接将立即永久失效。')) return;
+    await api('/__api/tempsubs/' + encodeURIComponent(b.dataset.del), { method: 'DELETE' });
+    load();
+  });
+  box.querySelectorAll('[data-toggle]').forEach(b => b.onclick = async () => {
+    const disable = b.dataset.disabled !== '1';
+    await api('/__api/tempsubs/' + encodeURIComponent(b.dataset.toggle), { method: 'PUT', body: JSON.stringify({ disabled: disable }) });
+    load();
+  });
+  box.querySelectorAll('[data-renew]').forEach(b => b.onclick = async () => {
+    const v = prompt('设为几天后到期？（从现在开始计算）', '1');
+    if (v === null) return;
+    const days = parseInt(v, 10);
+    if (!days || days < 1) { alert('请输入大于 0 的天数'); return; }
+    await api('/__api/tempsubs/' + encodeURIComponent(b.dataset.renew), { method: 'PUT', body: JSON.stringify({ days }) });
+    load();
+  });
+}
+$('#createBtn').onclick = async () => {
+  const btn = $('#createBtn');
+  btn.disabled = true;
+  setMsg('createMsg', '创建中…');
+  try {
+    const r = await api('/__api/tempsubs', { method: 'POST', body: JSON.stringify({ name: $('#newName').value, days: $('#newDays').value }) });
+    if (r.ok) { setMsg('createMsg', '已创建', false); $('#newName').value=''; load(); }
+    else setMsg('createMsg', r.data.error || '创建失败', true);
+  } catch (e) { setMsg('createMsg', '请求失败', true); }
+  btn.disabled = false;
+};
+load();
+</script>
+</body>
+</html>`;
+  return new Response(html, {
+    status: 200,
+    headers: { 'Content-Type': 'text/html; charset=utf-8', 'Access-Control-Allow-Origin': '*' },
+  });
+}
+
+export { handleAdmin, adminPage, tempSubPage };
