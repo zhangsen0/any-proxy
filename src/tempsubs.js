@@ -18,6 +18,15 @@ const MIN_DAYS = 1;
 
 function nowMs() { return Date.now(); }
 
+// 默认名称：未填名称时用创建时间占位。服务端无浏览器时区，按 UTC+8 格式化并标注，
+// 避免把 UTC 时间误读成本地时间（与列表下方的本地时间展示保持一致）。
+function defaultName() {
+  const p = (n) => String(n).padStart(2, '0');
+  const d = new Date(Date.now() + 8 * 3600 * 1000); // 偏移到 UTC+8
+  const iso = d.toISOString().slice(0, 19).replace('T', ' ');
+  return '临时订阅 ' + iso + ' 北京时间';
+}
+
 function clampDays(days) {
   const n = parseInt(days, 10);
   if (!Number.isFinite(n)) return 1;
@@ -82,7 +91,7 @@ async function get(id) {
 async function create({ name, days }) {
   const rec = {
     id: generateId(),
-    name: String(name || '').trim() || ('临时订阅 ' + new Date().toISOString()),
+    name: String(name || '').trim() || defaultName(),
     uuid: generateUuid(),
     created_at: new Date().toISOString(),
     expires_at: new Date(nowMs() + clampDays(days) * DAY_MS).toISOString(),

@@ -1099,6 +1099,13 @@ async function api(path, opts = {}) {
   return { ok: res.ok, status: res.status, data };
 }
 function esc(s) { return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+// 客户端：把 UTC ISO 串格式化为浏览器本地时间展示
+function fmtLocal(iso) {
+  const d = new Date(iso);
+  if (isNaN(d)) return String(iso);
+  const p = n => String(n).padStart(2, '0');
+  return d.getFullYear() + '-' + p(d.getMonth()+1) + '-' + p(d.getDate()) + ' ' + p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
+}
 function setMsg(id, text, isErr) {
   const el = document.getElementById(id);
   if (!el) return;
