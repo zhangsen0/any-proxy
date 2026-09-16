@@ -984,6 +984,14 @@ function statusBadge(rec) {
   return `<span class="badge on">有效 · ${remain}</span>`;
 }
 
+// 记录存的是 UTC ISO 串；按浏览器本地时区展示，避免把 13:15 UTC 误读成本地时间。
+function fmtLocal(iso) {
+  const d = new Date(iso);
+  if (isNaN(d)) return String(iso);
+  const p = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+
 async function tempSubPage(origin) {
   let listHtml = '<div class="empty">加载中…</div>';
   try {
@@ -1000,7 +1008,7 @@ async function tempSubPage(origin) {
     </span>
   </div>
   <div class="tsub-meta">UUID：<code>${esc(r.uuid)}</code></div>
-  <div class="tsub-meta">创建：${esc(r.created_at.replace('T', ' ').slice(0, 19))} · 到期：${esc(String(r.expires_at).replace('T', ' ').slice(0, 19))}</div>
+  <div class="tsub-meta">创建：${esc(fmtLocal(r.created_at))} · 到期：${esc(fmtLocal(r.expires_at))}（本地时间）</div>
   <div class="tsub-meta">订阅链接：<code class="sub-url">${esc(url)}</code></div>
   <div class="tsub-actions">
     <button type="button" class="mini" data-copy="${esc(url)}" data-msg="m-${esc(r.id)}">复制订阅链接</button>
@@ -1121,7 +1129,7 @@ async function load() {
       + '<button type="button" class="danger mini" data-del="' + esc(x.id) + '">删除</button>'
       + '</span></div>'
       + '<div class="tsub-meta">UUID：<code>' + esc(x.uuid) + '</code></div>'
-      + '<div class="tsub-meta">创建：' + esc(String(x.created_at).replace('T',' ').slice(0,19)) + ' · 到期：' + esc(String(x.expires_at).replace('T',' ').slice(0,19)) + '</div>'
+      + '<div class="tsub-meta">创建：' + esc(fmtLocal(x.created_at)) + ' · 到期：' + esc(fmtLocal(x.expires_at)) + '（本地时间）</div>'
       + '<div class="tsub-meta">订阅链接：<code class="sub-url">' + esc(url) + '</code></div>'
       + '<div class="tsub-actions"><button type="button" class="mini" data-copy="' + esc(url) + '" data-msg="m-' + esc(x.id) + '">复制订阅链接</button><span class="msg" id="m-' + esc(x.id) + '"></span></div>'
       + '</div>';
