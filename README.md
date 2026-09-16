@@ -246,13 +246,23 @@ node tools/check-compress.mjs
 # 9. 代理链路冒烟（改任何一处请求处理链路后必跑）
 node tools/check-smoke.mjs
 
-# 7. 实测订阅里每个节点是否真的可用（需 Python 3）
+# 10. 实测订阅里每个节点是否真的可用（需 Python 3）
 SUB_URL=https://proxy.example.com/tsub/xxxx python3 - <<'EOF'
 import urllib.request
 open('/tmp/sub.txt','wb').write(urllib.request.urlopen('$SUB_URL').read())
 EOF
 python3 tools/check-nodes.py /tmp/sub.txt
 ```
+
+> `check-nodes.py` 分四级递进，越往下越能证明「真能用」：
+> `L1` TCP 端口可达 → `L2` 带 SNI 完成 TLS → `L3` WebSocket 拿到 101 →
+> **`L4` 真发一条 VLESS 请求把数据代理出网**。只有到 L4 才算端到端验证过，
+> 停在 L3 只能说明「握手通了」，不代表能转发。
+>
+> 两个坑在实测里都被踩过，脚本里已经处理掉了：探测目标要避开 Cloudflare 托管的站点
+> （CF 对自己边缘 IP 发来的明文 HTTP 请求直接回 400，会把健康节点误判成坏的），
+> 以及每个目标必须新开一条连接（同一条 WS 连接上重试第二个目标，服务端已经把它
+> 当作上一个流在收，第一个失败会连累后面全部失败）。
 
 ---
 
@@ -470,6 +480,25 @@ python3 tools/check-nodes.py /tmp/sub.txt 16
 - **开启伪装后自愈不工作了**：健康检查现在需要先用 `PASSWORD` 登录再读优选池，且已改为「按每条 A 记录逐个尝试」以应对 DNS 已指向故障 IP 的情况。手动触发一次 `Health Check & Auto Repair`，确认日志里没有「无法登录 Worker」的警告。
 - **为什么浏览器测速用 no-cors 计时**：直连 `https://IP` 时 SNI=IP，CF 无 IP 证书，TLS 必然失败，cors 模式永远测不通；改 no-cors 计时（握手耗时段≈延迟）做排序，可用性交给服务端 HTTP 探测。
 - **访问链接公开**：`/p/<id>/` 链接对任何知道的人都开放（管理功能仍受口令保护）。
+
+---
+
+## 项目文档
+
+按软件生命周期组织的产出文档放在 [`docs/`](./docs/)：
+
+| 文档 | 阶段 |
+|---|---|
+| [需求与迭代](./docs/01-需求与迭代.md) | 每轮需求的来源、取舍与验收 |
+| [架构设计](./docs/02-架构设计.md) | 模块地图、三档访客模型、降级策略 |
+| [开发规范](./docs/03-开发规范.md) | 这个项目特有的硬约束（含反例） |
+| [测试体系](./docs/04-测试体系.md) | 8 个自检脚本各守哪一段 |
+| [部署上线](./docs/05-部署上线.md) | 流水线三步、Secrets 清单、验收清单 |
+| [运维与自愈](./docs/06-运维与自愈.md) | 健康检查、假健康事故的教训 |
+| [踩坑记录](./docs/07-踩坑记录.md) | 13 个能复现的坑，按代价排序 |
+| [归档说明](./docs/08-归档说明.md) | 归档后能做什么、不能做什么 |
+
+> 第一次接手建议按 **踩坑记录 → 架构设计 → 部署上线** 的顺序读。
 
 ---
 
