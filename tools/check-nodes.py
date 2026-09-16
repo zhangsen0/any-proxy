@@ -46,7 +46,9 @@ def parse_nodes(text):
         query = {}
         if "?" in rest:
             rest, qs = rest.split("?", 1)
-            query = dict(urllib.parse.parse_qsl(qs))
+            # 这里需要百分号解码：订阅里的 path 写作 %2F，而 HTTP 请求行必须是 GET /，
+            # 原样发 %2F 会被服务端回 400 Bad Request。
+            query = dict(urllib.parse.parse_qsl(qs, keep_blank_values=True))
         # ss:// 的 userinfo 可能是 base64；vless/trojan 是明文 uuid@host:port
         host, port = None, None
         if "@" in rest:
@@ -73,11 +75,7 @@ def parse_nodes(text):
 
 
 # L4 的探测目标。都不托管在 Cloudflare 上（原因见 probe 里的注释），命中任一即算链路通。
-PROBE_TARGETS = [
-    ("httpbin.org", b"GET /get HTTP/1.1\r\nHost: httpbin.org\r\nConnection: close\r\n\r\n"),
-    ("www.baidu.com", b"GET / HTTP/1.1\r\nHost: www.baidu.com\r\nConnection: close\r\n\r\n"),
-    ("www.qq.com", b"GET / HTTP/1.1\r\nHost: www.qq.com\r\nConnection: close\r\n\r\n"),
-]
+PROBE_TARGETS = ["www.baidu.com", "httpbin.org", "www.qq.com"]
 
 
 def ws_frame(payload: bytes) -> bytes:
@@ -117,10 +115,65 @@ def vless_request(uuid: str, target_host: str, target_port: int, payload: bytes 
     return body + payload
 
 
+def forwardOnce(node, target, timeout):
+    """对一个目标跑完整链路：TCP→TLS→WS→VLESS 转发。每条连接只用一次。"""
+    host, port = node["host"], node["port"]
+    sni = node["query"].get("sni") or node["query"].get("host") or ""
+    # path 必须原样发出，不能 URL 解码：配置里的值是 %2F 这样的字面串，
+    # 服务端按原始字符串匹配，解码成 / 反而匹配不上。
+    path = node["query"].get("path") or "/"
+    sock = socket.create_connection((host, port), timeout=timeout)
+    try:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        tls = ctx.wrap_socket(sock, server_hostname=sni or host)
+        tls.settimeout(timeout)
+        key = base64.b64encode(os.urandom(16)).decode()
+        headers = [
+            f"GET {path} HTTP/1.1",
+            f"Host: {sni or host}",
+            "Upgrade: websocket",
+            "Connection: Upgrade",
+            f"Sec-WebSocket-Key: {key}",
+            "Sec-WebSocket-Version: 13",
+            "\r\n",
+        ]
+        tls.sendall("\r\n".join(headers).encode())
+        buf = b""
+        while b"\r\n\r\n" not in buf and len(buf) < 8192:
+            chunk = tls.recv(2048)
+            if not chunk:
+                break
+            buf += chunk
+        head = buf.split(b"\r\n", 1)[0].decode("utf-8", "replace")
+        if "101" not in head:
+            return b""
+        req = ("GET / HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n" % target).encode()
+        tls.sendall(ws_frame(vless_request(node["uuid"], target, 80, req)))
+        out = b""
+        for _ in range(12):
+            chunk = tls.recv(4096)
+            if not chunk:
+                break
+            out += chunk
+            if len(out) > 3000:
+                break
+        return out
+    finally:
+        try:
+            sock.close()
+        except Exception:
+            pass
+
+
 def probe(node, timeout=9):
     host, port = node["host"], node["port"]
     sni = node["query"].get("sni") or node["query"].get("host") or ""
-    path = urllib.parse.unquote(node["query"].get("path") or "/")
+    # path 必须原样发出，不能 URL 解码：节点配置的 path 是 %2F 这样的字面值，
+    # 服务端按原始字符串匹配，解码成 / 之后就匹配不上，表现为
+    # 「WS 握手正常但 VLESS 转发无回包」——很容易被误判成节点坏了。
+    path = node["query"].get("path") or "/"
     result = {"node": node, "level": "FAIL", "detail": ""}
 
     try:
@@ -167,25 +220,19 @@ def probe(node, timeout=9):
             return result
         result["level"] = "L3"
         # L4：真正把一条 HTTP 请求代理出去，验证不只是握手通、转发也通。
-        # 目标刻意选择没有托管在 Cloudflare 上的站点：CF 对自己边缘 IP 发来的明文
-        # HTTP 请求会直接回 400，那属于目标侧行为，用它当判据会把健康节点误判成坏的。
+        # 每个目标都必须新开一条连接：WS 握手一次只能携带一次 VLESS 首包，
+        # 在同一个连接上重试第二个目标时，服务端已经把这条连接当成上一个流在收，
+        # 结果会「第一个目标也不通，后面的目标全部跟着无回包」，很容易误判。
         res = None
-        for tgt, req in PROBE_TARGETS:
+        for tgt in PROBE_TARGETS:
+            pass
             try:
-                tls.sendall(ws_frame(vless_request(node["uuid"], tgt, 80, req)))
-                buf = b""
-                for _ in range(10):
-                    chunk = tls.recv(4096)
-                    if not chunk:
-                        break
-                    buf += chunk
-                    if len(buf) > 3000:
-                        break
-                if b"HTTP/" in buf:
-                    res = (tgt, buf)
-                    break
+                buf = forwardOnce(node, tgt, timeout)
             except Exception:
                 continue
+            if buf and b"HTTP/" in buf:
+                res = (tgt, buf)
+                break
         if res:
             tgt, buf = res
             result["level"] = "L4"
