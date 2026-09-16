@@ -201,6 +201,7 @@ tools/                 本地开发与验证脚本（不参与部署）
   check-nodes.py       实测订阅里每个节点的可用性（TCP→TLS→WebSocket→真实转发出网）
   check-anycast.mjs    CDN 任播兜底自检：CIDR 判定、数据源降级、绝不编造国名
   check-compress.mjs   出口压缩与上游请求策略自检：压完必须能还原、SSE/二进制不压、幂等请求才允许对冲
+  check-smoke.mjs      路由级冒烟：从请求入口走到页面出口，专治「单测全绿但组合起来就炸」
 .github/workflows/
   deploy-cloudflare.yml   push master 自动部署（含 D1 迁移应用 + Secret 注入）
   healthcheck.yml         每 12 小时健康检查 + 自愈（workflow_dispatch 可手动触发）
@@ -241,6 +242,9 @@ node tools/check-anycast.mjs
 
 # 8. 出口压缩与请求策略自检（改 compress.js / proxy.js 后必跑）
 node tools/check-compress.mjs
+
+# 9. 代理链路冒烟（改任何一处请求处理链路后必跑）
+node tools/check-smoke.mjs
 
 # 7. 实测订阅里每个节点是否真的可用（需 Python 3）
 SUB_URL=https://proxy.example.com/tsub/xxxx python3 - <<'EOF'
