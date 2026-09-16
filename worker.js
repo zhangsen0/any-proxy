@@ -20,6 +20,7 @@
 import { bindRuntime } from './src/runtime.js';
 import { handleRequest } from './src/router.js';
 import { scheduledDnsCheck } from './src/dns.js';
+import { readConfig, isActive, renderNotFound } from './src/disguise.js';
 
 export default {
   async fetch(request, env, ctx) {
@@ -27,7 +28,13 @@ export default {
       bindRuntime(env);
       return await handleRequest(request, env, ctx);
     } catch (e) {
-      // 全局兜底：任何未捕获异常返回 500 + 错误信息，避免 CF 层 530（并发突发时曾集体 530）
+      // 全局兜底：任何未捕获异常返回 500 + 错误信息，避免 CF 层 530（并发突发时曾集体 530）。
+      // 但伪装开启时不能把内部异常原文吐给陌生人 —— 那等于替攻击者解释了一次失败原因，
+      // 也可能顺带泄漏内部路径与配置。此时代之以「用当前伪装模板渲染的 404」。
+      try {
+        const cfg = await readConfig(env);
+        if (isActive(cfg)) return renderNotFound(cfg, request);
+      } catch {}
       return new Response('proxy error: ' + String(e && e.message || e).slice(0, 500), {
         status: 500,
         headers: { 'content-type': 'text/plain; charset=utf-8' },

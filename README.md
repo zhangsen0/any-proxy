@@ -37,6 +37,7 @@
 - **无写死配置**：目标域名由变量或请求 hostname 推导，边缘 IP 段运行时拉取并缓存，CI 也要求显式配置，不存在会悄悄生效的内置常量。
 - **健康检查自愈**：GitHub Actions 每 12 小时从外部网络真实验证 A 记录，发现 1034 / 不可达时自动扫描可用 IP，经 Worker API 写回可用集并重写 A 记录。
 - **登录保护**：设置 `PASSWORD` 后，管理 / 编辑 / 代理面板需登录；未登录可只读查看站点列表、复制链接。
+- **首页伪装**：根路径可渲染成一个普通站点页面（维护页 / 企业官网 / 博客 / 下载页 / 自定义 HTML），管理面板移到隐蔽入口；未进门者看不到任何面板痕迹，也拿不到任何 API 数据。详见 [首页伪装](#首页伪装)。
 - **主题**：亮 / 暗 / 跟随系统三档，本地保存。
 
 ---
@@ -78,6 +79,8 @@ GitHub Actions 自动执行：按 `STORAGE_BACKEND` 裁剪 `wrangler.toml`（**�
 | `CF_ZONE_ID` | 自定义域名所在 Zone 的 ID（DNS 自动优选需要） |
 | `PASSWORD` | 管理口令（也作为代理面板管理员密码；healthcheck 自愈写回 GOOD_IPS 也需要） |
 | `UUID` | 代理节点 UUID（可选，不设置则由 PASSWORD 派生） |
+| `DISGUISE_PATH` | **首页伪装**的隐蔽入口路径，如 `/mypanel`。走 Secret 而非变量是刻意的：入口信息不该出现在 Actions 日志里（与 `DISGUISE_TOKEN` 至少配一个） |
+| `DISGUISE_TOKEN` | **首页伪装**的 URL 口令；配置后访问 `任意路径?k=<口令>` 即可进门（与 `DISGUISE_PATH` 至少配一个） |
 
 > `KV_NAMESPACE_ID` 不再需要：KV 绑定已写入 `wrangler.toml`，健康检查经 Worker API 读写存储，与后端无关。
 
@@ -89,6 +92,8 @@ GitHub Actions 自动执行：按 `STORAGE_BACKEND` 裁剪 `wrangler.toml`（**�
 | `PREF_DOMAINS` | 改 DNS 时解析用的候选域名池（空格分隔）。优先级：GitHub 变量 → Worker 侧 `PREF_DOMAINS`（面板可配）。**没有内置兜底**，两项都空时域名解析这一路候选不参与 |
 | `PROXY_HOST` | **优选 / 自愈 / 健康检查的目标域名**（例如 `proxy.example.com`）。留空则 Worker 按**当前请求的 hostname** 推导；定时任务（cron）场景拿不到请求，**必须显式配置**，否则优选会明确报错而不会猜到一个别的域名 |
 | `SUB_URL` | 浏览器优选拉取候选节点的订阅链接。留空则回退本机 `/sub`（token 按 edgetunnel 同一口径推导）。面板「订阅链接」里填写的值优先级最高 |
+| `DISGUISE_TEMPLATE` | **首页伪装**模板，作为首次部署的种子（`maintenance` / `corp` / `blog` / `download` / `custom`）。写入过面板配置后以面板为准 |
+| `DISGUISE_TITLE` / `DISGUISE_SUBTITLE` / `DISGUISE_CONTACT` | 伪装页的站点标题 / 副标题 / 页脚联系方式。标题留空则用当前域名推导，不会回落到任何内置名字 |
 
 Worker 侧还有一组可选变量（`wrangler.toml` 的 `[vars]`，非敏感）：
 
@@ -110,8 +115,8 @@ Worker 侧还有一组可选变量（`wrangler.toml` 的 `[vars]`，非敏感）
 
 | 路径 | 说明 |
 |---|---|
-| `/` 、`/__admin` | 主页（未登录 = 只读列表；登录 = 完整管理 + 代理面板入口） |
-| `/__login` | 登录页 |
+| `/` 、`/__admin` | 主页（未登录 = 只读列表；登录 = 完整管理 + 代理面板入口）。**开启首页伪装后**：没通过隐蔽入口的访客只看到伪装页 |
+| `/__login` | 登录页（伪装开启时不显示任何项目品牌信息） |
 | `/p/<id>/...` | 反代访问某站点（免登录） |
 | `/p/<id>/__x/<host>/...` | 跨域通道：任意第三方域资源 / 接口 |
 | `/edt` | 代理端点（客户端 VLESS 配置用） |
@@ -153,6 +158,12 @@ Worker 侧还有一组可选变量（`wrangler.toml` 的 `[vars]`，非敏感）
 | POST | `/__api/preferred-ips` | 需登录 | 保存优选池 `{ips}` |
 | GET | `/__api/pool-config` | 需登录 | 读 `GOOD_IPS` / 候选域名池 / 上次检查时间 |
 | POST | `/__api/pool-config` | 需登录 | 保存候选域名池 `{pref_domains}` 或写回可用集 `{good_ips}`（healthcheck 自愈用） |
+| GET | `/__api/disguise` | 需登录 | 读首页伪装配置。返回的 `templates` 为可用模板清单；入口口令只给出 `has_token` 布尔，**不返回明文** |
+| POST | `/__api/disguise` | 需登录 | 保存首页伪装配置（见 [首页伪装](#首页伪装)）。口令字段留空表示保持原值 |
+| GET | `/__api/disguise-preview` | 需登录 | 预览伪装页。带进门 cookie 的浏览器平时看到的是真面板，用这个端点自查访客视角 |
+
+> **伪装 + 严格模式下**，上表标注「免登录」的 GET 接口全部改为**需登录**；此时未进门者访问这些接口会拿到伪装页外形的 404。
+> `/__api/login`、`/__api/logout`、`/p/<id>/...`、`/tsub/<id>` 以及所有 WebSocket 请求始终保持匿名可达 —— 前两者是登录与登出本身的通道，后两者是客户端行为（分享出去的反代链接、订阅拉取），一旦被收敛就会把用户锁在外面。
 
 ---
 
@@ -170,7 +181,8 @@ src/
   inject.js            注入到被代理页面的前端运行时脚本（injectLinkFix）
   sites.js             站点配置持久化（增删查、slug 生成、target 解析）
   admin.js             管理 REST API + 服务端渲染的管理页
-  auth.js              登录 / 登出 / 登录页
+  auth.js              登录 / 登出 / 登录页（伪装开启时自动脱敏）
+  disguise.js          首页伪装：模板注册表、配置读写、进门标记判定、伪装首页与伪装 404 渲染
   dns.js               优选 IP 与 DNS 自动更新（候选池 → 并发探测 → 写 A 记录 → 自校验回滚），带时间预算
   subs.js              订阅与候选：订阅地址解析、节点抽取、边缘 IP 段判定、候选域名解析（无写死数据）
   util.js              无依赖小工具
@@ -185,6 +197,7 @@ tools/                 本地开发与验证脚本（不参与部署）
   local-test.mjs       新旧实现行为对比
   check-e2e.mjs        线上端到端校验（需 PROXY_HOST）
   check-preferred.mjs  优选链路自检：订阅候选拉取 + 探测是否会在 Workers 墙钟内完成
+  check-disguise.mjs   首页伪装自检：访客分档、两种进门方式、拥堵是否收敛、是否被自己锁死
 .github/workflows/
   deploy-cloudflare.yml   push master 自动部署（含 D1 迁移应用 + Secret 注入）
   healthcheck.yml         每 12 小时健康检查 + 自愈（workflow_dispatch 可手动触发）
@@ -213,6 +226,9 @@ PROXY_HOST=proxy.example.com node tools/check-e2e.mjs
 # 4. 优选链路自检（订阅候选能否拉到、优选探测会不会超时）
 SUB_URL=https://proxy.example.com/tsub/xxxx node tools/check-preferred.mjs
 CIDR_FILE=./cidrs.txt SKIP_NETWORK=1 node tools/check-preferred.mjs   # 离线模式
+
+# 5. 首页伪装自检（改 disguise.js / router.js 后必跑）
+node tools/check-disguise.mjs
 ```
 
 ---
@@ -229,6 +245,59 @@ CIDR_FILE=./cidrs.txt SKIP_NETWORK=1 node tools/check-preferred.mjs   # 离线�
 
 ---
 
+## 首页伪装
+
+开启后，**没通过隐蔽入口的访客**访问根路径看到的是一个普通站点页面，而不是管理面板。管理页 →「首页伪装」卡片即可配置，无需改代码、无需重新部署。
+
+### 访客分档
+
+| 访客 | 判定 | 根路径 `/` | `/__api/*` |
+|---|---|---|---|
+| 陌生人 | 无进门标记、未登录 | 伪装页 | 伪装页外形的 404 |
+| 已进门未登录 | 有进门 cookie | 真面板 | 401（面板 JS 据此引导登录） |
+| 已登录 | `ap_auth` 有效 | 真面板 | 正常放行 |
+
+**进门标记（cookie）为什么不需要保密**：伪造它最多只能拿到 401，拿不到任何数据 —— 敏感接口一律要求真登录。它只用来区分「有没有找对门」，真正的门始终是 `PASSWORD`。即使有人猜到了入口路径，看到的也只是一个不带任何品牌信息的登录页。
+
+### 两种进门方式（存在后才生效）
+
+- **隐蔽路径**：配置如 `/mypanel`，访问即进门。首段不能占用 `admin` / `edt` / `p` / `sub` / `__api` 等保留段，也不能是 `/` —— 面板会直接拒绝这类配置，避免把自己锁死。
+- **URL 口令**：配置后访问 `任意路径?k=<口令>` 即进门。口令校验收窄等长侧信道，且读取接口只返回 `has_token` 布尔，不返回明文。
+
+两者可同时配置，任一命中即进门。**启用伪装必须至少配一种**，否则保存时会被拒绝 —— 这是最容易把自己关在门外的配置错误。
+
+### 内置模板
+
+| 模板 | 内容 | 需要填的字段 |
+|---|---|---|
+| `maintenance` | 极简维护页：标题 + 说明 + 联系方式 | `title` / `subtitle` / `contact` |
+| `corp` | 企业官网：导航 + 主视觉 + 服务三栏 + 页脚 | 另加 `items` |
+| `blog` | 文章列表：日期 + 标题 + 摘要 | 另加 `posts` |
+| `download` | 项目 / 下载页：主视觉 + 特性列表 | 另加 `items` |
+| `custom` | 直接输出你贴的整段 HTML | `custom_html` |
+
+`items` 每行一条，格式 `标题 | 说明`；`posts` 每行一条，格式 `日期 | 标题 | 摘要`。标题留空时用**当前域名**推导 —— 代码里没有任何内置站点名。
+
+### 严格模式做了什么
+
+开启后（默认开启），未进门者：
+
+- 全部 `/__api/*` 拿不到数据 —— 包括原先免登录的 `/__api/sites`（它原本会把站点名、目标域名、`/p/<id>/` 链接整份交给陌生人）
+- 所有未匹配路径返回伪装 404，**不再 302 到 `/__admin`**（跳转的 `Location` 头会把面板命名空间直接送给扫描器）
+- `/robots.txt` 返回 `Disallow: /`，`/favicon.ico` 返回静默 204
+- 登录页、错误页脱掉项目名称；全局异常兜底不再把内部错误原文吐给陌生人
+- **始终保持匿名可达**：`/__api/login`、`/__api/logout`（登录通道本身）、`/p/...`（分享出去的反代链接）、`/tsub/...`（订阅拉取）、所有 WebSocket（代理节点可能把 path 配成 `/`）
+
+### 连带改造：探活改用根路径
+
+这一条不那么显眼但很关键。原先**四处**依赖匿名访问 `/__api/config` 来判活：服务端优选探测、DNS 自检、浏览器跨站测速、Actions 健康检查。严格模式一开，它们会全部失效、误判 IP 不可达，进而触发自愈把好端端的 A 记录删掉。
+
+改法是分两路：**内部请求**自带登录态（口令进程内可得），**外部 / 跨站请求**改用根路径 `/` —— 伪装状态下根路径永远返回 200，而根路径是所有网站都有的，不引入任何新指纹。健康检查的判据同步放宽为「2xx/3xx 即视为可达」。
+
+> 改完请手动触发一次 `Health Check & Auto Repair` 确认自愈链路正常，再放开长期自动运行。
+
+---
+
 ## 常见问题
 
 - **「立即更新优选 IP」执行失败**：错误信息现在会带具体环节。常见三种：① 缺 `CF_API_TOKEN` / `CF_ZONE_ID` Secret；② 没配 `PROXY_HOST` 且拿不到请求 hostname（cron 场景必配）；③ 候选为空——先在面板粘贴订阅链接或保存优选池。若提示 HTTP 5xx 且无详情，说明请求在平台侧超时，多为池里混了过多不可达 IP。
@@ -237,6 +306,8 @@ CIDR_FILE=./cidrs.txt SKIP_NETWORK=1 node tools/check-preferred.mjs   # 离线�
 - **页面一直加载 / 按钮点不动**：多为第三方域 JS/CSS 直连失败。本项目已把任意第三方域自动走跨域通道并按同一规则重写；仍异常请强刷（Ctrl/Cmd+Shift+R）重试。
 - **图片 / 图标不出**：第三方独立域资源走跨域通道经代理；若用户网络本身无法访问该 CDN 则仍加载不出。
 - **A 记录会不会写入不可用 IP（1034）**：不会。定时任务与「立即更新」都先经服务端 HTTP(80) 探测过滤不可达 / 非 CF IP，写入前还会以域名访问自检，新 IP 若 1034 立即回滚旧记录。
+- **开启伪装后进不去面板了**：先确认当时配了至少一种进门方式（隐蔽路径或 URL 口令）。清掉站点 Cookie 后重新访问该路径（或 `任意路径?k=口令`）即可恢复 —— 进门标记本身不涉及权限，丢失不会有副作用。若配置丢失，可在 Cloudflare 控制台把 Worker 存储里的 `DISGUISE_CONFIG` 键删掉，伪装即停用。
+- **开启伪装后自愈不工作了**：健康检查现在需要先用 `PASSWORD` 登录再读优选池，且已改为「按每条 A 记录逐个尝试」以应对 DNS 已指向故障 IP 的情况。手动触发一次 `Health Check & Auto Repair`，确认日志里没有「无法登录 Worker」的警告。
 - **为什么浏览器测速用 no-cors 计时**：直连 `https://IP` 时 SNI=IP，CF 无 IP 证书，TLS 必然失败，cors 模式永远测不通；改 no-cors 计时（握手耗时段≈延迟）做排序，可用性交给服务端 HTTP 探测。
 - **访问链接公开**：`/p/<id>/` 链接对任何知道的人都开放（管理功能仍受口令保护）。
 

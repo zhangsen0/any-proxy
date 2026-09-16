@@ -26,6 +26,14 @@ jobs:
       PROXY_HOST: ${{ vars.PROXY_HOST }}
       PREF_DOMAINS: ${{ vars.PREF_DOMAINS }}
       SUB_URL: ${{ vars.SUB_URL }}
+      # 首页伪装的非敏感部分可走仓库变量，作为首次部署的种子（写入后以面板配置为准）。
+      # 隐蔽入口路径 / URL 口令属于敏感信息，建议放在 Secrets 里（即下面的 DISGUISE_PATH / DISGUISE_TOKEN）。
+      DISGUISE_TEMPLATE: ${{ vars.DISGUISE_TEMPLATE }}
+      DISGUISE_TITLE: ${{ vars.DISGUISE_TITLE }}
+      DISGUISE_SUBTITLE: ${{ vars.DISGUISE_SUBTITLE }}
+      DISGUISE_CONTACT: ${{ vars.DISGUISE_CONTACT }}
+      DISGUISE_PATH: ${{ secrets.DISGUISE_PATH }}
+      DISGUISE_TOKEN: ${{ secrets.DISGUISE_TOKEN }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -51,6 +59,10 @@ jobs:
           [ -n "$PROXY_HOST" ] && ARGS="$ARGS --var PROXY_HOST:$PROXY_HOST"
           [ -n "$PREF_DOMAINS" ] && ARGS="$ARGS --var PREF_DOMAINS:$PREF_DOMAINS"
           [ -n "$SUB_URL" ] && ARGS="$ARGS --var SUB_URL:$SUB_URL"
+          [ -n "$DISGUISE_TEMPLATE" ] && ARGS="$ARGS --var DISGUISE_TEMPLATE:$DISGUISE_TEMPLATE"
+          [ -n "$DISGUISE_TITLE" ] && ARGS="$ARGS --var DISGUISE_TITLE:$DISGUISE_TITLE"
+          [ -n "$DISGUISE_SUBTITLE" ] && ARGS="$ARGS --var DISGUISE_SUBTITLE:$DISGUISE_SUBTITLE"
+          [ -n "$DISGUISE_CONTACT" ] && ARGS="$ARGS --var DISGUISE_CONTACT:$DISGUISE_CONTACT"
           wrangler deploy $ARGS
 
       - name: Put secrets
@@ -66,3 +78,6 @@ jobs:
           put_if_set UUID "$UUID"
           put_if_set CF_API_TOKEN "$CLOUDFLARE_API_TOKEN"
           put_if_set CF_ZONE_ID "$CF_ZONE_ID"
+          # 伪装入口（路径 / 口令）走 Secret，不进 --var：它们会出现在 Actions 日志与 wrangler 输出里
+          put_if_set DISGUISE_PATH "$DISGUISE_PATH"
+          put_if_set DISGUISE_TOKEN "$DISGUISE_TOKEN"

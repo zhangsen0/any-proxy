@@ -32,6 +32,18 @@ GH_ACTIONS_URL = "https://github.com/zhangsen0/any-proxy/actions/workflows/healt
 # CF_IP_RANGES_URL = "https://api.cloudflare.com/client/v4/ips" # 边缘 IP 段数据源，可换成自建镜像
 # DOH_URL         = "https://cloudflare-dns.com/dns-query"      # 解析候选域名用的 DoH 服务
 # DNS_BUDGET_MS   = "22000"                                      # 单次优选的总时间预算（须小于 Workers 30s 墙钟）
+#
+# ---- 首页伪装（详见 README「首页伪装」章节）----
+# 面板里配置更直观：管理页 → 首页伪装。以下变量只作为「首次部署的种子」，
+# 一旦写入过面板配置就以面板为准。敏感项（隐蔽路径 / URL 口令）建议走 Actions Secrets，
+# 避免出现在本文件的版本库里。
+# DISGUISE_CONFIG   = '{"enabled":true,"template":"maintenance","title":"示例站点"}'  # 整段配置（JSON）
+# DISGUISE_TEMPLATE = "maintenance"     # maintenance / corp / blog / download / custom
+# DISGUISE_TITLE    = ""                # 站点标题，留空则用当前域名
+# DISGUISE_SUBTITLE = ""                # 副标题，留空则不显示该区块
+# DISGUISE_CONTACT  = ""                # 页脚联系方式
+# DISGUISE_STRICT   = "true"            # 严格模式：未登录拿不到任何 API 数据（推荐）
+# DISGUISE_PATH     = ""                # 隐蔽入口路径，如 /mypanel（不能以 admin/edt/p/sub 等保留段开头）
 
 # 可选：设置自定义域名（需要先在 Cloudflare 配置）
 # routes = [

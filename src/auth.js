@@ -1,6 +1,8 @@
-import { json, b64 } from './util.js';
+import { json, b64, esc } from './util.js';
 import { MD5MD5 } from '../vendor/vless.js';
 import { runtime } from './runtime.js';
+// 伪装模块只用到「清除进门标记」，直接内联该 cookie 名规则，避免 auth <-> disguise 互相依赖
+import { expiredGateCookie } from './disguise.js';
 
 // 统一口令的登录态：主页 / 管理页共用一份 Cookie
 
@@ -34,20 +36,33 @@ async function handleLogin(request, env) {
   return json({ error: '密码错误' }, 401);
 }
 
-function handleLogout() {
+function handleLogout(cfg) {
   const h = new Headers({ 'Content-Type': 'application/json; charset=utf-8' });
   h.append('Set-Cookie', 'ap_auth=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax');
   h.append('Set-Cookie', 'auth=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax');
+  // 一并清除「进门」标记：否则登出后根路径仍是真面板，等于没真正登出
+  if (cfg) h.append('Set-Cookie', expiredGateCookie(cfg));
   return new Response(JSON.stringify({ ok: true }), { status: 200, headers: h });
 }
 
-function loginPage() {
+/**
+ * 登录页。
+ * opts.plain = true（首页伪装开启时）：脱掉项目名称与功能描述，只保留口令输入框 ——
+ * 否则陌生人只要猜到 /__login 就能确认「这是个代理面板」。
+ * opts.plain 下的标题取伪装配置的站点标题（管理员自己的文案），不回落到任何内置品牌名。
+ */
+function loginPage(opts = {}) {
+  const plain = !!(opts && opts.plain);
+  const brand = plain ? String((opts && opts.title) || '').trim() : 'Any-Proxy';
+  const pageTitle = brand ? `登录 · ${esc(brand)}` : '登录';
+  const h1 = brand ? esc(brand) : '进入';
+  const sub = plain ? '请输入访问口令以继续' : '统一代理入口 · 多站反向代理 + 优选 IP 节点，一个域名全部搞定';
   const html = `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>登录 · Any-Proxy</title>
+<title>${pageTitle}</title>
   <style>
   :root { --bg:#f4f6fb; --card:#ffffff; --line:#e2e8f0; --txt:#0f172a; --muted:#64748b; --accent:#2563eb; --accent-hover:#1d4ed8; --ok:#16a34a; --err:#dc2626; --input:#f1f5f9; --on-accent:#ffffff; --radius:14px; --radius-sm:10px; --radius-xs:8px; --shadow:0 1px 2px rgba(15,23,42,.04), 0 6px 18px rgba(15,23,42,.06); --ring:0 0 0 3px rgba(37,99,235,.18); --err-bg:rgba(220,38,38,.10); --hover:rgba(100,116,139,.06); }
   :root[data-theme="dark"] { --bg:#0f172a; --card:#1e293b; --line:#334155; --txt:#e2e8f0; --muted:#94a3b8; --accent:#38bdf8; --accent-hover:#7dd3fc; --ok:#4ade80; --err:#f87171; --input:#0b1220; --on-accent:#06283d; --shadow:0 1px 2px rgba(0,0,0,.30), 0 8px 24px rgba(0,0,0,.35); --ring:0 0 0 3px rgba(56,189,248,.25); --err-bg:rgba(248,113,113,.12); --hover:rgba(148,163,184,.08); }
@@ -74,8 +89,8 @@ function loginPage() {
 <body>
 <div class="box">
   <button type="button" id="themeBtn"></button>
-  <h1>Any-Proxy</h1>
-  <div class="sub">统一代理入口 · 多站反向代理 + 优选 IP 节点，一个域名全部搞定</div>
+  <h1>${h1}</h1>
+  <div class="sub">${sub}</div>
   <input type="password" id="pw" placeholder="访问口令" autofocus>
   <button id="btn">登录</button>
   <div class="msg err" id="msg"></div>
@@ -121,15 +136,16 @@ pw.addEventListener('keydown', e => { if (e.key === 'Enter') doLogin(); });
 function noConfigPage() {
   const html = `<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>未配置口令 · Any-Proxy</title>
+<title>Service Unavailable</title>
 <style>body{margin:0;font-family:-apple-system,"PingFang SC",system-ui,sans-serif;background:#0f172a;color:#e2e8f0;min-height:100vh;display:flex;align-items:center;justify-content:center}.box{max-width:560px;background:#1e293b;border:1px solid #334155;border-radius:14px;padding:28px 26px}h1{font-size:19px;margin:0 0 10px}code{background:#0b1220;color:#7dd3fc;padding:2px 6px;border-radius:4px;font-size:13px}p{color:#94a3b8;font-size:14px;line-height:1.7}</style>
-</head><body><div class="box"><h1>尚未配置访问口令</h1>
-<p>为保证安全，本站已开启登录保护，但管理员口令 <code>PASSWORD</code> 尚未设置。</p>
-<p>请到 Cloudflare 控制台 → Workers 和 Pages → <b>any-proxy</b> → 设置(Settings) → 变量(Variables) → 添加 Secret：名称 <code>PASSWORD</code>，值填你想设定的口令，保存后重新部署即可使用。</p>
+</head><body><div class="box"><h1>服务暂时不可用</h1>
+<p>本站尚未完成配置，请稍后再试。</p>
 </div></body></html>`;
+  // 503 而非 200：健康依赖 HTTP 状态码判活（优选探测、Actions 自愈、跨站测速都看状态码），
+  // 若返回 200 会被误判为「该 IP 可用」，进而污染优选池与 A 记录。
   return new Response(html, {
-    status: 200,
-    headers: { 'Content-Type': 'text/html; charset=utf-8' },
+    status: 503,
+    headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' },
   });
 }
 

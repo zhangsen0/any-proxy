@@ -23,16 +23,15 @@ const results = [];
 const check = (name, ok, extra = '') => { results.push({ name, ok, extra }); };
 
 async function httpChecks() {
-  // 管理 API 可达（线上配置已加载、Worker 在跑）
-  const cfg = await fetch(`${PROXY}/__api/config`).catch(e => ({ status: 0, text: async () => e.message }));
-  check('管理配置接口可用', cfg.status === 200, 'status=' + cfg.status);
-
-  // 首页（未登录只读）必须返回 HTML
-  const r = await fetch(PROXY + '/', { redirect: 'manual' });
-  check('首页 200', r.status === 200, 'status=' + r.status);
+  // 站点本身可达、且没被 CDN/浏览器缓存住。
+  // 校验目标用根路径而非管理 API：首页伪装开启后 /__api/config 要求登录，
+  // 而这里要验证的恰恰是「匿名访客能不能正常打开这个站点」。
+  const fallback = Object.assign(new Response(''), { status: 0 });
+  const r = await fetch(PROXY + '/', { redirect: 'manual' }).catch(() => fallback);
+  check('根路径可达', r.status === 200, 'status=' + r.status);
   const html = await r.text();
-  check('首页是 HTML', /<html/i.test(html));
-  check('首页有页面标题', /<title>/i.test(html));
+  check('返回 HTML', /<html/i.test(html));
+  check('有页面标题', /<title>/i.test(html));
 
   const cc = r.headers.get('cache-control') || '';
   check('HTML 不缓存', cc.includes('no-store'), cc);

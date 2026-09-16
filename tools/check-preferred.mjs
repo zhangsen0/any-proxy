@@ -103,11 +103,13 @@ if (!SKIP_NETWORK) {
   const serialStart = Date.now();
   let serialMs = 0;
   {
-    // 串行基准：每个 IP 最多等 3s（修复前的实现）
+    // 串行基准：每个 IP 最多等 3s（修复前的实现）。
+    // 带上登录态，保证对照组与新实现跑在完全相同的网络条件下，差别只在并发度。
+    const probeHeaders = { Host: host, Cookie: authCookie };
     for (const ip of pool) {
       const t0 = Date.now();
       try {
-        await fetch('http://' + ip + '/__api/config', { headers: { Host: host }, redirect: 'manual', signal: AbortSignal.timeout(3000) });
+        await fetch('http://' + ip + '/__api/config', { headers: probeHeaders, redirect: 'manual', signal: AbortSignal.timeout(3000) });
       } catch {}
     }
     serialMs = Date.now() - serialStart;

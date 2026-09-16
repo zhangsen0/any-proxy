@@ -435,7 +435,7 @@ const retry = retryUrl
     : '';
   const html = `<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>${esc(title)} · Any-Proxy</title>
+<title>${esc(title)}</title>
 <style>body{margin:0;font-family:-apple-system,"PingFang SC","Microsoft YaHei",system-ui,sans-serif;background:#f4f6fb;color:#0f172a;min-height:100vh;display:flex;align-items:center;justify-content:center}.box{max-width:520px;background:#fff;border:1px solid #e2e8f0;border-radius:14px;padding:32px 28px;text-align:center}h1{font-size:20px;margin:0 0 12px}p{color:#64748b;font-size:14px;line-height:1.8;word-break:break-all}.links{margin-top:24px}</style>
 </head><body><div class="box"><h1>${esc(title)}</h1><p>${msg}</p><div class="links">${retry}<a href="/" style="display:inline-block;background:transparent;color:#2563eb;border:1px solid #2563eb;border-radius:8px;padding:10px 20px;text-decoration:none;font-size:14px;">← 返回主页</a></div></div></body></html>`;
   return new Response(html, {

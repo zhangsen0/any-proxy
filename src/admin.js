@@ -4,6 +4,7 @@ import { listSites, getSite, autoSlug, validSlug, buildTarget, addSite } from '.
 import { autoUpdatePreferredDns, filterUsableIps, applyDnsWithSelfCheck, proxyHost, targetHost } from './dns.js';
 import { subscriptionUrl, fetchSubscriptionCandidates } from './subs.js';
 import * as tempsubs from './tempsubs.js';
+import { readConfig, saveConfig, sanitize, isActive, renderHome } from './disguise.js';
 
 // 站点管理：REST API + 服务端渲染的管理页
 
@@ -173,6 +174,44 @@ async function handleAdmin(request, url, env) {
       await runtime.KV.put('SUB_URL', v);
       return json({ ok: true, sub_url: v });
     }
+  }
+
+  // GET / POST /__api/disguise -> 首页伪装配置（模板 / 文案 / 隐蔽入口 / 严格模式）
+  // 读取时不返回入口口令明文（sanitize 已剔除），避免口令通过前端或日志二次泄漏。
+  if (path === '/__api/disguise') {
+    if (request.method === 'GET') {
+      const cfg = await readConfig(env);
+      return json({ ok: true, config: sanitize(cfg), active: isActive(cfg) });
+    }
+    if (request.method === 'POST') {
+      let body;
+      try { body = await request.json(); } catch { return json({ error: 'invalid json' }, 400); }
+      const patch = {};
+      // enabled / strict 用可选布尔，避免前端漏传时被当成 false 静默关闭
+      if (body.enabled !== undefined) patch.enabled = body.enabled === true;
+      if (body.strict !== undefined) patch.strict = body.strict !== false;
+      for (const k of ['template', 'title', 'subtitle', 'contact', 'custom_html', 'path']) {
+        if (body[k] !== undefined) patch[k] = String(body[k]).trim();
+      }
+      if (body.token !== undefined) {
+        const t = String(body.token).trim();
+        // 传空串表示清空口令；非空才覆盖，避免误操作把已配好的口令抹掉
+        if (t) patch.token = t;
+        else patch.token = '';
+      }
+      if (body.items !== undefined) patch.items = Array.isArray(body.items) ? body.items : [];
+      if (body.posts !== undefined) patch.posts = Array.isArray(body.posts) ? body.posts : [];
+      const r = await saveConfig(env, patch);
+      if (r && r.error) return json({ error: r.error }, 400);
+      return json({ ok: true, config: r, active: isActive(r) });
+    }
+  }
+
+  // GET /__api/disguise-preview -> 伪装页预览（需登录）。
+  // 带 gate cookie 的管理员平时看到的是真面板，用这个端点才能自查访客视角。
+  if (request.method === 'GET' && path === '/__api/disguise-preview') {
+    const cfg = await readConfig(env);
+    return renderHome(cfg, request);
   }
 
   // GET /__api/pool-config -> 优选池 & 健康检查配置（GOOD_IPS / 候选域名池 / 上次健康检查时间），需登录
@@ -382,6 +421,10 @@ async function adminPage(authed, origin, env) {
   // 服务端直接渲染站点列表（首屏秒开，不依赖前端 fetch；前端 load() 仅用于增删/操作后刷新）
   // 页面上展示的「优选目标域名」由配置推导，不写死任何域名
   const pageHost = proxyHost(env, String(origin || '').replace(/^https?:\/\//i, '').split(/[/?#]/)[0].split(':')[0]);
+  // 首页伪装配置：面板里展示当前状态；口令是否已设置只给出布尔，不把明文带上管理页 HTML
+  let dgCfg = null;
+  try { dgCfg = await readConfig(env); } catch {}
+  const hasToken = !!(dgCfg && dgCfg.token);
   let listHtml = '<div class="empty">加载中…</div>';
   try {
     const sites = await listSites();
@@ -432,9 +475,10 @@ async function adminPage(authed, origin, env) {
   .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:0 var(--sp-3); }
   @media (max-width:560px){ .grid2{ grid-template-columns:1fr; gap:0; } }
   label { display:block; font-size:13px; color:var(--muted); margin:var(--sp-3) 0 6px; }
-  input, textarea { width:100%; padding:10px 12px; border-radius:var(--radius-sm); border:1px solid var(--line); background:var(--input); color:var(--txt); font-size:14px; outline:none; transition:border-color .15s, box-shadow .15s, background .15s; }
-  input:focus, textarea:focus, input:focus-visible, textarea:focus-visible { border-color:var(--accent); box-shadow:var(--ring); }
-  input:hover:not(:focus), textarea:hover:not(:focus) { border-color:var(--muted); }
+  input, textarea, select { width:100%; padding:10px 12px; border-radius:var(--radius-sm); border:1px solid var(--line); background:var(--input); color:var(--txt); font-size:14px; outline:none; transition:border-color .15s, box-shadow .15s, background .15s; }
+  input:focus, textarea:focus, select:focus, input:focus-visible, textarea:focus-visible, select:focus-visible { border-color:var(--accent); box-shadow:var(--ring); }
+  input:hover:not(:focus), textarea:hover:not(:focus), select:hover:not(:focus) { border-color:var(--muted); }
+  select { cursor:pointer; }
   textarea { resize:vertical; line-height:1.5; }
   .row { display:flex; gap:var(--sp-2); margin-top:var(--sp-3); flex-wrap:wrap; align-items:center; }
   button { padding:10px 18px; border:none; border-radius:var(--radius-sm); font-size:14px; cursor:pointer; background:var(--accent); color:var(--on-accent); font-weight:600; transition:background .15s, transform .05s, box-shadow .15s; }
@@ -584,6 +628,69 @@ async function adminPage(authed, origin, env) {
     <div class="hint" style="margin:-8px 0 12px;">点击链接访问代理后的页面；复制按钮可复制代理后/代理前两种链接；「编辑」可修改名称、网址、端口、访问后缀（修改后缀后旧链接将失效）。</div>
     <div id="list">${listHtml}</div>
   </div>
+
+  ${authed ? `
+  <div class="card" id="disguiseCard">
+    <h2>首页伪装</h2>
+    <div class="hint" style="margin:-8px 0 4px;">启用后，没通过隐蔽入口的访客访问根路径 <span class="tag">/</span> 只会看到下面的普通站点页面；管理面板与全部 <span class="tag">/__api</span> 接口改为必须登录。</div>
+
+    <label for="dgEnabled" style="margin-top:14px;">状态</label>
+    <select id="dgEnabled">
+      <option value="0">关闭（根路径照常显示管理面板）</option>
+      <option value="1">启用伪装</option>
+    </select>
+
+    <label for="dgTemplate">伪装模板</label>
+    <select id="dgTemplate"></select>
+    <div class="hint" id="dgTplDesc" style="margin-top:4px;"></div>
+
+    <label for="dgTitle">站点标题</label>
+    <input type="text" id="dgTitle" placeholder="留空则使用当前域名">
+    <label for="dgSubtitle">副标题 / 说明</label>
+    <input type="text" id="dgSubtitle" placeholder="留空则不显示该区块">
+    <label for="dgContact">联系方式（页脚，邮箱 / 备案号均可）</label>
+    <input type="text" id="dgContact" placeholder="留空则不显示页脚">
+
+    <div class="grid2">
+      <div>
+        <label for="dgItems" style="margin-top:12px;">服务 / 特性（每行一条）</label>
+        <textarea id="dgItems" rows="4" placeholder="技术支持 | 7x24 小时响应"></textarea>
+      </div>
+      <div>
+        <label for="dgPosts" style="margin-top:12px;">文章列表（每行一条）</label>
+        <textarea id="dgPosts" rows="4" placeholder="2026-01-01 | 标题 | 摘要"></textarea>
+      </div>
+    </div>
+
+    <label for="dgHtml">自定义 HTML（模板选「自定义」时整页直出，其余模板忽略）</label>
+    <textarea id="dgHtml" rows="4" placeholder="粘贴完整 HTML" style="font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;"></textarea>
+
+    <h2 style="margin:18px 0 0;">隐蔽入口（至少填一项）</h2>
+    <div class="hint" style="margin:0 0 4px;">两者都能单独进门：访问「隐蔽路径」任意路径，或在任意地址后加 <span class="tag">?k=口令</span>。进门后仍是登录页 —— 真正的门是访问口令。</div>
+    <div class="grid2">
+      <div>
+        <label for="dgPath" style="margin-top:10px;">隐蔽路径</label>
+        <input type="text" id="dgPath" placeholder="/mypanel">
+      </div>
+      <div>
+        <label for="dgToken" style="margin-top:10px;">URL 口令（已保存则不显示）</label>
+        <input type="text" id="dgToken" placeholder="${hasToken ? '已设置，留空保持不变' : '留空则不启用该方式'}">
+      </div>
+    </div>
+
+    <label for="dgStrict" style="margin-top:12px;">严格模式</label>
+    <select id="dgStrict">
+      <option value="1">启用（推荐：未登录一律拿不到任何 API 数据）</option>
+      <option value="0">关闭（保留原有的匿名只读接口）</option>
+    </select>
+
+    <div class="row">
+      <button type="button" id="dgSaveBtn">保存伪装配置</button>
+      <button type="button" id="dgPreviewBtn" class="ghost">预览伪装页</button>
+    </div>
+    <div class="msg" id="dgMsg"></div>
+    <div class="hint" style="margin-top:4px;">保存后 <b>当前浏览器</b> 会记住进门状态，所以根路径仍显示管理面板；用无痕窗口或清掉 Cookie 才能看到访客视角。</div>
+  </div>` : ''}
 </div>
 
 ${authed ? `
@@ -791,12 +898,15 @@ if (prefBtn) {
 // 确认制测速：no-cors 计时近似「你网络→节点」延迟。
 // 首测 2 次取最短；resolve 快（<200ms）的 IP 可能隐藏 1034/假快（TLS 成功但 HTTP 被拒），
 // 自动复测 2 次取中位数；波动大（>150ms）的降权，避免抖动假快污染排序。
+// 探活目标改用根路径：伪装开启后 /__api/config 要求登录，跨站 no-cors 请求带不上 cookie，
+// 继续打它会全部超时。根路径在伪装状态下始终返回 200 的伪装页，且「根路径」是所有网站都有的，
+// 不引入任何新指纹。代价：no-cors 模式本就无法读取状态码，1034 仍要靠服务端优选（dns.js）判定。
 async function measureIp(ip) {
   let first = Infinity;
   for (let t = 0; t < 2; t++) {
     const t0 = performance.now();
     try {
-      await fetch('https://' + ip + '/__api/config', { mode: 'no-cors', cache: 'no-store', signal: AbortSignal.timeout(3500) });
+      await fetch('https://' + ip + '/', { mode: 'no-cors', cache: 'no-store', signal: AbortSignal.timeout(3500) });
     } catch (e) {}
     const ms = performance.now() - t0;
     if (ms < first) first = ms;
@@ -807,7 +917,7 @@ async function measureIp(ip) {
     for (let t = 0; t < 2; t++) {
       const t0 = performance.now();
       try {
-        await fetch('https://' + ip + '/__api/config', { mode: 'no-cors', cache: 'no-store', signal: AbortSignal.timeout(3500) });
+        await fetch('https://' + ip + '/', { mode: 'no-cors', cache: 'no-store', signal: AbortSignal.timeout(3500) });
       } catch (e) {}
       samples.push(performance.now() - t0);
     }
@@ -901,6 +1011,84 @@ if (autoBtn) {
     btn.disabled = false;
     btn.textContent = '浏览器自动优选';
   };
+}
+
+// 首页伪装：模板清单由服务端下发（config.templates），前端不内置任何模板名，
+// 保证以后新增模板不需要同时改前后端。
+function dgJoin(rows, keys) {
+  return (rows || []).map(function (row) {
+    return keys.map(function (k) { return row && row[k] ? String(row[k]) : ''; }).join(' | ').replace(/(\\s*\\|\\s*)+$/, '');
+  }).join('\\n');
+}
+function dgSplit(text, keys) {
+  return String(text || '').split(/\\r?\\n/).map(function (s) { return s.trim(); }).filter(Boolean).map(function (line) {
+    const parts = line.split('|').map(function (s) { return s.trim(); });
+    const out = {};
+    keys.forEach(function (k, i) { out[k] = parts[i] || ''; });
+    return out;
+  });
+}
+const dgSaveBtn = document.getElementById('dgSaveBtn');
+if (dgSaveBtn) {
+  const dgTpl = document.getElementById('dgTemplate');
+  const dgTplDesc = document.getElementById('dgTplDesc');
+  let dgTpls = [];
+  api('/__api/disguise').then(function (r) {
+    if (!r.ok || !r.data) return;
+    const cfg = r.data.config || {};
+    dgTpls = cfg.templates || [];
+    dgTpls.forEach(function (t) {
+      const o = document.createElement('option');
+      o.value = t.id;
+      o.textContent = t.id;
+      dgTpl.appendChild(o);
+    });
+    dgTpl.value = cfg.template || (dgTpls[0] && dgTpls[0].id) || '';
+    document.getElementById('dgEnabled').value = cfg.enabled ? '1' : '0';
+    document.getElementById('dgStrict').value = cfg.strict === false ? '0' : '1';
+    document.getElementById('dgTitle').value = cfg.title || '';
+    document.getElementById('dgSubtitle').value = cfg.subtitle || '';
+    document.getElementById('dgContact').value = cfg.contact || '';
+    document.getElementById('dgPath').value = cfg.path || '';
+    document.getElementById('dgHtml').value = cfg.custom_html || '';
+    document.getElementById('dgItems').value = dgJoin(cfg.items, ['title', 'desc']);
+    document.getElementById('dgPosts').value = dgJoin(cfg.posts, ['date', 'title', 'summary']);
+    const hit = dgTpls.filter(function (t) { return t.id === dgTpl.value; })[0];
+    dgTplDesc.textContent = hit ? hit.desc : '';
+  }).catch(function () {});
+  dgTpl.onchange = function () {
+    const hit = dgTpls.filter(function (t) { return t.id === dgTpl.value; })[0];
+    dgTplDesc.textContent = hit ? hit.desc : '';
+  };
+  dgSaveBtn.onclick = async function () {
+    dgSaveBtn.disabled = true;
+    setMsg('dgMsg', '保存中…', false);
+    const body = {
+      enabled: document.getElementById('dgEnabled').value === '1',
+      strict: document.getElementById('dgStrict').value === '1',
+      template: dgTpl.value,
+      title: document.getElementById('dgTitle').value,
+      subtitle: document.getElementById('dgSubtitle').value,
+      contact: document.getElementById('dgContact').value,
+      custom_html: document.getElementById('dgHtml').value,
+      path: document.getElementById('dgPath').value,
+      items: dgSplit(document.getElementById('dgItems').value, ['title', 'desc']),
+      posts: dgSplit(document.getElementById('dgPosts').value, ['date', 'title', 'summary']),
+    };
+    // 口令留空 = 保持原值（面板永远读不到明文，不能拿空串去覆盖）
+    const tk = document.getElementById('dgToken').value;
+    if (tk) body.token = tk;
+    try {
+      const r = await api('/__api/disguise', { method: 'POST', body: JSON.stringify(body) });
+      if (!r.ok) setMsg('dgMsg', r.data.error || '保存失败', true);
+      else setMsg('dgMsg', r.data.active ? '已保存，伪装已生效' : '已保存，但伪装未启用（需开启状态并至少配置一种隐蔽入口）', false);
+    } catch (err) {
+      setMsg('dgMsg', '请求失败：' + (err && err.message ? err.message : err), true);
+    }
+    dgSaveBtn.disabled = false;
+  };
+  const dgPrev = document.getElementById('dgPreviewBtn');
+  if (dgPrev) dgPrev.onclick = function () { window.open('/__api/disguise-preview', '_blank', 'noopener'); };
 }
 
 async function load() {

@@ -1,7 +1,20 @@
 import { runtime } from './runtime.js';
+import { b64 } from './util.js';
 import { fetchSubscriptionCandidates, resolveDomains, isIpv4 } from './subs.js';
 
-// DNS 自动优选：候选池 -> HTTP 探测 -> 写 A 记录 -> 自校验
+/**
+ * 探活目标：伪装开启后任何 /__api/* 都要求登录，内部 fetch 必须自己带上登录态。
+ * 口令在进程内直接可得（runtime.PASSWORD），不需要额外配置。
+ * 注意 device：若某天探活改成走外部（如浏览器跨站测速），带不上 cookie，
+ * 那时应该改打根路径 /（伪装页始终 200），而不是放宽 /__api 的权限。
+ */
+const PROBE_PATH = '/__api/config';
+
+function probeHeaders(host) {
+  const h = { Host: host };
+  if (runtime.PASSWORD) h.Cookie = `ap_auth=${b64(runtime.PASSWORD)}`;
+  return h;
+}
 // 存储统一走 runtime.KV（bindRuntime 按 STORAGE_BACKEND 选择 KV 或 D1），与本项目其余模块保持一致
 
 // 时间预算：Workers 单次 HTTP 请求的墙钟上限约 30s，超时会被平台直接杀掉，前端只看到「请求失败」。
@@ -207,8 +220,8 @@ async function filterUsableIps(ips, opts = {}) {
       if (Date.now() > hardEnd) return;
       const ip = queue.shift();
       try {
-        const r = await fetch('http://' + ip + '/__api/config', {
-          headers: { Host: host },
+        const r = await fetch('http://' + ip + PROBE_PATH, {
+          headers: probeHeaders(host),
           redirect: 'manual',
           signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
         });
@@ -356,8 +369,8 @@ async function selfCheck(host, deadlineMs) {
   const remain = deadlineMs ? deadlineMs - Date.now() - 200 : 6000;
   const timeout = Math.max(1000, Math.min(6000, remain));
   try {
-    const r = await fetch(`https://${host}/__api/config`, {
-      headers: { 'User-Agent': 'selfcheck' },
+    const r = await fetch(`https://${host}${PROBE_PATH}`, {
+      headers: { ...probeHeaders(host), 'User-Agent': 'selfcheck' },
       signal: AbortSignal.timeout(timeout),
     });
     if (r.status === 200) return { ok: true };
