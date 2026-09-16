@@ -26,7 +26,9 @@ async function httpChecks() {
   // 站点本身可达、且没被 CDN/浏览器缓存住。
   // 校验目标用根路径而非管理 API：首页伪装开启后 /__api/config 要求登录，
   // 而这里要验证的恰恰是「匿名访客能不能正常打开这个站点」。
-  const fallback = Object.assign(new Response(''), { status: 0 });
+  // 兜底对象手写，不能用 Object.assign(new Response(...), { status: 0 }) ——
+  // Response.status 是只读 getter，那样写会直接抛 TypeError。
+  const fallback = { status: 0, text: async () => '', headers: new Headers() };
   const r = await fetch(PROXY + '/', { redirect: 'manual' }).catch(() => fallback);
   check('根路径可达', r.status === 200, 'status=' + r.status);
   const html = await r.text();
