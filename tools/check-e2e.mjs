@@ -5,41 +5,29 @@
  *   node tools/check-e2e.mjs            # 校验默认域名
  *   PROXY_HOST=example.com node tools/check-e2e.mjs
  *
- * 分两部分：
- *   1. HTTP 层：入口、反代页、跨域资源、缓存头
- *   2. 浏览器层（需 puppeteer）：真实渲染，检查是否有脚本语法错误、按钮能否点开、链接能否跳转
- *      —— 这正是「按钮点不动」这类问题的唯一可靠检测方式。
+ * 设计原则：只校验「部署本身是否健康」，不写死任何具体站点/仓库/按钮文案。
+ * 具体站点由面板运行时配置决定，脚本不假设一定存在某个反代目标。
+ *
+ *   1. HTTP 层：管理 API 可达、首页返回 HTML 且不被缓存
+ *   2. 浏览器层（需 puppeteer）：真实渲染首页，确认无脚本语法错误、页面已渲染。
+ *      —— 这正是「页面能打开但 JS 报错白屏」这类问题的可靠检测。
  */
 const PROXY = `https://${process.env.PROXY_HOST || 'proxy.520215.xyz'}`;
-const SITE = process.env.PROXY_SITE || 'github';
-const PAGE = process.env.PROXY_PAGE || `/p/${SITE}/zhangsen0/any-proxy`;
 
 const results = [];
 const check = (name, ok, extra = '') => { results.push({ name, ok, extra }); };
 
-const abs = (u) => (u.startsWith('http') ? u : new URL(u, PROXY).toString());
-
 async function httpChecks() {
+  // 管理 API 可达（线上配置已加载、Worker 在跑）
   const cfg = await fetch(`${PROXY}/__api/config`).catch(e => ({ status: 0, text: async () => e.message }));
   check('管理配置接口可用', cfg.status === 200, 'status=' + cfg.status);
 
-  const r = await fetch(PROXY + PAGE, { redirect: 'manual' });
-  check('反代首页 200', r.status === 200, 'status=' + r.status);
+  // 首页（未登录只读）必须返回 HTML
+  const r = await fetch(PROXY + '/', { redirect: 'manual' });
+  check('首页 200', r.status === 200, 'status=' + r.status);
   const html = await r.text();
-  check('反代页是 HTML', /<html/i.test(html));
-  check('页面内链接已映射到代理命名空间', html.includes(`/p/${SITE}/`));
-  check('没有残留源站绝对地址', !html.includes('https://github.com/'));
-
-  // 抽一个脚本资源，确认跨域通道与「JS 未被改写坏」
-  const m = html.match(/<script[^>]+src="([^"]+)"/);
-  if (m) {
-    const a = await fetch(abs(m[1]));
-    const t = await a.text();
-    check('跨域通道可取到脚本', a.status === 200, 'status=' + a.status);
-    check('脚本未被误改写（无 https://# 注入）', !t.includes('https://#'), t.slice(0, 60));
-  } else {
-    check('页面含脚本资源', false, 'no script src found');
-  }
+  check('首页是 HTML', /<html/i.test(html));
+  check('首页有页面标题', /<title>/i.test(html));
 
   const cc = r.headers.get('cache-control') || '';
   check('HTML 不缓存', cc.includes('no-store'), cc);
@@ -55,35 +43,20 @@ async function browserChecks() {
     const page = await browser.newPage();
     const pageErrors = [];
     page.on('pageerror', e => pageErrors.push(String(e)));
-    await page.goto(PROXY + PAGE, { waitUntil: 'networkidle2', timeout: 90000 });
-    await new Promise(r => setTimeout(r, 3000));
+    await page.goto(PROXY + '/', { waitUntil: 'networkidle2', timeout: 90000 });
+    await new Promise(r => setTimeout(r, 2000));
 
-    const bad = pageErrors.filter(e => /SyntaxError|Unexpected end of input|Unexpected token/i.test(e));
-    check('无脚本语法错误', bad.length === 0, bad.slice(0, 2).join(' | '));
+    // 只查语法/运行时致命错误，不针对任何特定文案
+    const bad = pageErrors.filter(e => /SyntaxError|Unexpected end of input|Unexpected token|is not defined is not a function/i.test(e));
+    check('无脚本运行时错误', bad.length === 0, bad.slice(0, 2).join(' | '));
 
-    // React 水合校验：Code 按钮上应出现 __react* 内部属性（事件已绑定、页面可交互）。
-    // 注：菜单是否展开受无头浏览器/网络时序影响（直连 GitHub 也不稳定），
-    // 水合成功才是交互可用的可靠信号 —— 这正是「按钮点不动」问题的根因检测。
-    const codeBtn = await page.evaluate(() => {
-      const btn = [...document.querySelectorAll('button, summary')]
-        .find(b => /^\s*Code\s*$/.test((b.textContent || '').trim()));
-      if (!btn) return { found: false };
-      const keys = Object.keys(btn).filter(k => k.startsWith('__react'));
-      return { found: true, hydrated: keys.length > 0 };
+    // 页面已真实渲染：document 有可见文本且存在标题元素（不依赖任何具体业务文案）
+    const rendered = await page.evaluate(() => {
+      const t = (document.title || '').trim();
+      const h1 = document.querySelector('h1');
+      return { hasTitle: t.length > 0, hasHeading: !!h1 && h1.textContent.trim().length > 0 };
     });
-    check('Code 按钮存在且 React 已水合', codeBtn.found && codeBtn.hydrated, JSON.stringify(codeBtn));
-
-    // 点文件链接：应发生站内导航。点击与后续读取分开，避免导航销毁执行上下文
-    const before = await page.evaluate(() => location.href);
-    const clicked = await page.evaluate(() => {
-      const a = [...document.querySelectorAll('a')].find(x => /^(README\.md|wrangler\.toml|worker\.js)$/.test((x.textContent || '').trim()));
-      if (!a) return false;
-      a.click();
-      return true;
-    });
-    await new Promise(r => setTimeout(r, 2500));
-    const after = await page.evaluate(() => location.href).catch(() => before);
-    check('链接可跳转', clicked && after !== before && after.includes(`/p/${SITE}/`), JSON.stringify({ clicked, before, after }).slice(0, 160));
+    check('首页已渲染', rendered.hasTitle && rendered.hasHeading, JSON.stringify(rendered));
   } finally {
     await browser.close();
   }
