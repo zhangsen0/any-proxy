@@ -536,6 +536,12 @@ async function adminPage(authed, origin, env) {
     .row { gap:var(--sp-1); }
     button { padding:10px 14px; }
   }
+.tabs { display:flex; gap:6px; margin:16px 0 2px; padding:4px; background:var(--input); border:1px solid var(--line); border-radius:var(--radius-sm); overflow-x:auto; scrollbar-width:none; }
+.tabs::-webkit-scrollbar { display:none; }
+.tab { padding:8px 14px; margin:0; width:auto; background:transparent; color:var(--muted); border:none; border-radius:var(--radius-xs); cursor:pointer; font-size:14px; font-weight:500; white-space:nowrap; transition:color .15s, background .15s; }
+.tab:hover { background:transparent; color:var(--txt); transform:none; }
+.tab:active { transform:none; }
+.tab.active { background:var(--card); color:var(--txt); box-shadow:var(--shadow); }
 </style>
 </head>
 <body>
@@ -554,7 +560,15 @@ async function adminPage(authed, origin, env) {
   </div>
 
   ${authed ? `
-  <div class="card" style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;">
+  <nav class="tabs" id="paneTabs">
+    <button type="button" class="tab" data-tab="sites">站点</button>
+    <button type="button" class="tab" data-tab="proxy">代理节点</button>
+    <button type="button" class="tab" data-tab="preferred">优选 IP</button>
+    <button type="button" class="tab" data-tab="security">伪装与安全</button>
+  </nav>` : ''}
+
+  ${authed ? `
+  <div class="card" data-pane="proxy" style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;">
     <div>
       <h2 style="margin:0 0 4px;">代理管理面板</h2>
       <div class="notice" style="font-size:12px;">VLESS / Trojan / SS 节点订阅、流量日志与优选 IP 配置（edgetunnel），与站点管理共用同一套登录。</div>
@@ -563,7 +577,7 @@ async function adminPage(authed, origin, env) {
   </div>` : ''}
 
   ${authed ? `
-  <div class="card" style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;">
+  <div class="card" data-pane="proxy" style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;">
     <div>
       <h2 style="margin:0 0 4px;">临时订阅管理</h2>
       <div class="notice" style="font-size:12px;">创建限时有效的临时订阅链接（独立 UUID，默认 1 天到期），可改有效期、手动置为失效或删除；节点配置与代理面板一致。</div>
@@ -572,7 +586,7 @@ async function adminPage(authed, origin, env) {
   </div>` : ''}
 
   ${authed ? `
-  <div class="card" id="addCard">
+  <div class="card" id="addCard" data-pane="sites">
     <h2>添加代理站点</h2>
     <div class="hint" style="margin:-8px 0 4px;">填好名称和网址即可，代理前缀自动生成；同域名重复添加会自动复用已有站点。</div>
     <div class="grid2">
@@ -597,7 +611,7 @@ async function adminPage(authed, origin, env) {
   </div>` : ''}
 
   ${authed ? `
-  <div class="card" id="dnsCard">
+  <div class="card" id="dnsCard" data-pane="preferred">
     <h2>DNS 自动优选</h2>
     <div class="hint" style="margin:-8px 0 8px;">定时从 <span class="tag">sub 订阅节点</span> + 优选池测速排序，HTTP 探测过滤不可达后写入 A 记录，域名始终指向可用的 CF 泛播边缘。反代链接自动走优选 IP，浏览器直连、客户端零配置。</div>
     <label for="dnsInterval">自动更新频率（分钟）</label>
@@ -644,14 +658,14 @@ async function adminPage(authed, origin, env) {
     <div class="hint" style="margin:-8px 0 4px;">定时从优选池测速后更新 <span class="tag">${esc(pageHost || '未配置')}</span> 的 A 记录（HTTP 探测过滤不可达），反代自动走优选 IP。当前频率：<b id="dnsCur">加载中…</b>。登录后可修改。</div>
   </div>`}
 
-  <div class="card">
+  <div class="card" data-pane="sites">
     <h2>已添加的站点</h2>
     <div class="hint" style="margin:-8px 0 12px;">点击链接访问代理后的页面；复制按钮可复制代理后/代理前两种链接；「编辑」可修改名称、网址、端口、访问后缀（修改后缀后旧链接将失效）。</div>
     <div id="list">${listHtml}</div>
   </div>
 
   ${authed ? `
-  <div class="card" id="disguiseCard">
+  <div class="card" id="disguiseCard" data-pane="security">
     <h2>首页伪装</h2>
     <div class="hint" style="margin:-8px 0 4px;">启用后，没通过隐蔽入口的访客访问根路径 <span class="tag">/</span> 只会看到下面的普通站点页面；管理面板与全部 <span class="tag">/__api</span> 接口改为必须登录。</div>
 
@@ -713,7 +727,7 @@ async function adminPage(authed, origin, env) {
     <div class="hint" style="margin-top:4px;">保存后 <b>当前浏览器</b> 会记住进门状态，所以根路径仍显示管理面板；用无痕窗口或清掉 Cookie 才能看到访客视角。</div>
   </div>
 
-  <div class="card" id="nodeTagCard">
+  <div class="card" id="nodeTagCard" data-pane="proxy">
     <h2>节点备注国家标注</h2>
     <div class="hint" style="margin:-8px 0 4px;">给订阅里的节点备注补上 IP 归属国家，例如 <span class="tag">CF 电信优选 | 美国【US】</span>。主订阅 <span class="tag">/sub</span> 与临时订阅 <span class="tag">/tsub/&lt;id&gt;</span> 都生效。</div>
 
@@ -1303,6 +1317,58 @@ if (addBtn) addBtn.addEventListener('click', async (e) => {
 } catch (e) { console.error('admin init:', e); }
 ` : ''}
 
+
+// 面板分区切换：面板原本把站点、代理、优选、伪装全堆在一屏，首屏元素太多。
+// 这里按 data-pane 归类成标签页，一次只显示一屏；元素本身不销毁，
+// 所以所有既有 id 与「加载 / 保存」逻辑完全不用改。
+// 当前分区记在 URL hash 里，刷新和分享链接都能回到同一屏。
+const paneTabs = document.querySelectorAll('#paneTabs .tab');
+const paneEls = document.querySelectorAll('[data-pane]');
+function switchPane(name) {
+  paneEls.forEach(function (el) {
+    el.style.display = el.getAttribute('data-pane') === name ? '' : 'none';
+  });
+  paneTabs.forEach(function (b) {
+    b.classList.toggle('active', b.getAttribute('data-tab') === name);
+  });
+  try { history.replaceState(null, '', '#' + name); } catch (e) {}
+}
+if (paneTabs.length) {
+  const tabNames = [].map.call(paneTabs, function (b) { return b.getAttribute('data-tab'); });
+  const initial = String(location.hash || '').replace('#', '');
+  switchPane(tabNames.indexOf(initial) >= 0 ? initial : tabNames[0]);
+  paneTabs.forEach(function (b) {
+    b.onclick = function () { switchPane(b.getAttribute('data-tab')); };
+  });
+  window.addEventListener('hashchange', function () {
+    const n = String(location.hash || '').replace('#', '');
+    if (tabNames.indexOf(n) >= 0) switchPane(n);
+  });
+}
+// 节点备注的国家标注：开关 + 样式。样式清单写死在下拉框里是安全的 ——
+// 它描述的是「怎么展示」而不是业务数据，写死不会让 fork 后指向别人的资源。
+const ntEnabled = document.getElementById('ntEnabled');
+const ntStyle = document.getElementById('ntStyle');
+if (ntEnabled) {
+  api('/__api/node-tag').then(function (r) {
+    if (!r.ok || !r.data || !r.data.config) return;
+    const c = r.data.config;
+    ntEnabled.value = c.enabled ? '1' : '0';
+    ntStyle.value = c.style || 'cn-code';
+  });
+  const ntSaveBtn = document.getElementById('ntSaveBtn');
+  if (ntSaveBtn) ntSaveBtn.onclick = async function () {
+    ntSaveBtn.disabled = true;
+    setMsg('ntMsg', '保存中…', false);
+    try {
+      const r = await api('/__api/node-tag', { method: 'POST', body: JSON.stringify({
+        enabled: ntEnabled.value === '1', style: ntStyle.value,
+      }) });
+      setMsg('ntMsg', r.ok ? '已保存，订阅下次拉取即生效' : (r.data && r.data.error ? r.data.error : '保存失败'), !r.ok);
+    } catch (e) { setMsg('ntMsg', '请求失败', true); }
+    ntSaveBtn.disabled = false;
+  };
+}
 </script>
 </body>
 </html>`;
@@ -1505,30 +1571,6 @@ function bindActions(box) {
     await api('/__api/tempsubs/' + encodeURIComponent(b.dataset.renew), { method: 'PUT', body: JSON.stringify({ days }) });
     load();
   });
-}
-// 节点备注的国家标注：开关 + 样式。样式清单写死在下拉框里是安全的 ——
-// 它描述的是「怎么展示」而不是业务数据，写死不会让 fork 后指向别人的资源。
-const ntEnabled = document.getElementById('ntEnabled');
-const ntStyle = document.getElementById('ntStyle');
-if (ntEnabled) {
-  api('/__api/node-tag').then(function (r) {
-    if (!r.ok || !r.data || !r.data.config) return;
-    const c = r.data.config;
-    ntEnabled.value = c.enabled ? '1' : '0';
-    ntStyle.value = c.style || 'cn-code';
-  });
-  const ntSaveBtn = document.getElementById('ntSaveBtn');
-  if (ntSaveBtn) ntSaveBtn.onclick = async function () {
-    ntSaveBtn.disabled = true;
-    setMsg('ntMsg', '保存中…', false);
-    try {
-      const r = await api('/__api/node-tag', { method: 'POST', body: JSON.stringify({
-        enabled: ntEnabled.value === '1', style: ntStyle.value,
-      }) });
-      setMsg('ntMsg', r.ok ? '已保存，订阅下次拉取即生效' : (r.data && r.data.error ? r.data.error : '保存失败'), !r.ok);
-    } catch (e) { setMsg('ntMsg', '请求失败', true); }
-    ntSaveBtn.disabled = false;
-  };
 }
 $('#createBtn').onclick = async () => {
   const btn = $('#createBtn');

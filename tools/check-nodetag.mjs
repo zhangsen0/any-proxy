@@ -205,6 +205,28 @@ reset();
   ok('style 可读取环境变量', styleFrom({ NODE_COUNTRY_STYLE: 'name' }) === 'name');
 }
 
+console.log('\n=== 7. 管理页渲染：配置卡片与绑定逻辑必须在同一页 ===');
+{
+  // 真人踩过的坑：把 JS 注入到模板时，锚点命中了「临时订阅页」的 script，
+  // 结果主页只有 HTML 元素、没有任何点击处理，开关点了完全没反应。
+  // 这里连同绑定的 JS 一起校验，而不是只查元素是否存在。
+  const { adminPage } = await import('../src/admin.js');
+  const resp = await adminPage(true, 'https://proxy.example.com', env);
+  const html = await resp.text();
+  ok('管理页渲染正常', html.length > 10000, 'bytes=' + html.length);
+  for (const el of ['paneTabs', 'ntEnabled', 'ntStyle', 'ntSaveBtn', 'paneTabs']) {
+    ok('含配置元素 ' + el, html.includes(el));
+  }
+  const blocks = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)].map(m => m[1]);
+  const js = blocks.join('\n');
+  ok('主页脚本含分区切换逻辑', js.includes('switchPane') && js.includes('paneTabs'));
+  ok('主页脚本含标注保存逻辑', js.includes('/__api/node-tag'));
+  const panes = [...html.matchAll(/data-pane="([a-z]+)"/g)].map(m => m[1]);
+  const tally = panes.reduce((a, x) => (a[x] = (a[x] || 0) + 1, a), {});
+  ok('四个分区都有归属卡片', Object.keys(tally).length === 4, JSON.stringify(tally));
+  ok('每屏都有卡片（无空标签）', Object.values(tally).every(n => n >= 1));
+}
+
 globalThis.fetch = realFetch;
 
 console.log(`\n=== ${fail === 0 ? '全部通过' : '存在失败'} ===`);
