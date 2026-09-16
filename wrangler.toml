@@ -22,10 +22,16 @@ migrations_dir = "migrations"
 binding = "SITES"
 id = "2a940bcb0dae4b448e8def3ebf4fe27d"
 
-# 可配置变量
+# 可配置变量（非敏感）。全部可留空 —— Worker 侧均有「按请求推导或明确报错」的降级策略，
+# 不会悄悄回退到任何写死的域名 / IP / IP 段。以上变量也可由 GitHub Actions 用 --var 注入（见 deploy-cloudflare.yml）。
 [vars]
 # 管理页「手动触发健康检查」跳转链接（改为你自己的仓库 Actions 地址；留空则主页不显示该按钮）
 GH_ACTIONS_URL = "https://github.com/zhangsen0/any-proxy/actions/workflows/healthcheck.yml"
+# PREF_DOMAINS    = "www.cloudflare.com speed.cloudflare.com"  # 候选域名池种子，优选用；留空则由面板填写
+# CF_IP_RANGES    = "104.16.0.0/13 172.64.0.0/13"              # 自定义边缘 IP 段；留空则运行时拉取官方列表并缓存
+# CF_IP_RANGES_URL = "https://api.cloudflare.com/client/v4/ips" # 边缘 IP 段数据源，可换成自建镜像
+# DOH_URL         = "https://cloudflare-dns.com/dns-query"      # 解析候选域名用的 DoH 服务
+# DNS_BUDGET_MS   = "22000"                                      # 单次优选的总时间预算（须小于 Workers 30s 墙钟）
 
 # 可选：设置自定义域名（需要先在 Cloudflare 配置）
 # routes = [

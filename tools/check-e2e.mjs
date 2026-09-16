@@ -2,7 +2,6 @@
 /**
  * 线上部署的端到端校验（云端执行，不依赖本地网络）。
  *
- *   node tools/check-e2e.mjs            # 校验默认域名
  *   PROXY_HOST=example.com node tools/check-e2e.mjs
  *
  * 设计原则：只校验「部署本身是否健康」，不写死任何具体站点/仓库/按钮文案。
@@ -12,7 +11,13 @@
  *   2. 浏览器层（需 puppeteer）：真实渲染首页，确认无脚本语法错误、页面已渲染。
  *      —— 这正是「页面能打开但 JS 报错白屏」这类问题的可靠检测。
  */
-const PROXY = `https://${process.env.PROXY_HOST || 'proxy.520215.xyz'}`;
+// 不内置默认域名：写死会让 fork 后的 CI 静默地去校验别人的站点。
+const HOST = String(process.env.PROXY_HOST || '').trim();
+if (!HOST) {
+  console.error('缺少 PROXY_HOST：请在环境变量或仓库变量中指定要校验的域名');
+  process.exit(2);
+}
+const PROXY = 'https://' + HOST;
 
 const results = [];
 const check = (name, ok, extra = '') => { results.push({ name, ok, extra }); };

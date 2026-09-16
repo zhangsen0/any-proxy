@@ -1,26 +1,23 @@
 import { json, esc, kvKey, validTarget } from './util.js';
 import { runtime } from './runtime.js';
 import { listSites, getSite, autoSlug, validSlug, buildTarget, addSite } from './sites.js';
-import { autoUpdatePreferredDns, filterUsableIps, applyDnsWithSelfCheck } from './dns.js';
+import { autoUpdatePreferredDns, filterUsableIps, applyDnsWithSelfCheck, proxyHost, targetHost } from './dns.js';
+import { subscriptionUrl, fetchSubscriptionCandidates } from './subs.js';
 import * as tempsubs from './tempsubs.js';
 
-const DEFAULT_PREF_DOMAINS = ['www.cloudflare.com', 'speed.cloudflare.com', 'time.cloudflare.com', 'one.one.one.one', 'www.gstatic.com', 'cdn.jsdelivr.net'];
+// 站点管理：REST API + 服务端渲染的管理页
 
 /**
- * 与 edgetunnel 订阅密钥保持一致：MD5MD5(文本) = MD5(MD5(文本).hex.slice(7,27)) 的小写十六进制。
- * 订阅 token = MD5MD5(host + UUID)，host 取请求 hostname（vless.js 在未配置 HOST 变量时的同一口径）。
- * 禁止硬编码 token：订阅密钥随域名/UUID 变化，写死必然失配。
+ * 从请求推导优选所需上下文（目标域名 + 总预算）。
+ * 目标域名不再写死：PROXY_HOST 变量优先，否则用当前请求的 hostname。
  */
-async function md5Hex(s) {
-  const buf = await crypto.subtle.digest('MD5', new TextEncoder().encode(s));
-  return [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, '0')).join('');
+async function dnsContext(request, url, env) {
+  return {
+    host: await targetHost(env, url.hostname),
+    origin: url.origin,
+    deadlineMs: Date.now() + (Number(env && env.DNS_BUDGET_MS) || 22000),
+  };
 }
-async function md5md5(s) {
-  const first = await md5Hex(s);
-  return (await md5Hex(first.slice(7, 27))).toLowerCase();
-}
-
-// 站点管理：REST API + 服务端渲染的管理页
 
 async function handleAdmin(request, url, env) {
   if (request.method === 'OPTIONS') {
@@ -68,12 +65,21 @@ async function handleAdmin(request, url, env) {
     }
   }
 
-  // POST /__api/dns-run  -> 手动立即执行一次优选：先严格测通（200 才算可用），再把可用 IP 写入 A 记录（需登录）
+  // POST /__api/dns-run  -> 手动立即执行一次优选：并发测通后把可用 IP 写入 A 记录（需登录）
+  // 目标域名与预算由 dnsContext 统一给出，避免再出现「域名写死 / 预算失控导致请求超时」的情况。
   if (request.method === 'POST' && path === '/__api/dns-run') {
-    const result = await autoUpdatePreferredDns(env);
-    return json(result && result.ok
-      ? { ok: true, ips: result.ips, pool: result.pool, changed: result.changed, message: `优选完成：测通 ${(result.ips || []).length} 个，已更新 ${result.changed} 条 A 记录 → ${(result.ips || []).join(' / ')}（优选池 ${result.pool} 个）` }
-      : { error: (result && result.error) || '执行失败' }, result && result.ok ? 200 : 500);
+    const ctx = await dnsContext(request, url, env);
+    if (!ctx.host) return json({ error: '无法确定优选目标域名：请配置 PROXY_HOST' }, 500);
+    const result = await autoUpdatePreferredDns(env, ctx);
+    if (!result || !result.ok) {
+      return json({ error: (result && result.error) || '执行失败', note: (result && result.note) || '' }, 500);
+    }
+    const msg = `优选完成：测通 ${(result.ips || []).length} 个，已更新 ${result.changed} 条 A 记录 → ${(result.ips || []).join(' / ')}（候选 ${result.pool} 个，目标 ${ctx.host}）`;
+    return json({
+      ok: true, ips: result.ips, pool: result.pool, changed: result.changed, verified: result.verified,
+      host: ctx.host, note: result.note || '',
+      message: result.note ? msg + `｜${result.note}` : msg,
+    });
   }
 
   // 优选 IP 池（PREF_IPS，仅 DNS 自动优选用，与 edgetunnel 的 ADD.txt 解耦）：GET 读取 / POST 保存（apply=true 时先测通再更新 DNS A 记录）
@@ -99,36 +105,74 @@ async function handleAdmin(request, url, env) {
       await runtime.KV.put('PREF_IPS', uniq.join('\n'));
       let updated = null;
       if (body.apply && uniq.length) {
-        // 立即应用：先 HTTP 探测过滤死 IP，再写入 A 记录（应用后自检，1034 自动回滚）
-        const usable = await filterUsableIps(uniq);
-        const res = await applyDnsWithSelfCheck(env, usable);
-        updated = { ok: res.ok, ips: res.ips || [], changed: res.changed || 0, verified: res.verified, error: res.error };
+        // 立即应用：并发 HTTP 探测过滤不可达 IP，再写入 A 记录（应用后自检，不可用自动回滚）
+        const ctx = await dnsContext(request, url, env);
+        if (!ctx.host) {
+          updated = { ok: false, error: '无法确定优选目标域名：请配置 PROXY_HOST' };
+        } else {
+          const usable = await filterUsableIps(uniq, { host: ctx.host, deadlineMs: ctx.deadlineMs, budgetMs: 10000 });
+          const res = await applyDnsWithSelfCheck(env, usable, ctx);
+          updated = { ok: res.ok, ips: res.ips || [], changed: res.changed || 0, verified: res.verified, error: res.error, note: res.note || '', host: ctx.host };
+        }
       }
       return json({ ok: true, count: uniq.length, updated });
     }
   }
 
-  // GET /__api/preferred-candidates -> 从 sub 订阅链接拉取节点 IP 作为浏览器优选候选（不暴露 token）
+  // GET /__api/preferred-candidates -> 从**订阅链接**拉取节点 IP 作为浏览器优选候选
+  // 来源优先级：面板配置（KV SUB_URL）→ 环境变量 SUB_URL → 自动推导的本机 /sub（token 口径与 edgetunnel 一致）。
+  // 默认只返回归属边缘网络的 IP：订阅里常混入第三方节点，不筛会让优选池被无用 IP 占满、
+  // 并让「立即更新优选 IP」逐个探测这些不可达地址直到超时。可用 SUB_STRICT=0 关闭筛选。
   if (request.method === 'GET' && path === '/__api/preferred-candidates') {
-    // 订阅 token 与 edgetunnel 保持同一口径：MD5MD5(host + UUID)，host = 请求 hostname（未配 HOST 变量时）
-    let subToken = '';
-    try { subToken = await md5md5(`${url.hostname}${env.UUID || ''}`); } catch {}
-    const ips = [];
-    if (subToken) {
-      try {
-        const sub = await fetch(`${url.origin}/sub?token=${subToken}`, { headers: { 'User-Agent': 'Mozilla/5.0' }, signal: AbortSignal.timeout(8000) });
-        const text = await sub.text();
-        let raw = text.trim();
-        try {
-          if (!raw.includes('vless://')) raw = atob(raw.replace(/-/g, '+').replace(/_/g, '/'));
-        } catch {}
-        for (const line of raw.split(/\r?\n/)) {
-          const m = line.match(/@([^:]+):/);
-          if (m && m[1] && /^\d{1,3}(\.\d{1,3}){3}$/.test(m[1]) && !ips.includes(m[1])) ips.push(m[1]);
-        }
-      } catch {}
+    const strictCfg = String((env && env.SUB_STRICT) || '').trim().toLowerCase();
+    const strict = strictCfg === '0' || strictCfg === 'false' ? false : true;
+    const limit = Number(env && env.SUB_CANDIDATE_LIMIT) || 40;
+    let res;
+    try {
+      res = await fetchSubscriptionCandidates(env, {
+        origin: url.origin,
+        hostname: proxyHost(env, url.hostname) || url.hostname,
+        limit,
+        strict,
+        signal: AbortSignal.timeout(9000),
+      });
+    } catch (e) {
+      return json({ ok: false, ips: [], error: '候选拉取异常：' + (e && e.message ? e.message : e) }, 502);
     }
-    return json({ ok: true, ips: ips.slice(0, 40) });
+    return json({
+      ok: true,
+      ips: res.ips,
+      source: res.source,
+      note: res.note || '',
+      stats: { addresses: res.addresses || 0, filtered: res.filtered || 0, ranges: res.ranges || '' },
+    });
+  }
+
+  // GET / POST /__api/sub-config -> 订阅链接配置（面板可填，存 KV；留空则回退环境变量 SUB_URL）
+  if (path === '/__api/sub-config') {
+    if (request.method === 'GET') {
+      const saved = await runtime.KV.get('SUB_URL').catch(() => null);
+      return json({
+        ok: true,
+        sub_url: saved || '',
+        env: String((env && (env.SUB_URL || env.sub_url)) || ''),
+        effective: (await subscriptionUrl(env, url.origin)) || '',
+      });
+    }
+    if (request.method === 'POST') {
+      let body;
+      try { body = await request.json(); } catch { return json({ error: 'invalid json' }, 400); }
+      const v = String(body.sub_url || '').trim();
+      if (!v) {
+        try { await runtime.KV.delete('SUB_URL'); } catch {}
+        return json({ ok: true, sub_url: '' });
+      }
+      if (!/^https?:\/\//i.test(v) && !v.startsWith('/')) {
+        return json({ error: '请填写完整 URL（http(s)://…）或以 / 开头的路径（如 /tsub/xxx）' }, 400);
+      }
+      await runtime.KV.put('SUB_URL', v);
+      return json({ ok: true, sub_url: v });
+    }
   }
 
   // GET /__api/pool-config -> 优选池 & 健康检查配置（GOOD_IPS / 候选域名池 / 上次健康检查时间），需登录
@@ -141,9 +185,15 @@ async function handleAdmin(request, url, env) {
         const d = await runtime.KV.get('PREF_DOMAINS');
         if (d) domains.push(...d.split(/\r?\n/).map(s => s.trim()).filter(Boolean));
         else {
-          // KV 无配置时初始化默认域名池，保证 healthcheck 总是读 KV（面板可改），不依赖写死的兜底
-          domains.push(...DEFAULT_PREF_DOMAINS);
-          try { await runtime.KV.put('PREF_DOMAINS', DEFAULT_PREF_DOMAINS.join('\n')); } catch {}
+          // KV 无配置时用环境变量做种子（wrangler.toml / Actions 变量可配），而不是在代码里写死一份域名清单。
+          // 都没配就返回空数组并带提示，由面板引导用户填写，保证 fork 后不会出现「改不到却又悄悄生效」的兜底行为。
+          const seed = String((env && (env.PREF_DOMAINS || env.pref_domains)) || '')
+            .split(/\r?\n|,|;|\s+/).map(s => s.trim().toLowerCase())
+            .filter(s => /^[a-z0-9]([a-z0-9.-]*[a-z0-9])?\.[a-z]{2,}$/.test(s));
+          domains.push(...seed);
+          if (seed.length) {
+            try { await runtime.KV.put('PREF_DOMAINS', seed.join('\n')); } catch {}
+          }
         }
       } catch {}
       let last = 0;
@@ -330,6 +380,8 @@ async function handleAdmin(request, url, env) {
 
 async function adminPage(authed, origin, env) {
   // 服务端直接渲染站点列表（首屏秒开，不依赖前端 fetch；前端 load() 仅用于增删/操作后刷新）
+  // 页面上展示的「优选目标域名」由配置推导，不写死任何域名
+  const pageHost = proxyHost(env, String(origin || '').replace(/^https?:\/\//i, '').split(/[/?#]/)[0].split(':')[0]);
   let listHtml = '<div class="empty">加载中…</div>';
   try {
     const sites = await listSites();
@@ -490,13 +542,21 @@ async function adminPage(authed, origin, env) {
       <button type="button" id="dnsRunBtn" class="ghost">立即更新优选 IP</button>
     </div>
     <div class="hint" style="margin-top:6px;">范围 5 ~ 1440 分钟（12 小时 = 720）；保存后立即生效，下一个检查周期按新频率执行。立即更新不等待周期，马上测通并切换 A 记录。</div>
-    <label for="prefIps" style="margin-top:14px;">优选 IP 列表（sub 订阅节点 / 本地测速结果，每行一个）</label>
-    <textarea id="prefIps" rows="5" placeholder="104.17.109.97&#10;104.17.110.1&#10;172.66.1.183" style="font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;"></textarea>
+    <label for="subUrl" style="margin-top:14px;">订阅链接（浏览器优选从这里拉取候选 IP）</label>
+    <input id="subUrl" placeholder="粘贴完整订阅链接，或以 / 开头的路径如 /tsub/xxxx">
+    <div class="row" style="margin-top:6px;">
+      <button type="button" id="subBtn">保存订阅链接</button>
+      <span class="hint" id="subState" style="margin:0;"></span>
+    </div>
+    <div class="hint" style="margin-top:6px;">留空则回退到本机 <span class="tag">/sub</span>（token 按代理引擎同一口径推导）。第三方订阅常混入非边缘网络的节点，候选会按官方 IP 段过滤后再参与测速——否则这些不可达地址会占满优选池，还会拖慢「立即更新优选 IP」。</div>
+    <label for="prefIps" style="margin-top:14px;">优选 IP 列表（订阅候选 / 本地测速结果，每行一个）</label>
+    <textarea id="prefIps" rows="5" placeholder="每行一个 IPv4，例如 104.17.109.97" style="font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;"></textarea>
     <div class="row" style="margin-top:8px;">
       <button type="button" id="prefBtn">保存优选池</button>
       <button type="button" id="autoBtn" class="ghost">浏览器自动优选</button>
     </div>
-    <div class="hint" style="margin-top:6px;">「保存优选池」仅保存 IP 列表（不更新 DNS，不影响 edgetunnel 代理入口）；需要立即切换 A 记录请点上方「立即更新优选 IP」。「浏览器自动优选」从 sub 订阅节点 + 泛播候选测速（约 5~15 秒），最快的自动填入后点「保存优选池」。</div>
+    <div class="hint" style="margin-top:6px;">「保存优选池」仅保存 IP 列表（不更新 DNS，不影响 edgetunnel 代理入口）；需要立即切换 A 记录请点上方「立即更新优选 IP」。「浏览器自动优选」先从上面的订阅链接拉候选并发测速（约 5~15 秒），最快的自动填入，再点「保存优选池」。</div>
+    <div class="msg" id="subMsg"></div>
     <div class="msg" id="dnsMsg"></div>
     <div class="msg" id="dnsRunMsg"></div>
     <div class="msg" id="prefMsg"></div>
@@ -516,7 +576,7 @@ async function adminPage(authed, origin, env) {
   </div>` : `
   <div class="card" id="dnsCard">
     <h2>DNS 自动优选</h2>
-    <div class="hint" style="margin:-8px 0 4px;">定时从优选池测速后更新 <span class="tag">proxy.520215.xyz</span> 的 A 记录（HTTP 探测过滤不可达），反代自动走优选 IP。当前频率：<b id="dnsCur">加载中…</b>。登录后可修改。</div>
+    <div class="hint" style="margin:-8px 0 4px;">定时从优选池测速后更新 <span class="tag">${esc(pageHost || '未配置')}</span> 的 A 记录（HTTP 探测过滤不可达），反代自动走优选 IP。当前频率：<b id="dnsCur">加载中…</b>。登录后可修改。</div>
   </div>`}
 
   <div class="card">
@@ -659,7 +719,15 @@ if (dnsRunBtn) {
     setMsg('dnsRunMsg', '', false);
     try {
       const r = await api('/__api/dns-run', { method: 'POST' });
-      setMsg('dnsRunMsg', r.ok ? (r.data.message || '更新完成') : (r.data.error || '执行失败'), !r.ok);
+      if (r.ok) {
+        let msg = r.data.message || '更新完成';
+        if (r.data.verified === false) msg += '（A 记录已写入但未通过访问校验）';
+        setMsg('dnsRunMsg', msg, false);
+      } else {
+        // 拿不到 JSON 详情说明请求在平台侧就失败了（超时被杀 / 边缘错误），把状态码暴露出来便于定位
+        const detail = (r.data && (r.data.error || r.data.message)) || '';
+        setMsg('dnsRunMsg', detail ? detail : ('执行失败（HTTP ' + r.status + '）' + (r.status >= 500 ? '：Worker 可能已超时，请减少优选池里的无效 IP 后重试' : '')), true);
+      }
     } catch (err) {
       setMsg('dnsRunMsg', '请求失败：' + (err && err.message ? err.message : err), true);
     }
@@ -751,7 +819,33 @@ async function measureIp(ip) {
   return first;
 }
 
-// 浏览器自动优选：候选 = sub 订阅节点 IP（优先）+ 当前池，最多 40 个，并发测速最快自动填入
+// 订阅链接配置：浏览器优选的候选来源（存在 KV，留空则回退环境变量 / 本机 /sub）
+const subUrl = document.getElementById('subUrl');
+const subState = document.getElementById('subState');
+if (subUrl) {
+  api('/__api/sub-config').then(r => {
+    if (!r.ok || !r.data) return;
+    if (r.data.sub_url) subUrl.value = r.data.sub_url;
+    else if (subState) subState.textContent = r.data.env ? '当前使用环境变量 SUB_URL' : '未配置，将回退本机 /sub';
+  }).catch(() => {});
+  const subBtn = document.getElementById('subBtn');
+  if (subBtn) {
+    subBtn.onclick = async () => {
+      subBtn.disabled = true;
+      setMsg('subMsg', '保存中…', false);
+      try {
+        const r = await api('/__api/sub-config', { method: 'POST', body: JSON.stringify({ sub_url: subUrl.value }) });
+        if (!r.ok) { setMsg('subMsg', r.data.error || '保存失败', true); }
+        else setMsg('subMsg', r.data.sub_url ? '已保存订阅链接，浏览器优选将从这里拉候选' : '已清空，将回退环境变量 SUB_URL 或本机 /sub', false);
+      } catch (err) {
+        setMsg('subMsg', '请求失败：' + (err && err.message ? err.message : err), true);
+      }
+      subBtn.disabled = false;
+    };
+  }
+}
+
+// 浏览器自动优选：候选统一从**订阅链接**拉取（服务端已按地址归属过滤），失败才用当前池兜底
 const autoBtn = document.getElementById('autoBtn');
 if (autoBtn) {
   autoBtn.onclick = async () => {
@@ -759,19 +853,31 @@ if (autoBtn) {
     btn.disabled = true;
     setMsg('prefMsg', '', false);
     btn.textContent = '正在拉取订阅节点…';
-    // 候选统一从 sub 订阅接口获取（preferred-candidates = 服务端拉 /sub 解析节点）；拉取失败才用当前池兜底
     let cands = [];
+    let note = '';
     try {
       const r = await api('/__api/preferred-candidates');
-      if (r.ok && r.data.ips && r.data.ips.length) cands = r.data.ips;
-    } catch {}
+      if (r.ok && r.data) {
+        cands = r.data.ips || [];
+        const s = r.data.stats || {};
+        note = r.data.note || (s.filtered ? '订阅共 ' + s.addresses + ' 个节点，已过滤非边缘网络 ' + s.filtered + ' 个' : '');
+      } else {
+        note = (r.data && r.data.error) || '订阅拉取失败';
+      }
+    } catch (e) { note = '订阅拉取异常'; }
     if (!cands.length) {
       try {
         const r = await api('/__api/preferred-ips');
-        if (r.ok && r.data.ips) cands = r.data.ips;
+        if (r.ok && r.data.ips && r.data.ips.length) { cands = r.data.ips; note = '订阅无候选，改用当前优选池'; }
       } catch {}
     }
     cands = [...new Set(cands.filter(ip => /^\\d{1,3}(\\.\\d{1,3}){3}$/.test(ip)))].slice(0, 40);
+    if (!cands.length) {
+      setMsg('prefMsg', '没有可用候选：请先在上方填写订阅链接并保存' + (note ? '（' + note + '）' : ''), true);
+      btn.disabled = false;
+      btn.textContent = '浏览器自动优选';
+      return;
+    }
     const results = [];
     let done = 0;
     const CONC = 8;
@@ -790,7 +896,7 @@ if (autoBtn) {
       setMsg('prefMsg', '全部节点超时（网络受限？），请稍后重试', true);
     } else {
       prefIps.value = best.map(r => r.ip).join('\\n');
-      setMsg('prefMsg', '优选完成：测 ' + cands.length + ' 个，最快 ' + Math.round(best[0].t) + 'ms，前 ' + best.length + ' 个已填入，点「保存优选池」写入优选池（不自动改 DNS，可再点「立即更新优选 IP」应用）', false);
+      setMsg('prefMsg', '优选完成：测 ' + cands.length + ' 个，最快 ' + Math.round(best[0].t) + 'ms，前 ' + best.length + ' 个已填入' + (note ? '｜' + note : '') + '，点「保存优选池」写入优选池（不自动改 DNS，可再点「立即更新优选 IP」应用）', false);
     }
     btn.disabled = false;
     btn.textContent = '浏览器自动优选';

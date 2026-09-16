@@ -1,6 +1,6 @@
 name: Health Check & Auto Repair
 
-# 定时健康检查：runner 从外部网络真实访问 proxy.520215.xyz，
+# 定时健康检查：runner 从外部网络真实访问 PROXY_HOST（仓库变量，必填），
 # 若 A 记录中的 IP 出现 1034（Edge IP Restricted）/不可达，自动扫描 CF 泛播候选、
 # 重写「已验证可用集」(GOOD_IPS) 与 A 记录，实现自动自愈。
 # 优选池的读写一律经 Worker 公开 API（/__api/pool-config、/__api/preferred-ips），
@@ -25,12 +25,22 @@ jobs:
           PASSWORD: ${{ secrets.PASSWORD }}
           # 候选域名池（改 DNS 用的域名）可在 GitHub 仓库 Settings→Secrets and variables→Actions→Variables 配置 PREF_DOMAINS
           PREF_DOMAINS_VAR: ${{ vars.PREF_DOMAINS }}
-          # 反代域名（健康检查验证/修复的域名）可在 Actions→Variables 配置 PROXY_HOST；留空回退 proxy.520215.xyz
+          # 反代域名（健康检查验证/修复的目标）：仓库变量 PROXY_HOST，必填，无默认值
           PROXY_HOST: ${{ vars.PROXY_HOST }}
         run: |
           set -e
+          # 目标域名与 Zone 必须由仓库变量 / Secrets 显式给出：不再内置任何兜底值，
+          # 避免健康检查在配置缺失时悄悄去改别人的 DNS。
+          if [ -z "$PROXY_HOST" ]; then
+            echo "::error::未配置仓库变量 PROXY_HOST（健康检查/自愈的目标域名），请在 Settings→Secrets and variables→Actions→Variables 中设置"
+            exit 1
+          fi
+          if [ -z "$CF_ZONE_ID" ]; then
+            echo "::error::未配置 Secret CF_ZONE_ID（目标域名所在 Zone 的 ID）"
+            exit 1
+          fi
           ZONE="$CF_ZONE_ID"
-          HOST="${PROXY_HOST:-proxy.520215.xyz}"
+          HOST="$PROXY_HOST"
           echo "健康检查域名: $HOST"
           AUTH="Authorization: Bearer $CF_API_TOKEN"
           BASE="https://api.cloudflare.com/client/v4"
@@ -61,16 +71,17 @@ jobs:
           GOOD_API=$(echo "$POOL" | python3 -c "import sys,json;d=json.load(sys.stdin);print(' '.join(d.get('good_ips',[])))" 2>/dev/null || true)
           DOMAINS_API=$(echo "$POOL" | python3 -c "import sys,json;d=json.load(sys.stdin);print(' '.join(d.get('pref_domains',[])))" 2>/dev/null || true)
           ADD_API=$(curl -s -m 10 "https://$HOST/__api/preferred-ips?t=$TS" | python3 -c "import sys,json;d=json.load(sys.stdin);print(' '.join(d.get('ips',[])))" 2>/dev/null || true)
-          CAND=$(echo "$GOOD_API $ADD_API" | tr ' ' '\n' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | sort -u | tr ' ' '\n')
-          echo "优选 IP 池候选: $(echo $CAND | wc -w) 个"
+          # 候选来源（均可配置，无写死）：订阅链接（Worker 侧已按 IP 归属过滤）+ 已验证可用集 + 优选池
+          SUB_API=$(curl -s -m 15 "https://$HOST/__api/preferred-candidates?t=$TS" | python3 -c "import sys,json;d=json.load(sys.stdin);print(' '.join(d.get('ips',[])))" 2>/dev/null || true)
+          CAND=$(echo "$GOOD_API $ADD_API $SUB_API" | tr ' ' '\n' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | sort -u | tr ' ' '\n')
+          echo "优选 IP 池候选: $(echo $CAND | wc -w) 个（其中订阅候选 $(echo $SUB_API | wc -w) 个）"
           # 池不足时兜底：解析候选域名池得到动态 IP（不写死 IP 列表）。
-          # 配置优先级：GitHub 仓库变量 PREF_DOMAINS（Settings→Variables）→ Worker 侧 PREF_DOMAINS（面板可配）→ 内置兜底（下行）
+          # 配置优先级：GitHub 仓库变量 PREF_DOMAINS（Settings→Variables）→ Worker 侧 PREF_DOMAINS（面板可配）
           if [ "$(echo $CAND | wc -w)" -lt 5 ]; then
             PREF_DOMAINS="$PREF_DOMAINS_VAR"
             if [ -z "$PREF_DOMAINS" ]; then
               PREF_DOMAINS="$DOMAINS_API"
             fi
-            [ -z "$PREF_DOMAINS" ] && PREF_DOMAINS="www.cloudflare.com speed.cloudflare.com time.cloudflare.com one.one.one.one www.gstatic.com cdn.jsdelivr.net"
             for d in $PREF_DOMAINS; do
               CAND="$CAND $(getent ahostsv4 "$d" 2>/dev/null | awk '{print $1}' | sort -u)"
             done
@@ -78,7 +89,7 @@ jobs:
             echo "域名解析兜底后候选: $(echo $CAND | wc -w) 个"
           fi
           if [ -z "$CAND" ]; then
-            echo "❌ 无任何可扫描候选，跳过本次修复"
+            echo "::error::无任何可扫描候选：请在管理页粘贴订阅链接 / 保存优选池，或配置仓库变量 PREF_DOMAINS"
             exit 1
           fi
           GOOD=""

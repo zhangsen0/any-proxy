@@ -48,5 +48,6 @@ jobs:
         run: sleep 40
       - name: 线上校验
         env:
-          PROXY_HOST: ${{ vars.PROXY_HOST || 'proxy.520215.xyz' }}
+          # 必须显式配置：PR 无关地把校验打到别人的域名上会让结果失真
+          PROXY_HOST: ${{ vars.PROXY_HOST }}
         run: node tools/check-e2e.mjs

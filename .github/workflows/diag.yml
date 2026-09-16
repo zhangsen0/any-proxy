@@ -2,6 +2,15 @@ name: Diagnose Proxy Output
 
 on:
   workflow_dispatch:
+    inputs:
+      # 不再写死任何域名/站点：默认留空，由运行者按需填写
+      proxy_host:
+        description: '要诊断的部署域名（留空则读仓库变量 PROXY_HOST）'
+        required: false
+      paths:
+        description: '要诊断的反代路径，空格分隔，例如 /p/github/ /p/demo/'
+        required: false
+        default: '/p/github/'
 
 jobs:
   diag:
@@ -25,14 +34,20 @@ jobs:
 
       - name: Browser render test (capture console errors)
         working-directory: ${{ github.workspace }}
+        env:
+          PROXY_HOST: ${{ github.event.inputs.proxy_host || vars.PROXY_HOST }}
+          DIAG_PATHS: ${{ github.event.inputs.paths || '/p/github/' }}
         run: |
+          if [ -z "$PROXY_HOST" ]; then
+            echo "::error::需要目标域名：请在运行参数 proxy_host 或仓库变量 PROXY_HOST 中指定"
+            exit 1
+          fi
           cat > check.mjs <<'EOF'
           import puppeteer from 'puppeteer';
 
-          const targets = [
-            'https://proxy.520215.xyz/p/github/zhangsen0/any-proxy',
-            'https://proxy.520215.xyz/p/github/',
-          ];
+          const host = process.env.PROXY_HOST;
+          const paths = (process.env.DIAG_PATHS || '/p/github/').split(/\s+/).filter(Boolean);
+          const targets = paths.map(p => 'https://' + host + (p.startsWith('/') ? p : '/' + p));
 
           const browser = await puppeteer.launch({
             args: ['--no-sandbox', '--disable-dev-shm-usage'],

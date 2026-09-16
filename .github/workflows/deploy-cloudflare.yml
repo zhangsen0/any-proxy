@@ -19,9 +19,13 @@ jobs:
       UUID: ${{ secrets.UUID }}
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-      CF_ZONE_ID: ${{ secrets.CF_ZONE_ID || '3e768047adb7722044400a312bbe7a2e' }}
+      CF_ZONE_ID: ${{ secrets.CF_ZONE_ID }}
       # GitHub 仓库 Variables.STORAGE_BACKEND 可选 kv，默认 d1（D1 为默认后端，部署前自动应用迁移）
       STORAGE_BACKEND: ${{ vars.STORAGE_BACKEND || 'd1' }}
+      # 优选 / 自愈的目标域名与派生配置全部来自仓库变量，不在代码里写死任何域名
+      PROXY_HOST: ${{ vars.PROXY_HOST }}
+      PREF_DOMAINS: ${{ vars.PREF_DOMAINS }}
+      SUB_URL: ${{ vars.SUB_URL }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -41,11 +45,24 @@ jobs:
         run: python3 .github/scripts/prepare-deploy.py
 
       - name: Deploy Worker
-        run: wrangler deploy --var STORAGE_BACKEND:$STORAGE_BACKEND
+        # 非敏感配置用 --var 注入；缺失的变量不传（Worker 侧回退到请求 hostname / 面板配置，不会写到别人的域名上）
+        run: |
+          ARGS="--var STORAGE_BACKEND:$STORAGE_BACKEND"
+          [ -n "$PROXY_HOST" ] && ARGS="$ARGS --var PROXY_HOST:$PROXY_HOST"
+          [ -n "$PREF_DOMAINS" ] && ARGS="$ARGS --var PREF_DOMAINS:$PREF_DOMAINS"
+          [ -n "$SUB_URL" ] && ARGS="$ARGS --var SUB_URL:$SUB_URL"
+          wrangler deploy $ARGS
 
       - name: Put secrets
+        # 只写入非空的 Secret：缺哪个就跳过并提示，避免把空值写进 Worker 或让 CI 失败。
+        # 缺少 CF_ZONE_ID / CF_API_TOKEN 不会阻断部署，只是「DNS 优选」会明确报错提示去配置。
         run: |
-          echo "$PASSWORD" | wrangler secret put PASSWORD
-          echo "$UUID" | wrangler secret put UUID
-          echo "$CLOUDFLARE_API_TOKEN" | wrangler secret put CF_API_TOKEN
-          echo "$CF_ZONE_ID" | wrangler secret put CF_ZONE_ID
+          set -e
+          put_if_set() {
+            if [ -n "$2" ]; then echo "$2" | wrangler secret put "$1";
+            else echo "::warning::未配置 $1，已跳过注入（相关功能会明确提示去配置）"; fi
+          }
+          put_if_set PASSWORD "$PASSWORD"
+          put_if_set UUID "$UUID"
+          put_if_set CF_API_TOKEN "$CLOUDFLARE_API_TOKEN"
+          put_if_set CF_ZONE_ID "$CF_ZONE_ID"
