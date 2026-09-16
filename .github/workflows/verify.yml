@@ -35,6 +35,12 @@ jobs:
       # 节点国家标注：守住「订阅被改坏」（编码形态 / 中文乱码）与「数据源挂了拖垮订阅」
       - name: 节点标注校验
         run: node tools/check-nodetag.mjs
+      # CDN 任播兜底：守住「GeoIP 查不到就编一个国名」，以及拿不到官方段时不能拖垮订阅
+      - name: 任播兜底校验
+        run: node tools/check-anycast.mjs
+      # 出口压缩 + 上游请求策略：压缩错了会让浏览器解不开整站资源，必须验证「压完能还原」
+      - name: 出口压缩校验
+        run: node tools/check-compress.mjs
 
   # 2) 线上端到端校验：真实浏览器渲染 + 点击，覆盖「页面能打开但按钮点不动」这类只有跑起来才暴露的问题
   e2e:

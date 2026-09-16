@@ -1,6 +1,7 @@
 import { cors, isText, esc, isNavigation, isFingerprinted } from './util.js';
 import { CROSS_PREFIX, mapAbsoluteUrl, rewriteContent, contentKind } from './url.js';
 import { injectLinkFix, buildDocWritePage, rewriteLocations } from './inject.js';
+import { finalizeResponse } from './compress.js';
 
 // 反向代理核心：请求转发、响应重写、WebSocket 透传
 
@@ -120,7 +121,7 @@ function restoreHeaderValue(s, proxyHost, sitePrefix, targetBase, targetHost) {
  *   - 跨域通道 /p/<id>/__x/<host>/<path>   -> 任意第三方域（页面用到的任何外部资源/接口）
  * 两套通道共用同一套重写规则，因此任何站点的资源、接口、跳转都会留在代理内，不会被浏览器直连。
  */
-async function proxyRequest(request, site, crossHost, ctx) {
+async function proxyRequest(request, site, crossHost, ctx, env) {
   const url = new URL(request.url);
   const sitePrefix = `/p/${site.id}`;
   // origin = 代理自身对外地址。脚本上下文的 URL 需要补成绝对地址（见 url.js absOnOrigin）
@@ -171,6 +172,9 @@ async function proxyRequest(request, site, crossHost, ctx) {
   const targetUrl = targetBase + rest + targetSearch;
 
   const headers = new Headers(request.headers);
+  // 发给上游时必须先记下浏览器真实支持的压缩方式：下面会把请求头的 Accept-Encoding
+  // 改成 identity，等信息到这一刻已经拿不到了。
+  const acceptEnc = request.headers.get('accept-encoding');
   headers.set('Host', targetHost);
   headers.set('Origin', targetBase);
   if (headers.has('Referer')) {
@@ -220,8 +224,10 @@ async function proxyRequest(request, site, crossHost, ctx) {
     }
   }
 
-  // 上游取一次；网络错误或 5xx/429 重试一次（不区分站点，纯传输层兜底）
-  let upstream = await fetchUpstream(targetUrl, reqInit);
+  // 上游取一次。对冲阈值由环境变量给出，未配置即 0（关闭），默认行为与原先一致；
+  // 突发 handful 场景下把隔 1200ms 的慢请求重发一次，能明显削掉长尾。
+  const hedgeMs = Number(env && (env.PROXY_HEDGE_MS || env.proxy_hedge_ms)) || 0;
+  let upstream = await fetchUpstream(targetUrl, reqInit, hedgeMs);
 
   /**
    * 代理路径 -> 目标站绝对路径（用于 Location / Referer 还原）
@@ -359,7 +365,7 @@ async function proxyRequest(request, site, crossHost, ctx) {
     rewritten = isJsFile ? rewriteLocations(text) : rewriteContent(text, site, sitePrefix, base, kind);
   }
   if (isNavHtml) {
-    return new Response(rewritten, { status: upstream.status, headers: headersOut });
+    return finalizeResponse(upstream.status, rewritten, headersOut, acceptEnc);
   }
   // 文本资源（JS/CSS/JSON）：fingerprinted 资源加长缓存头（浏览器/CDN 层缓存），
   // 二次访问零回源、零 Cache API 开销——并发突发时不再因每次请求的 Cache API
@@ -368,7 +374,7 @@ async function proxyRequest(request, site, crossHost, ctx) {
     headersOut.set('Cache-Control', 'public, max-age=604800, immutable');
     headersOut.set('CDN-Cache-Control', 'public, max-age=604800, immutable');
   }
-  return new Response(rewritten, { status: upstream.status, headers: headersOut });
+  return finalizeResponse(upstream.status, rewritten, headersOut, acceptEnc);
 }
 
 /**
@@ -397,24 +403,56 @@ function rewriteSetCookies(out, upstream, cookiePath) {
   }
 }
 
-/** 上游请求：失败重试一次（网络抖动 / 瞬时 5xx / 限流）；HTTPS 不可用时回退 HTTP（自签或纯 HTTP 源站） */
+/**
+ * 上游请求。三层保障，越往后越保守：
+ *   1. 对冲（hedged）：先发一个，超过阈值还没回来就并行发第二个，谁先回来用谁。
+ *      治的是长尾延迟（P99）——Tail at Scale 的经典做法。
+ *      只对幂等请求启用（GET/HEAD 且无 body）：重复提交一次带 body 的 POST
+ *      可能造成重复下单，那种风险换来的延迟收益不值。
+ *   2. 错误/5xx/429 立即重试一次。这里刻意不做 sleep：原先在 Worker 里空转 300ms
+ *      既救不了过载的源站（真退避应该是秒级指数），又实打实让用户多等 300ms。
+ *   3. HTTPS 完全不可用时降级 HTTP（自签证书或纯 HTTP 源站）。
+ */
+async function fetchUpstream(targetUrl, reqInit, hedgeMs = 0) {
+  const method = String(reqInit.method || 'GET').toUpperCase();
+  const idempotent = (method === 'GET' || method === 'HEAD') && !reqInit.body;
+  const once = signal => (signal
+    ? fetch(targetUrl, { ...reqInit, signal })
+    : fetch(targetUrl, reqInit));
 
-/** 上游请求：失败重试一次（网络抖动 / 瞬时 5xx / 限流）；HTTPS 不可用时回退 HTTP（自签或纯 HTTP 源站） */
-async function fetchUpstream(targetUrl, reqInit) {
+  if (hedgeMs > 0 && idempotent) {
+    let timer = null;
+    let second = null;
+    try {
+      const hedge = new Promise(resolve => {
+        timer = setTimeout(() => {
+          // 首个请求超过了长尾阈值还没回来，补一发（不取消首个，两个都在跑）
+          second = fetch(targetUrl, reqInit).then(resolve).catch(() => resolve(null));
+        }, hedgeMs);
+      });
+      const first = await Promise.race([fetch(targetUrl, reqInit), hedge]);
+      clearTimeout(timer);
+      if (first) return first;
+      if (second) {
+        const r = await second;
+        if (r) return r;
+      }
+    } catch {
+      if (timer) clearTimeout(timer);
+      // 对冲路径异常不影响正确性，继续走下面的常规重试
+    }
+  }
+
   let res = null;
   try {
     res = await fetch(targetUrl, reqInit);
-    if (res.status >= 500 || res.status === 429) {
-      await new Promise(r => setTimeout(r, 300));
-      res = await fetch(targetUrl, reqInit);
-    }
+    if (res.status >= 500 || res.status === 429) res = await fetch(targetUrl, reqInit);
   } catch (e) {
     try {
-      await new Promise(r => setTimeout(r, 300));
       res = await fetch(targetUrl, reqInit);
     } catch (e2) {
       if (targetUrl.startsWith('https://')) {
-        try { return await fetch(targetUrl.replace(/^https:/, 'http:'), reqInit); } catch (e3) {}
+        try { return await fetch(targetUrl.replace(/^https:/, 'http:'), reqInit); } catch (e3) { /* ignore */ }
       }
       throw e2;
     }

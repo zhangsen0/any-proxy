@@ -199,6 +199,8 @@ tools/                 本地开发与验证脚本（不参与部署）
   check-disguise.mjs   首页伪装自检：访客分档、两种进门方式、拥堵是否收敛、是否被自己锁死
   check-nodetag.mjs    节点国家标注自检：编码形态不被改坏、中文不乱码、数据源挂了不拖垮订阅
   check-nodes.py       实测订阅里每个节点的可用性（TCP→TLS→WebSocket→真实转发出网）
+  check-anycast.mjs    CDN 任播兜底自检：CIDR 判定、数据源降级、绝不编造国名
+  check-compress.mjs   出口压缩与上游请求策略自检：压完必须能还原、SSE/二进制不压、幂等请求才允许对冲
 .github/workflows/
   deploy-cloudflare.yml   push master 自动部署（含 D1 迁移应用 + Secret 注入）
   healthcheck.yml         每 12 小时健康检查 + 自愈（workflow_dispatch 可手动触发）
@@ -233,6 +235,12 @@ node tools/check-disguise.mjs
 
 # 6. 节点备注国家标注自检（改 geoip.js / nodetag.js 后必跑）
 node tools/check-nodetag.mjs
+
+# 7. CDN 任播兜底自检（改 geoip.js 的任播逻辑后必跑）
+node tools/check-anycast.mjs
+
+# 8. 出口压缩与请求策略自检（改 compress.js / proxy.js 后必跑）
+node tools/check-compress.mjs
 
 # 7. 实测订阅里每个节点是否真的可用（需 Python 3）
 SUB_URL=https://proxy.example.com/tsub/xxxx python3 - <<'EOF'
@@ -340,10 +348,39 @@ CF 电信优选 | 美国【US】
 
 **失败时的行为**：数据源不可用、返回非 JSON、超时，统统原样透传节点（备注只是少个后缀）。订阅是整个服务的入口，为了加个后缀把订阅搞挂是不可接受的。这一层还有 8 秒墙钟上限兜底。
 
+### CDN 任播 IP：不编国名
+
+有个绕不开的事实：**CDN 任播 IP 没有单一地理归属**。同一个 IP 在全球边缘通告，从不同位置探测会落到不同地域。实测同一个 Cloudflare 优选 IP：
+
+| 数据源 | 给出的结论 |
+|---|---|
+| `api.country.is`（本项目主源） | 查不到，返回空 |
+| `ip-api.com` | 加拿大 CA |
+| `ipwho.is` | 美国 US |
+
+谁都不是「标准答案」。而这类 IP 恰恰是订阅的主力——实测 67 个去重 IP 里有 42 个（63%）落在 Cloudflare 官方段内，主源对其中 32 个查不出国家。
+
+所以这里的处理是 **GeoIP 优先 + 官方 IP 段兜底**：
+
+1. 主源查得到国家 → 照常显示真实国家（哪怕这个 IP 在 CDN 段内）
+2. 查不到、但 IP 落在 CDN 官方段内 → 标成 `Cloudflare 任播【ANYCAST】`
+3. 查不到、也不在任何已知 CDN 段 → 老实留空，绝不顺手编一个国名
+
+```
+CF 电信优选 | Cloudflare 任播【ANYCAST】
+普通节点     | 荷兰【NL】
+```
+
+覆盖率从 49% 提到约 97%，而且**标出来的每一条都经得起推敲**——这比凑满覆盖率重要，备注是用来做判断的，一个错的国家名比没有更糟。
+
+官方 IP 段取自 Cloudflare 自己公开维护的清单（`https://www.cloudflare.com/ips-v4`），拉取一次长期缓存，之后每个 IP 的判定是**纯内存的整数区间比较、零外部请求**。所以这层兜底几乎没有运行时成本。
+
 | 环境变量 | 说明 |
 |---|---|
 | `NODE_COUNTRY_TAG` | `false` / `0` / `off` 关闭标注，其余（含未配置）为开启 |
 | `NODE_COUNTRY_STYLE` | 后缀样式，取值见上表，默认 `cn-code` |
+| `NODE_COUNTRY_ANYCAST` | 任播兜底开关，默认开启；显式写否关闭（关闭后退化为「查不到就不标注」） |
+| `CF_NETS_URL` | CDN 官方 IPv4 段清单，默认 `https://www.cloudflare.com/ips-v4` |
 | `GEOIP_BATCH_URL` | 批量查询端点，默认 `https://api.country.is/`（HTTPS、免密钥、单次 100 个 IP、数据源 MaxMind GeoLite2）。任何接受 JSON 数组、返回国家代码的批量端点都能替换 |
 | `GEOIP_BATCH_SIZE` | 单次批量上限，默认 `100` |
 
@@ -366,6 +403,54 @@ python3 tools/check-nodes.py /tmp/sub.txt 16
 ```
 
 > L4 的探测目标刻意选**没有托管在 Cloudflare 上**的站点。CF 对自己边缘 IP 发来的明文 HTTP 请求会直接回 400，用 `example.com` 这类 CF 托管域名当判据，会把健康节点误判成坏的。
+
+---
+
+## 访问速度
+
+反代的正文链路是「源站 → Worker 读 body 解压 → 改写 → 发给浏览器」。每一步都有成本，这里做了三件事。
+
+### 1. 出口 gzip 压缩（收益最大）
+
+改写必须先把压缩过的 body 解压成明文，解完之后如果不重新压缩，浏览器拿到的就是原始体量——几百 KB 的 JS bundle、上百 KB 的 HTML 全部裸奔。
+
+现在会在返回前用 `CompressionStream` 压一遍：
+
+```
+10841 B  →  139 B  （工具自检里的样例）
+```
+
+典型网页通常压到原来的 **20~30%**，也就是首屏在浏览器这一侧的下载时间能省掉一大半。这不是理论值，是 upstream 链路发生变化后最直接的杠杆。
+
+三条安全边界，任何一条不满足就发明文：
+
+| 条件 | 原因 |
+|---|---|
+| 浏览器 `Accept-Encoding` 明确支持 gzip 且 `q>0` | 发了对方解不开的编码，整站 JS/CSS 一起挂 |
+| 响应不是 SSE / 二进制 / 已压缩 | SSE 一旦被缓冲实时性就没了；重复压缩纯属浪费 |
+| 正文大于 512 B | 太小的内容压了反而变大 |
+
+响应会带上 `Vary: Accept-Encoding`，避免缓存把压缩版和明文版混在一起。
+
+> 之所以能放心这么做，是因为**任何异常都会退回未压缩版本**——慢一点和发坏 body 之间，永远选慢一点。
+
+### 2. 对冲请求（治长尾）
+
+先发一个请求，超过阈值还没回来就并行再发一个，谁先回来用谁。这是 *Tail at Scale* 里的经典做法，治的是 P99 尾延迟，不是错误。
+
+限定条件很严格，**只对幂等请求生效**（GET/HEAD 且无 body）。重复提交一次带 body 的 POST 可能造成重复下单，那种风险换来的延迟收益不值。
+
+默认关闭，靠环境变量打开：
+
+| 环境变量 | 说明 |
+|---|---|
+| `PROXY_HEDGE_MS` | 对冲阈值（毫秒）。建议 `1200`；不配置或 `0` 即关闭，行为与原先一致 |
+
+### 3. 重试不再空等
+
+原先失败重试前会先在 Worker 里 `sleep(300)`。这段等待既救不了过载的源站（真正的退避应该是秒级指数级），又实打实让每个失败请求多卡 300ms，而且 Worker 计费时长照算。现在改成**立即重试**。
+
+保留的三层保障从前往后是：对冲 → 错误/5xx/429 立即重试一次 → HTTPS 不可用时降级 HTTP。
 
 ---
 

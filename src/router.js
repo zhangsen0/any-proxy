@@ -282,7 +282,7 @@ async function dispatchProxy(request, url, ctx) {
     return handleWebSocket(request, site, crossHost);
   }
   try {
-    return await proxyRequest(request, site, crossHost, ctx);
+    return await proxyRequest(request, site, crossHost, ctx, env);
   } catch (e) {
     return friendlyError('代理请求失败', `无法连接到目标站 <b>${esc(crossHost || site.host)}</b>：${esc(e && e.message || '网络错误')}`, url.href, 502, isNavigation(request));
   }

@@ -12,6 +12,7 @@
 import {
   lookupCountries, enabled as geoipEnabled, isIpv4, flagEmoji, regionName, toggle,
   readTagSettings, saveTagSettings, STYLE_DEFAULT,
+  ANYCAST, ANYCAST_LABEL, ANYCAST_CODE,
 } from './geoip.js';
 
 export { readTagSettings, saveTagSettings };
@@ -109,6 +110,16 @@ function lineRemark(line) {
  *   flag：          🇬🇧
  */
 function tagText(info, style) {
+  // CDN 任播 IP：没有国旗也没有国家名，按样式给最贴近的展示，绝不编造国名。
+  if (info && info.anycast) {
+    switch (String(style || DEFAULT_STYLE).trim().toLowerCase()) {
+      case 'name':
+      case 'flag-name': return ANYCAST_LABEL;
+      case 'code':
+      case 'flag': return ANYCAST_CODE;
+      default: return ANYCAST_LABEL + '【' + ANYCAST_CODE + '】';
+    }
+  }
   const flag = info.flag || flagEmoji(info.cc);
   const name = info.cn || regionName(info.cc);
   const code = String(info.cc || '').toUpperCase();

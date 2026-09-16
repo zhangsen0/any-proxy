@@ -20,6 +20,23 @@ const KEY_PREFIX = 'geoip:';
 const NEGATIVE = '-';
 const EMPTY = '';
 
+// —— CDN / 任播 IP 兜底 ——
+//
+// CDN 任播 IP 在全球边缘通告同一个地址，本来就不存在「单一国家归属」，
+// GeoIP 数据库对这类 IP 普遍缺数据：实测主源对 CF 官方段内的节点只能覆盖约 1/4。
+// 缺数据时不编造国名，而是命中官方 IP 段就如实标成任播——用户看到的信息反而更准。
+//
+// 官方段列表由 CDN 厂商自己公开维护，一次拉取后长期缓存；
+// 之后每个 IP 的判定是纯内存的整数区间比较，零外部请求。
+const CF_NETS_URL = 'https://www.cloudflare.com/ips-v4';
+const CF_NETS_KEY = KEY_PREFIX + 'cfnets';
+// 任播伪代号：故意用连字符，保证永远不会和任何 ISO 3166-1 alpha-2 撞车。
+// 不能用 'CF' —— 那是中非共和国的真实国家代码。
+export const ANYCAST = '--';
+// 给备注用的展示名。geoip 模块不碰文案，由 nodetag 决定怎么排版。
+export const ANYCAST_LABEL = 'Cloudflare 任播';
+export const ANYCAST_CODE = 'ANYCAST';
+
 const OFF_WORDS = ['0', 'false', 'no', 'off', 'none', 'disable', 'disabled'];
 const ON_WORDS = ['1', 'true', 'yes', 'on', 'enable', 'enabled'];
 
@@ -44,6 +61,76 @@ export function isIpv4(s) {
   if (!/^\d{1,3}(\.\d{1,3}){3}$/.test(String(s))) return false;
   return String(s).split('.').every(o => Number(o) >= 0 && Number(o) <= 255);
 }
+
+/** IPv4 → 32 位无符号整数。整数比较比逐段字符串处理快得多，也更省 GC。 */
+export function ipToInt(ip) {
+  if (!isIpv4(ip)) return NaN;
+  const p = String(ip).split('.');
+  return (((+p[0] << 24) >>> 0) + ((+p[1] << 16) >>> 0) + ((+p[2] << 8) >>> 0) + (+p[3] >>> 0)) >>> 0;
+}
+
+/** '1.2.3.0/24' → [起始整数, 结束整数]。解析不出来返回 null。 */
+export function parseCidr(cidr) {
+  const m = /^(\d{1,3}(?:\.\d{1,3}){3})\/(\d{1,2})$/.exec(String(cidr).trim());
+  if (!m || !isIpv4(m[1])) return null;
+  const bits = Number(m[2]);
+  if (!(bits >= 0 && bits <= 32) || String(bits) !== m[2]) return null;
+  const base = ipToInt(m[1]);
+  if (bits === 0) return [0, 0xffffffff];
+  const size = 1 << (32 - bits);
+  return [base, base + size - 1];
+}
+
+/** IP 是否落在任一 CIDR 区间内。纯 CPU，无外部请求。 */
+export function isCfIp(ip, nets) {
+  if (!nets || !nets.length || !isIpv4(ip)) return false;
+  const n = ipToInt(ip);
+  for (const range of nets) if (n >= range[0] && n <= range[1]) return true;
+  return false;
+}
+
+/** 任播兜底的开关。默认开启，环境变量显式写否才关。 */
+export function anycastEnabled(env) {
+  return toggle(env && (env.NODE_COUNTRY_ANYCAST || env.node_country_anycast), true);
+}
+
+let cfNets = null;
+/**
+ * 取 Cloudflare 官方 IPv4 段。KV 缓存优先，拉不到就用上一次的结果；
+ * 什么都拿不到时返回空数组——退化为「不做任播兜底」，节点照旧输出。
+ */
+export async function loadCfNets(env, ctx) {
+  if (cfNets) return cfNets;
+  const parse = text => String(text || '').split('\n').map(parseCidr).filter(Boolean);
+  try {
+    const cached = await kvGet(CF_NETS_KEY);
+    const nets = parse(cached);
+    if (nets.length) { cfNets = nets; return nets; }
+  } catch { /* 读缓存失败不致命，继续走网络 */ }
+  if (!anycastEnabled(env)) { cfNets = []; return cfNets; }
+  try {
+    const r = await fetch(String((env && (env.CF_NETS_URL || env.cf_nets_url)) || CF_NETS_URL).trim(), {
+      headers: { Accept: 'text/plain' },
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const text = await r.text();
+    // 存原始文本：读出来时走的是同一个 parseCidr，格式必须保持一致。
+    const lines = String(text).split('\n').map(s => s.trim()).filter(Boolean);
+    const nets = lines.map(parseCidr).filter(Boolean);
+    if (nets.length) {
+      cfNets = nets;
+      const saved = kvPut(CF_NETS_KEY, lines.join('\n')).catch(() => false);
+      if (ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(saved);
+      return nets;
+    }
+  } catch { /* 拿不到官方段就跳过兜底，不影响订阅本身 */ }
+  cfNets = [];
+  return cfNets;
+}
+
+/** 单测用：清掉进程内缓存，让下一次 loadCfNets 重新走 KV / 网络。 */
+export function resetCfNets() { cfNets = null; }
 
 /** ISO alpha-2 → 国旗 emoji。两个 regional indicator 直接算出来，不需要任何映射表。 */
 export function flagEmoji(cc) {
@@ -169,6 +256,10 @@ export async function lookupCountries(ips, opts = {}) {
   await Promise.all(list.map(async ip => {
     const hit = await kvGet(KEY_PREFIX + ip);
     if (hit === NEGATIVE) return;              // 已知查不到，别再问第二次
+    if (hit === ANYCAST) {                     // 已知是 CDN 任播段
+      out.set(ip, { cc: ANYCAST, cn: ANYCAST_LABEL, flag: EMPTY, anycast: true });
+      return;
+    }
     if (hit && /^[A-Z]{2}$/.test(String(hit).toUpperCase())) {
       const cc = String(hit).toUpperCase();
       out.set(ip, { cc, cn: regionName(cc), flag: flagEmoji(cc) });
@@ -180,6 +271,7 @@ export async function lookupCountries(ips, opts = {}) {
 
   // 2) 未命中的分批问。任一批失败只影响这一批，其余照常返回。
   const size = batchSize(env);
+  const useAnycast = anycastEnabled(env);
   for (const batch of chunks(missing, size)) {
     if (opts.deadline && Date.now() > opts.deadline) break;
     try {
@@ -190,7 +282,18 @@ export async function lookupCountries(ips, opts = {}) {
       }
       // 批里有问没答的（数据源缺数据）也标记为已查，避免每次订阅都重试
       const answered = new Set(rows.map(r => r.ip));
-      for (const ip of batch) if (!answered.has(ip)) writeThrough(ip, EMPTY, opts.ctx);
+      const unknown = batch.filter(ip => !answered.has(ip));
+      // 缺数据的一部分其实是 CDN 任播 IP：它们没有单一国家归属，
+      // 与其附上一条随时可能错的国名，不如命中官方段就如实标成任播。
+      const nets = (useAnycast && unknown.length) ? await loadCfNets(env, opts.ctx) : [];
+      for (const ip of unknown) {
+        if (isCfIp(ip, nets)) {
+          out.set(ip, { cc: ANYCAST, cn: ANYCAST_LABEL, flag: EMPTY, anycast: true });
+          writeThrough(ip, ANYCAST, opts.ctx);
+        } else {
+          writeThrough(ip, EMPTY, opts.ctx);
+        }
+      }
     } catch {
       // 数据源不可用：本批留空，节点原样输出。订阅本身必须还能拉到。
     }
@@ -199,6 +302,7 @@ export async function lookupCountries(ips, opts = {}) {
 }
 
 export {
-  KEY_PREFIX, NEGATIVE, toggle,
+  KEY_PREFIX, NEGATIVE, EMPTY, toggle,
   DEFAULT_BATCH_URL, DEFAULT_BATCH_SIZE,
+  CF_NETS_KEY, CF_NETS_URL,
 };
