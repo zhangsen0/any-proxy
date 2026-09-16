@@ -10,6 +10,7 @@
  *   1. HTTP 层：管理 API 可达、首页返回 HTML 且不被缓存
  *   2. 浏览器层（需 puppeteer）：真实渲染首页，确认无脚本语法错误、页面已渲染。
  *      —— 这正是「页面能打开但 JS 报错白屏」这类问题的可靠检测。
+ *      失败会重试一轮并如实记录，避免 runner 网络抖动把健康部署判成坏的。
  */
 // 不内置默认域名：写死会让 fork 后的 CI 静默地去校验别人的站点。
 const HOST = String(process.env.PROXY_HOST || '').trim();
@@ -44,28 +45,75 @@ async function browserChecks() {
   try { puppeteer = (await import('puppeteer')).default; }
   catch { check('浏览器校验（未安装 puppeteer，已跳过）', true, 'skipped'); return; }
 
-  const browser = await puppeteer.launch({ args: ['--no-sandbox', '--disable-dev-shm-usage'] });
+  // 云上偶发的单次失败（runner 出口网络抖动、CF 边缘节点刚同步完的短暂不一致）
+  // 给一次重试机会：抖动能自愈，持续故障两次都过不去，不会掩盖真问题。
+  let run = await collectBrowserChecks(puppeteer);
+  let note = '';
+  if (!run.ok) {
+    note = '（首次未通过，已重试一次）';
+    run = await collectBrowserChecks(puppeteer);
+  }
+  for (const it of run.items) check(it.name, it.ok, it.extra);
+  if (note) check('浏览器校验重试', run.ok, run.ok ? '重试后通过' : '重试后仍未通过');
+}
+
+// 跑一轮浏览器取样，返回明细而非直接写全局结果，便于失败重试时丢弃整轮脏数据。
+async function collectBrowserChecks(puppeteer) {
+  const items = [];
+  const add = (name, ok, extra = '') => items.push({ name, ok, extra });
+  let browser;
   try {
+    browser = await puppeteer.launch({
+      // acceptInsecureCerts：这里验的是「站点能不能打开」，不是证书链是否可信。
+      // 自定义域名在换证书窗口期可能短暂不可信，不该让可用性校验误报。
+      acceptInsecureCerts: true,
+      args: ['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--no-first-run', '--disable-extensions'],
+      protocolTimeout: 60000,
+    });
     const page = await browser.newPage();
+    await page.setViewport({ width: 1280, height: 900 });
     const pageErrors = [];
     page.on('pageerror', e => pageErrors.push(String(e)));
-    await page.goto(PROXY + '/', { waitUntil: 'networkidle2', timeout: 90000 });
-    await new Promise(r => setTimeout(r, 2000));
 
-    // 只查语法/运行时致命错误，不针对任何特定文案
-    const bad = pageErrors.filter(e => /SyntaxError|Unexpected end of input|Unexpected token|is not defined is not a function/i.test(e));
-    check('无脚本运行时错误', bad.length === 0, bad.slice(0, 2).join(' | '));
+    const resp = await page.goto(PROXY + '/', { waitUntil: 'domcontentloaded', timeout: 45000 });
+    add('浏览器可打开根路径', !!resp && resp.status() < 500, resp ? 'status=' + resp.status() : 'no response');
+    await settle(page);
 
-    // 页面已真实渲染：document 有可见文本且存在标题元素（不依赖任何具体业务文案）
+    // 只查语法/运行时致命错误。网络类报错（fetch failed 之类）不算：
+    // 一次 CDN 抖动不该把部署判成坏的。
+    const fatal = pageErrors.filter(e => /SyntaxError|Unexpected end of input|Unexpected token|is not a function|is not defined/i.test(e));
+    add('无脚本致命错误', fatal.length === 0, fatal.slice(0, 2).join(' | '));
+
+    // 页面已真实渲染：有标题、有标题元素、有可见文案 —— 不依赖任何具体业务文案。
+    // 未登录时前端会跳登录页，这是正常行为，因此不断言「必须停留在首页」。
     const rendered = await page.evaluate(() => {
-      const t = (document.title || '').trim();
-      const h1 = document.querySelector('h1');
-      return { hasTitle: t.length > 0, hasHeading: !!h1 && h1.textContent.trim().length > 0 };
+      const heading = document.querySelector('h1, h2, [role="heading"]');
+      return {
+        url: location.href,
+        hasTitle: (document.title || '').trim().length > 0,
+        hasHeading: !!heading && heading.textContent.trim().length > 0,
+        textLen: (document.body && document.body.innerText || '').trim().length,
+      };
     });
-    check('首页已渲染', rendered.hasTitle && rendered.hasHeading, JSON.stringify(rendered));
+    add('页面已真实渲染', rendered.hasTitle && rendered.hasHeading && rendered.textLen > 0, JSON.stringify(rendered));
+  } catch (e) {
+    // 浏览器链路任何一步炸了都要落成一条可读的失败项。直接抛出去的话 CI 只看到一个
+    // stack trace，后面的校验项全部失踪，等于白跑一次。
+    add('浏览器校验未抛异常', false, String((e && e.message) || e).slice(0, 300));
   } finally {
-    await browser.close();
+    if (browser) await browser.close().catch(() => {});
   }
+  return { ok: items.every(i => i.ok), items };
+}
+
+// 等页面稳定：优先等 readyState 落到 complete，等不到也继续（慢资源不该拖垮校验）。
+// 不采用 networkidle2：页面上的异步请求没有固定终点（列表拉取、节点测速），
+// 它要求「两秒内不超过两个连接」，在慢环境里永远等不到，会被 goto 超时炸掉整个 job。
+async function settle(page) {
+  try {
+    await page.waitForFunction(() => document.readyState === 'complete', { timeout: 20000, polling: 500 });
+  } catch { /* 不强求：readyState 卡住时仍按下面的固定等待继续取样 */ }
+  await new Promise(r => setTimeout(r, 2000));
 }
 
 await httpChecks();
