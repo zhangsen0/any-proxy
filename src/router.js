@@ -118,6 +118,11 @@ async function handleRequest(request, env, ctx) {
   const authed = isAuthed(request);
 
   // 管理页 / 首页：未登录也可查看（只读模式：仅站点列表 + 复制）
+  // 例外：根路径上的 WebSocket 升级请求是 VLESS/Trojan 代理连接（订阅节点 path=/），
+  // 必须交给代理引擎；普通浏览器 GET 仍返回管理页。
+  if (path === '/' && (request.headers.get('Upgrade') || '').toLowerCase() === 'websocket') {
+    return await vlessHandler.fetch(request, { ...env, KV: runtime.KV }, ctx);
+  }
   if (path === '/' || path === '/__admin') {
     const resp = await adminPage(authed, url.origin, env);
     // 防缓存：历史出现浏览器/CF边缘缓存旧版HTML导致列表一直加载中
