@@ -4,7 +4,7 @@ let config_JSON, 缓存SOCKS5白名单 = null, 调试日志打印 = false;
 let 额外合法UUID集合 = new Set();
 async function 加载临时UUID集合(env) {
 	const now = Date.now();
-	if (加载临时UUID集合._cacheAt && now - 加载临时UUID集合._cacheAt < 60000 && 加载临时UUID集合._cache) return 加载临时UUID集合._cache;
+	if (加载临时UUID集合._cacheAt && now - 加载临时UUID集合._cacheAt < 10000 && 加载临时UUID集合._cache) return 加载临时UUID集合._cache;
 	const s = new Set();
 	try {
 		if (env && env.KV && typeof env.KV.list === 'function') {
