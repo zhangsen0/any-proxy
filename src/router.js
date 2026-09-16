@@ -91,7 +91,7 @@ async function handleRequest(request, env, ctx) {
     if (path === '/robots.txt') return renderRobots();
     if (path === '/') return renderHome(cfg, request);
     // 反代通道保持可用：这是站点的正常使用路径，把访客挡在外面反而更可疑
-    if (path.startsWith('/p/')) return await dispatchProxy(request, url, ctx);
+    if (path.startsWith('/p/')) return await dispatchProxy(request, url, ctx, env);
     // 临时订阅：订阅拉取是客户端行为，不带 cookie，按 id + 时效自校验放行
     if (path.startsWith('/tsub/')) return await dispatchTempSub(request, url, env, ctx);
     // 登录 / 登出必须匿名可达：面板 401 后要跳登录页，Actions 自愈也靠它取 cookie
@@ -214,7 +214,7 @@ async function handleRequest(request, env, ctx) {
 
   // 反向代理 /p/{id}/...：无需登录，访问链接可直接打开
   if (path.startsWith('/p/')) {
-    return await dispatchProxy(request, url, ctx);
+    return await dispatchProxy(request, url, ctx, env);
   }
 
   // 其余路径：
@@ -262,7 +262,7 @@ function renderNotFoundFallback() {
 }
 
 /** 反向代理 /p/{id}/...：无需登录，伪装开启时同样放行（这是站点的正常使用路径） */
-async function dispatchProxy(request, url, ctx) {
+async function dispatchProxy(request, url, ctx, env) {
   const path = url.pathname;
   const m = path.match(/^\/p\/([^/]+)(\/.*)?$/);
   const id = decodeURIComponent(m[1]);

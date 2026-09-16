@@ -18,7 +18,10 @@ const HTML_CACHE_TTL = 30_000;
 const HTML_CACHE_MAX = 50;
 const htmlCache = new Map();
 function cachedHtmlRewrite(site, crossHost, url, text, sitePrefix, base) {
-  const key = `${site.id}|${crossHost || ''}|${url.pathname}|${url.search}`;
+  // key 必须带命名空间：往下还有一份「主文档重建」的缓存，两者的处理分支和产物完全不同。
+  // 共用 key 会让同一 URL 先来的一方把结果留给后来的一方——
+  // 表现为 Turbo 的局部更新拿到一整份 docWrite 包裹的文档。
+  const key = `rw|${site.id}|${crossHost || ''}|${url.pathname}|${url.search}`;
   const now = Date.now();
   const hit = htmlCache.get(key);
   if (hit && now - hit.ts < HTML_CACHE_TTL) return hit.html;
@@ -39,7 +42,7 @@ function cachedHtmlRewrite(site, crossHost, url, text, sitePrefix, base) {
  * 键、TTL、上限与 cachedHtmlRewrite 一致；缓存的是最终交付页，命中时零重写成本。
  */
 function cachedDocWritePage(site, crossHost, url, text, sitePrefix, base, targetUrl) {
-  const key = `${site.id}|${crossHost || ''}|${url.pathname}|${url.search}`;
+  const key = `dw|${site.id}|${crossHost || ''}|${url.pathname}|${url.search}`;
   const now = Date.now();
   const hit = htmlCache.get(key);
   if (hit && now - hit.ts < HTML_CACHE_TTL) return hit.html;
