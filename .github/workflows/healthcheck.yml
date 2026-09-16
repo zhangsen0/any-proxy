@@ -50,6 +50,12 @@ jobs:
           IPS=$(curl -s -m 15 -H "$AUTH" "$BASE/zones/$ZONE/dns_records?name=$HOST&type=A" \
             | python3 -c "import sys,json;[print(r['content']) for r in json.load(sys.stdin).get('result',[])]")
           echo "$IPS"
+          # 读不到记录时不能当成「健康」：后面逐个验证的循环会一次都不跑，
+          # 于是 Token 失效 / Zone 填错会伪装成「一切正常」，自愈彻底失效。
+          if [ -z "$IPS" ]; then
+            echo "::error::未读到任何 A 记录：请检查 CF_API_TOKEN 是否有效、CF_ZONE_ID 是否对应 $HOST 所在的 Zone"
+            exit 1
+          fi
 
           # ---- 2) 登录拿会话（后续所有 Worker API 都要用）----
           # 首页伪装开启后，全部 /__api/* 都要求登录 —— 这是刻意的安全收敛，

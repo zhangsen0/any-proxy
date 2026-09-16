@@ -13,6 +13,21 @@ import {
   readConfig, isActive, hitEntry, hasGate, gateCookieValue, expiredGateCookie,
   renderHome, renderNotFound, renderRobots, emptyFavicon,
 } from './disguise.js';
+import { subscriptionTaggingEnabled, styleFrom, tagSubscriptionResponse } from './nodetag.js';
+
+/** 给节点备注增强用的参数：统一收敛在这儿，两个订阅出口共用同一口径。 */
+function tagOpts(env, ctx) {
+  return {
+    env,
+    ctx,
+    style: styleFrom(env),
+    // 墙钟兜底：GeoIP 是外部请求，网络抖动不能把订阅请求拖到 Worker 超时。
+    deadline: Date.now() + NODE_TAG_BUDGET_MS,
+  };
+}
+
+/** 节点备注增强最多给多少毫秒（拿到就用，拿不到就原样返回节点）。 */
+const NODE_TAG_BUDGET_MS = 8000;
 
 // HTTP 入口路由： edgetunnel 端点 / 登录 / 管理 API / 管理页 / 反代通道
 //
@@ -150,6 +165,12 @@ async function handleRequest(request, env, ctx) {
       h.delete('content-length');
       return new Response(injectHomeButton(text), { status: 200, headers: h });
     }
+    // 订阅出口：给每个节点的备注补上 IP 归属国家。
+    // 开关关闭时这里一次都不会触发，不产生任何外部请求或存储读取。
+    if (path === '/sub' || path.startsWith('/sub/')) {
+      if (!(await subscriptionTaggingEnabled(env))) return resp;
+      return await tagSubscriptionResponse(resp, tagOpts(env, ctx));
+    }
     return resp;
   }
 
@@ -227,7 +248,10 @@ async function dispatchTempSub(request, url, env, ctx) {
   subUrl.pathname = '/sub';
   subUrl.searchParams.set('token', token);
   const subReq = new Request(subUrl.toString(), request);
-  return await vlessHandler.fetch(subReq, { ...env, KV: runtime.KV, UUID: rec.uuid }, ctx);
+  const resp = await vlessHandler.fetch(subReq, { ...env, KV: runtime.KV, UUID: rec.uuid }, ctx);
+  // 临时订阅同样是订阅输出，备注规则与主订阅保持一致
+  if (!(await subscriptionTaggingEnabled(env))) return resp;
+  return await tagSubscriptionResponse(resp, tagOpts(env, ctx));
 }
 
 function renderNotFoundFallback() {

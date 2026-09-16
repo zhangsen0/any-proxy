@@ -5,6 +5,7 @@ import { autoUpdatePreferredDns, filterUsableIps, applyDnsWithSelfCheck, proxyHo
 import { subscriptionUrl, fetchSubscriptionCandidates } from './subs.js';
 import * as tempsubs from './tempsubs.js';
 import { readConfig, saveConfig, sanitize, isActive, renderHome } from './disguise.js';
+import { readTagSettings, saveTagSettings } from './geoip.js';
 
 // 站点管理：REST API + 服务端渲染的管理页
 
@@ -204,6 +205,20 @@ async function handleAdmin(request, url, env) {
       const r = await saveConfig(env, patch);
       if (r && r.error) return json({ error: r.error }, 400);
       return json({ ok: true, config: r, active: isActive(r) });
+    }
+  }
+
+  // GET / POST /__api/node-tag -> 节点备注的国家标注开关与样式
+  if (path === '/__api/node-tag') {
+    if (request.method === 'GET') return json({ ok: true, config: await readTagSettings(env) });
+    if (request.method === 'POST') {
+      let body;
+      try { body = await request.json(); } catch { return json({ error: 'invalid json' }, 400); }
+      const patch = { env };
+      // enabled 只在明确传布尔时才改，避免前端漏传把功能悄悄关掉
+      if (body.enabled !== undefined) patch.enabled = body.enabled === true;
+      if (body.style !== undefined) patch.style = String(body.style).trim().toLowerCase();
+      return json({ ok: true, config: await saveTagSettings(patch) });
     }
   }
 
@@ -425,6 +440,12 @@ async function adminPage(authed, origin, env) {
   let dgCfg = null;
   try { dgCfg = await readConfig(env); } catch {}
   const hasToken = !!(dgCfg && dgCfg.token);
+  // 节点备注的国家标注：面板展示当前来源（面板配置 / 环境变量 / 默认），便于判断为什么是这个值
+  let ntCfg = null;
+  try { ntCfg = await readTagSettings(env); } catch {}
+  const ntHint = ntCfg
+    ? `当前：${ntCfg.enabled ? '已启用' : '已关闭'}，样式 ${esc(String(ntCfg.style))}（来源：开关 ${ntCfg.sourceOn}、样式 ${ntCfg.sourceStyle}）`
+    : '当前状态读取失败';
   let listHtml = '<div class="empty">加载中…</div>';
   try {
     const sites = await listSites();
@@ -690,6 +711,33 @@ async function adminPage(authed, origin, env) {
     </div>
     <div class="msg" id="dgMsg"></div>
     <div class="hint" style="margin-top:4px;">保存后 <b>当前浏览器</b> 会记住进门状态，所以根路径仍显示管理面板；用无痕窗口或清掉 Cookie 才能看到访客视角。</div>
+  </div>
+
+  <div class="card" id="nodeTagCard">
+    <h2>节点备注国家标注</h2>
+    <div class="hint" style="margin:-8px 0 4px;">给订阅里的节点备注补上 IP 归属国家，例如 <span class="tag">CF 电信优选 | 美国【US】</span>。主订阅 <span class="tag">/sub</span> 与临时订阅 <span class="tag">/tsub/&lt;id&gt;</span> 都生效。</div>
+
+    <label for="ntEnabled" style="margin-top:14px;">状态</label>
+    <select id="ntEnabled">
+      <option value="1">启用（备注补国家）</option>
+      <option value="0">关闭（备注保持原样）</option>
+    </select>
+
+    <label for="ntStyle">标注样式</label>
+    <select id="ntStyle">
+      <option value="cn-code">中文名 + 代号：美国【US】</option>
+      <option value="flag-name">国旗 + 中文名：🇺🇸美国</option>
+      <option value="name">只要中文名：美国</option>
+      <option value="code">只要代号：US</option>
+      <option value="flag">只要国旗：🇺🇸</option>
+    </select>
+
+    <div class="row">
+      <button type="button" id="ntSaveBtn">保存标注设置</button>
+    </div>
+    <div class="msg" id="ntMsg"></div>
+    <div class="hint" id="ntState" style="margin-top:4px;">${esc(ntHint)}</div>
+    <div class="hint" style="margin-top:4px;">国家查询结果会长期缓存，同一个 IP 只真正查询一次；数据源不可用时自动跳过标注，绝不影响订阅本身。</div>
   </div>` : ''}
 </div>
 
@@ -1457,6 +1505,30 @@ function bindActions(box) {
     await api('/__api/tempsubs/' + encodeURIComponent(b.dataset.renew), { method: 'PUT', body: JSON.stringify({ days }) });
     load();
   });
+}
+// 节点备注的国家标注：开关 + 样式。样式清单写死在下拉框里是安全的 ——
+// 它描述的是「怎么展示」而不是业务数据，写死不会让 fork 后指向别人的资源。
+const ntEnabled = document.getElementById('ntEnabled');
+const ntStyle = document.getElementById('ntStyle');
+if (ntEnabled) {
+  api('/__api/node-tag').then(function (r) {
+    if (!r.ok || !r.data || !r.data.config) return;
+    const c = r.data.config;
+    ntEnabled.value = c.enabled ? '1' : '0';
+    ntStyle.value = c.style || 'cn-code';
+  });
+  const ntSaveBtn = document.getElementById('ntSaveBtn');
+  if (ntSaveBtn) ntSaveBtn.onclick = async function () {
+    ntSaveBtn.disabled = true;
+    setMsg('ntMsg', '保存中…', false);
+    try {
+      const r = await api('/__api/node-tag', { method: 'POST', body: JSON.stringify({
+        enabled: ntEnabled.value === '1', style: ntStyle.value,
+      }) });
+      setMsg('ntMsg', r.ok ? '已保存，订阅下次拉取即生效' : (r.data && r.data.error ? r.data.error : '保存失败'), !r.ok);
+    } catch (e) { setMsg('ntMsg', '请求失败', true); }
+    ntSaveBtn.disabled = false;
+  };
 }
 $('#createBtn').onclick = async () => {
   const btn = $('#createBtn');

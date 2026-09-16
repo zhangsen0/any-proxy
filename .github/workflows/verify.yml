@@ -19,7 +19,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # 1) 单元测试：重写规则 + 首页伪装。两者都不需要网络，每次 push 都跑。
+  # 1) 单元测试：重写规则 + 首页伪装 + 节点国家标注。三者都不需要网络，每次 push 都跑。
   unit:
     runs-on: ubuntu-latest
     steps:
@@ -32,6 +32,9 @@ jobs:
       # 首页伪装：重点守住「启用后管理员把自己锁在面板外」与「伪装页反而泄漏身份」两类回归
       - name: 首页伪装校验
         run: node tools/check-disguise.mjs
+      # 节点国家标注：守住「订阅被改坏」（编码形态 / 中文乱码）与「数据源挂了拖垮订阅」
+      - name: 节点标注校验
+        run: node tools/check-nodetag.mjs
 
   # 2) 线上端到端校验：真实浏览器渲染 + 点击，覆盖「页面能打开但按钮点不动」这类只有跑起来才暴露的问题
   e2e:

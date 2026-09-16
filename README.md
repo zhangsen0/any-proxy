@@ -8,7 +8,6 @@
 登录保护、亮/暗主题、GitHub Actions 自动部署与健康检查自愈，站点管理与代理面板共用同一套登录。
 
 - 部署域名：你自己的域名（如 `https://proxy.example.com`）
-- 示例反代链接：`https://proxy.example.com/p/github/zhangsen0/any-proxy`
 
 > 代码中**不含任何写死的域名 / IP / IP 段**：目标域名由 `PROXY_HOST` 或请求 hostname 推导，
 > 边缘 IP 段运行时拉取官方数据源并缓存，候选池一律来自订阅链接或面板配置。
@@ -90,7 +89,7 @@ GitHub Actions 自动执行：按 `STORAGE_BACKEND` 裁剪 `wrangler.toml`（**�
 |---|---|
 | `STORAGE_BACKEND` | 持久化后端：`d1`（默认）或 `kv`。Worker 内全部存储（站点配置、DNS 配置、优选池、面板数据）统一走该后端；切换后端后历史数据不会自动迁移，建议固定后不再切换 |
 | `PREF_DOMAINS` | 改 DNS 时解析用的候选域名池（空格分隔）。优先级：GitHub 变量 → Worker 侧 `PREF_DOMAINS`（面板可配）。**没有内置兜底**，两项都空时域名解析这一路候选不参与 |
-| `PROXY_HOST` | **优选 / 自愈 / 健康检查的目标域名**（例如 `proxy.example.com`）。留空则 Worker 按**当前请求的 hostname** 推导；定时任务（cron）场景拿不到请求，**必须显式配置**，否则优选会明确报错而不会猜到一个别的域名 |
+| `PROXY_HOST` | **优选 / 自愈 / 健康检查的目标域名**（例如 `proxy.example.com`）。留空则 Worker 按**当前请求的 hostname** 推导；定时任务（cron）场景拿不到请求，**必须显式配置**，否则优选会明确报错而不会猜到一个别的域名。**漏配的代价容易被忽视**：健康自愈会在第一个守卫处直接失败，线上端到端校验也因拿不到目标域名而失败；而后者在 push 触发时被跳过去，于是出现「每次 push 都绿，但自愈链路从没真正跑过」的假象 |
 | `SUB_URL` | 浏览器优选拉取候选节点的订阅链接。留空则回退本机 `/sub`（token 按 edgetunnel 同一口径推导）。面板「订阅链接」里填写的值优先级最高 |
 | `DISGUISE_TEMPLATE` | **首页伪装**模板，作为首次部署的种子（`maintenance` / `corp` / `blog` / `download` / `custom`）。写入过面板配置后以面板为准 |
 | `DISGUISE_TITLE` / `DISGUISE_SUBTITLE` / `DISGUISE_CONTACT` | 伪装页的站点标题 / 副标题 / 页脚联系方式。标题留空则用当前域名推导，不会回落到任何内置名字 |
@@ -198,6 +197,8 @@ tools/                 本地开发与验证脚本（不参与部署）
   check-e2e.mjs        线上端到端校验（需 PROXY_HOST）
   check-preferred.mjs  优选链路自检：订阅候选拉取 + 探测是否会在 Workers 墙钟内完成
   check-disguise.mjs   首页伪装自检：访客分档、两种进门方式、拥堵是否收敛、是否被自己锁死
+  check-nodetag.mjs    节点国家标注自检：编码形态不被改坏、中文不乱码、数据源挂了不拖垮订阅
+  check-nodes.py       实测订阅里每个节点的可用性（TCP→TLS→WebSocket→真实转发出网）
 .github/workflows/
   deploy-cloudflare.yml   push master 自动部署（含 D1 迁移应用 + Secret 注入）
   healthcheck.yml         每 12 小时健康检查 + 自愈（workflow_dispatch 可手动触发）
@@ -229,6 +230,16 @@ CIDR_FILE=./cidrs.txt SKIP_NETWORK=1 node tools/check-preferred.mjs   # 离线�
 
 # 5. 首页伪装自检（改 disguise.js / router.js 后必跑）
 node tools/check-disguise.mjs
+
+# 6. 节点备注国家标注自检（改 geoip.js / nodetag.js 后必跑）
+node tools/check-nodetag.mjs
+
+# 7. 实测订阅里每个节点是否真的可用（需 Python 3）
+SUB_URL=https://proxy.example.com/tsub/xxxx python3 - <<'EOF'
+import urllib.request
+open('/tmp/sub.txt','wb').write(urllib.request.urlopen('$SUB_URL').read())
+EOF
+python3 tools/check-nodes.py /tmp/sub.txt
 ```
 
 ---
@@ -295,6 +306,66 @@ node tools/check-disguise.mjs
 改法是分两路：**内部请求**自带登录态（口令进程内可得），**外部 / 跨站请求**改用根路径 `/` —— 伪装状态下根路径永远返回 200，而根路径是所有网站都有的，不引入任何新指纹。健康检查的判据同步放宽为「2xx/3xx 即视为可达」。
 
 > 改完请手动触发一次 `Health Check & Auto Repair` 确认自愈链路正常，再放开长期自动运行。
+
+---
+
+## 节点备注国家标注
+
+订阅里拉到的节点会自动在备注后面补上 IP 归属国家，主订阅 `/sub` 与临时订阅 `/tsub/<id>` 都生效：
+
+```
+CF 电信优选 | 美国【US】
+地区随机 | 美国 US | LAX | 104.202.107.55:8443 | 美国【US】
+```
+
+默认开启，面板「节点备注国家标注」里可以随时关掉或换样式；也可以用环境变量 `NODE_COUNTRY_TAG` / `NODE_COUNTRY_STYLE` 控制。
+
+| 样式取值 | 效果 | | 环境变量 `NODE_COUNTRY_STYLE` |
+|---|---|---|---|
+| `cn-code` | 美国【US】 | | 默认，中文名 + ISO 代号 |
+| `flag-name` | 🇺🇸美国 | | 国旗 + 中文名 |
+| `name` | 美国 | | 只要中文名 |
+| `code` | US | | 只要 ISO 代号 |
+| `flag` | 🇺🇸 | | 只要国旗 |
+
+> 代号用的是 **ISO 3166-1 alpha-2** 标准码，所以英国是 `GB` 而不是常见的非正式写法 `UK`。
+
+**怎么做到「效率最高」**：
+
+1. **批量**：一次 HTTP 请求最多问 100 个 IP。80 个节点 = 1 次外部请求，而不是 80 次。
+2. **永久缓存**：结果写进存储长期保存，同一个 IP 第二次起**零外部请求**。IP 归属几乎不变，没必要设短 TTL，这是最大的一笔节省。
+3. **负缓存**：查不到归属的 IP 也记下来，避免每次订阅都白去重问。
+4. **零数据表**：中文国家名由平台 ICU 提供（`Intl.DisplayNames`），国旗 emoji 由 ISO 代号直接算出（两个 regional indicator 字符），两者都不需要内置几百行的映射表。
+5. **写入不阻塞**：第一查询完就把结果用 `ctx.waitUntil` 甩到响应之后写，不让存储往返拖慢订阅返回。
+
+**失败时的行为**：数据源不可用、返回非 JSON、超时，统统原样透传节点（备注只是少个后缀）。订阅是整个服务的入口，为了加个后缀把订阅搞挂是不可接受的。这一层还有 8 秒墙钟上限兜底。
+
+| 环境变量 | 说明 |
+|---|---|
+| `NODE_COUNTRY_TAG` | `false` / `0` / `off` 关闭标注，其余（含未配置）为开启 |
+| `NODE_COUNTRY_STYLE` | 后缀样式，取值见上表，默认 `cn-code` |
+| `GEOIP_BATCH_URL` | 批量查询端点，默认 `https://api.country.is/`（HTTPS、免密钥、单次 100 个 IP、数据源 MaxMind GeoLite2）。任何接受 JSON 数组、返回国家代码的批量端点都能替换 |
+| `GEOIP_BATCH_SIZE` | 单次批量上限，默认 `100` |
+
+**注意**：这一步刻意放在 `/sub` 出口做增强，**没有改动 vendor/vless.js** —— 节点生成逻辑仍在上游，关掉开关就是原样透传，以后升级也不会冲突。
+
+### 实测节点是否真的可用
+
+`tools/check-nodes.py` 会对订阅里每个节点做分级握手，越往下越能证明「真能用」：
+
+| 级别 | 含义 |
+|---|---|
+| L1 | TCP 端口可达 |
+| L2 | 带正确 SNI 能完成 TLS 握手（1034 / 证书不匹配会在这里暴露） |
+| L3 | WebSocket upgrade 拿到 101 —— edgetunnel 的入口就是 ws |
+| L4 | 真正发一条 VLESS 请求把数据代理出网，并收到目标站响应 |
+
+```bash
+curl -s https://proxy.example.com/tsub/<id> -o /tmp/sub.txt
+python3 tools/check-nodes.py /tmp/sub.txt 16
+```
+
+> L4 的探测目标刻意选**没有托管在 Cloudflare 上**的站点。CF 对自己边缘 IP 发来的明文 HTTP 请求会直接回 400，用 `example.com` 这类 CF 托管域名当判据，会把健康节点误判成坏的。
 
 ---
 
