@@ -340,8 +340,10 @@ section('10. 布局度量一致（选项卡之间同宽）');
   // 选项卡的顶层块必须是同一种卡片：换个 class 就等于换了宽度来源
   const paneTags = [...pageHtml.matchAll(/<[a-z][^>]*\sdata-pane="[^"]*"[^>]*>/g)].map(m => m[0]);
   ok('选项卡顶层块数量与选项卡一致', paneTags.length >= Object.keys(TAB_LABELS).length, `${paneTags.length} 块`);
-  const noCard = paneTags.filter(t => !/class="[^"]*\bcard\b/.test(t));
-  ok('每个选项卡顶层块都是卡片', noCard.length === 0, noCard.join(' | ') || '—');
+  // cfg-lead 是配置页的引导说明段落（不是卡片，也不该有卡片的边框/底色），允许作为顶层块；
+  // 真正的纪律是「换 class = 换宽度来源」，引导段没有横向度量所以不破坏这条。
+  const noCard = paneTags.filter(t => !/class="[^"]*\bcard\b/.test(t) && !/class="[^"]*\bcfg-lead\b/.test(t));
+  ok('每个选项卡顶层块都是卡片（引导段除外）', noCard.length === 0, noCard.join(' | ') || '—');
   // 横向度量写进行内样式，就绕过了主题变量，也没法被这一节盯住
   const SIZING_RE = /(?:^|;|\s)(width|max-width|min-width|padding|padding-left|padding-right|margin-left|margin-right)\s*:/;
   const inlineSize = paneTags.filter(t => {

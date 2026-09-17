@@ -173,7 +173,7 @@ function renderConfigPanels() {
   const { cards, tools } = splitCatalog();
   const parts = [];
 
-  parts.push('<div class="cfg-lead">这里只放没有独立选项卡的设置项。'
+  parts.push('<div class="cfg-lead" data-pane="config">这里只放没有独立选项卡的设置项。'
     + '其余功能（站点、优选 IP、伪装、主题、临时链接）各自有专属选项卡，用顶部标签切换即可。</div>');
 
   for (const { group, items } of cards) {

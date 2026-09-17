@@ -1039,7 +1039,6 @@ ${themeScript}
     <div class="hint" id="ntState" style="margin-top:4px;">${esc(ntHint)}</div>
     <div class="hint" style="margin-top:4px;">国家查询结果会长期缓存，同一个 IP 只真正查询一次；数据源不可用时自动跳过标注，绝不影响订阅本身。</div>
   </div>` : ''}
-</div>
 
 ${authed ? `
 <!-- 编辑站点弹窗 -->
@@ -1081,6 +1080,7 @@ ${authed ? `
     <div class="msg" id="shMsg" style="min-height:18px;"></div>
     <div id="shList" style="margin-top:8px;"><div class="empty">加载中…</div></div>
   </div>` : ''}
+</div>
 
 <script>
 // 顶栏「外观」按钮：跳到主题分区，选主题在那一屏里做（不再三档循环 —— 主题多了循环点不过来）
