@@ -1,7 +1,7 @@
 import vlessHandler from '../vendor/vless.js';
 import { json, b64, esc, cors, isNavigation } from './util.js';
 import { bindRuntime, runtime } from './runtime.js';
-import { getSite } from './sites.js';
+import { getSite, listSites } from './sites.js';
 import { isAuthed, handleLogin, handleLogout, loginPage, noConfigPage } from './auth.js';
 import { adminPage, handleAdmin, tempSubPage } from './admin.js';
 import { get as getTempSub, isActive as isTempSubActive, subToken as tempSubToken } from './tempsubs.js';
@@ -158,6 +158,12 @@ async function handleRequest(request, env, ctx) {
     if (path === '/__api/login') return handleLogin(request, env);
     if (path === '/__api/logout') return handleLogout(cfg);
     if (path === '/__login') return await loginPageResp(cfg, cloaked, env);
+    // 前缀丢失自愈也覆盖伪装开启的场景：反代通道对访客本就可达，
+    // 客户端拼错前缀时同样要能救回来，否则伪装开着就等于站点废了。
+    {
+      const healed = await healLostPrefix(request, url, env);
+      if (healed) return healed;
+    }
     return renderNotFound(cfg, request);
   }
 
@@ -277,6 +283,13 @@ async function handleRequest(request, env, ctx) {
     return await dispatchProxy(request, url, ctx, env);
   }
 
+  // 前缀丢失自愈：客户端用绝对路径拼代理地址时会吃掉 /p/<id>，请求落到代理根上。
+  // 命中才接管，否则继续走下面的常规分支（见 healLostPrefix 里的收窄条件）。
+  {
+    const healed = await healLostPrefix(request, url, env);
+    if (healed) return healed;
+  }
+
   // 其余路径：
   //   伪装开启 -> 伪装 404。绝不能 302 到 /__admin，Location 头会把面板命名空间直接交给扫描器。
   //   未开启   -> 回管理页（保持历史行为）
@@ -319,6 +332,38 @@ function renderNotFoundFallback() {
     status: 404,
     headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' },
   });
+}
+
+/**
+ * 前缀丢失自愈：把「打到代理根、但本属于某个反代站点」的请求挂回它的前缀。
+ *
+ * 起因是 URL 规范决定的客户端拼接行为：客户端把代理地址当 base，与以 / 开头的
+ * 绝对路径（如 Emby 的 DirectStreamUrl=/play/video/...）做拼接时，前导斜杠表示
+ * 「从域名根开始」，base 里的 /p/<id> 会被整个吃掉：
+ *   new URL("/play/video/x", "https://proxy/p/uhdnow")  ->  https://proxy/play/video/x
+ * 于是播放地址脱离代理命名空间，请求落到代理根上变成 404，播放器反复重试、
+ * 流量打满却始终播不了。
+ *
+ * 兜底条件收得很紧，保证绝不会误伤代理自身的路径：
+ *   - 站点恰好只有一个（多站点时无法判断该回填谁，宁可不动）
+ *   - 路径不以 /p/ /edt /tsub /admin /login /sub /__ /favicon /robots 开头
+ *   - 只回填带查询串的 GET/HEAD（绝对 URL 拼接必然带走原查询串，
+ *     Emby 的 ?api_key= / ?UserId= 等都在其中）
+ */
+async function healLostPrefix(request, url, env) {
+  if (request.method !== 'GET' && request.method !== 'HEAD') return null;
+  const path = url.pathname;
+  if (!url.search) return null;
+  if (path === '/' || path === '') return null;
+  if (/^\/(?:p|edt|tsub|admin|login|logout|sub|__[a-z]*|favicon\.ico|robots\.txt)(?:\/|$)/.test(path)) return null;
+
+  let sites;
+  try { sites = await listSites(); } catch { return null; }
+  if (!Array.isArray(sites) || sites.length !== 1) return null;
+
+  const healed = new URL(url.toString());
+  healed.pathname = `/p/${sites[0].id}${path}`;
+  return dispatchProxy(new Request(healed.toString(), request), healed, null, env);
 }
 
 /** 反向代理 /p/{id}/...：无需登录，伪装开启时同样放行（这是站点的正常使用路径） */
