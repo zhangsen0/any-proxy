@@ -370,6 +370,56 @@ section('10. 布局度量一致（选项卡之间同宽）');
   ok('两页字段宽度一致', Math.abs(colW(cfgCols) - colW(siteCols)) < 0.01, `${colW(cfgCols)}px vs ${colW(siteCols)}px`);
 }
 
+// ===================== 11. 临时链接区块：api 契约行为校验 =====================
+section('11. 临时链接区块（api 包装契约行为校验）');
+{
+  // api() 返回 { ok, status, data } 包装结构。这里把渲染产物里的「站点临时访问链接」
+  // IIFE 原样抠出来，在裸沙盒里配桩真跑一遍。历史上它按旧契约直接读 r.sites / r.shares，
+  // 「生成链接」的站点下拉永远只有占位项——不报错、只静默为空，字符串断言抓不到，
+  // 只有把脚本真正执行起来才能暴露。
+  const marker = '站点临时访问链接：列表 + 生成 + 停用 / 启用 + 删除';
+  const mi = pageHtml.indexOf(marker);
+  ok('能定位到临时链接区块脚本', mi > 0);
+  if (mi > 0) {
+    const start = pageHtml.indexOf('(function () {', mi);
+    const end = pageHtml.indexOf('</script>', mi);
+    const code = start > 0 && end > start ? pageHtml.slice(start, end).trim() : '';
+    ok('成功截取完整 IIFE（以 })(); 结尾）', code.endsWith('})();'));
+    ok('share 脚本不经 r.sites / r.shares 等旧契约读字段（一律走 r.data.*）',
+      code.length > 0 && !/\br\.(sites|shares|path|error)\b/.test(code));
+
+    const runShare = async data => {
+      const els = {};
+      const mk = () => ({ innerHTML: '', addEventListener() {}, value: '', onclick: null });
+      const doc = { getElementById: id => (els[id] || (els[id] = mk())) };
+      const api = () => Promise.resolve({ ok: true, status: 200, data });
+      let err = '';
+      try {
+        new Function('document', 'api', code)(doc, api);
+        await new Promise(r => setTimeout(r, 20));
+      } catch (e) { err = String(e && e.message || e); }
+      return {
+        err,
+        shSite: (els.shSite && els.shSite.innerHTML) || '',
+        shList: (els.shList && els.shList.innerHTML) || '',
+      };
+    };
+    const good = await runShare({
+      sites: [{ id: 's1', name: '站点一' }],
+      shares: [{ token: 't1', note: '演示', site: 's1', path: '/s/abc', hits: 1, max_hits: 0, disabled: false, left_hours: 3 }],
+    });
+    ok('沙盒执行无异常', !good.err, good.err);
+    ok('站点下拉被真实填充（占位 + 1 个站点）',
+      (good.shSite.match(/<option/g) || []).length === 2 && good.shSite.includes('站点一'),
+      `option=${(good.shSite.match(/<option/g) || []).length}`);
+    ok('临时链接列表被真实渲染', good.shList.includes('演示') && good.shList.includes('/s/abc'));
+
+    const empty = await runShare({ sites: [], shares: [] });
+    ok('空数据时保留占位项并显示空态',
+      (empty.shSite.match(/<option/g) || []).length === 1 && empty.shList.includes('还没有临时链接'));
+  }
+}
+
 globalThis.fetch = undefined;
 
 console.log(`\n=== ${fail === 0 ? '全部通过' : '存在失败'} ===`);console.log(`配置页与接口目录：${pass + fail} 项，失败 ${fail} 项`);

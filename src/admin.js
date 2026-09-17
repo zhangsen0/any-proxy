@@ -1829,12 +1829,18 @@ ${authed ? STATS_JS : ''}
         + '</div></div>';
     }).join('');
   }
+  // api() 返回包装结构 { ok, status, data }，业务字段一律在 r.data 里（与页面其他区块一致）
+  function gotoLoginIf401(r) { if (r && r.status === 401) { location.href = '/__login'; return true; } return false; }
   function loadShares() {
-    return api('/__api/shares').then(function (r) { render(r.shares || []); });
+    return api('/__api/shares').then(function (r) {
+      if (gotoLoginIf401(r)) return;
+      render((r.data && r.data.shares) || []);
+    });
   }
   function loadSites() {
     return api('/__api/sites').then(function (r) {
-      var sites = (r && r.sites) || [];
+      if (gotoLoginIf401(r)) return;
+      var sites = (r.data && r.data.sites) || [];
       shSite.innerHTML = '<option value="">选择站点…</option>'
         + sites.map(function (s) { return '<option value="' + esc(s.id) + '">' + esc(s.name || s.id) + '</option>'; }).join('');
     });
@@ -1856,8 +1862,10 @@ ${authed ? STATS_JS : ''}
       ? api('/__api/shares/' + encodeURIComponent(token), { method: 'DELETE' })
       : api('/__api/shares/' + encodeURIComponent(token) + '/' + act, { method: 'POST', body: JSON.stringify({}) });
     call.then(function (r) {
-      setMsg('shMsg', r && r.error ? r.error : '已更新', !!r && !!r.error);
-      render(r.shares || []);
+      if (gotoLoginIf401(r)) return;
+      var err = r.data && r.data.error;
+      setMsg('shMsg', err ? err : '已更新', !!err);
+      render((r.data && r.data.shares) || []);
     }).catch(function (err) { setMsg('shMsg', String(err && err.message || err), true); });
   });
   document.getElementById('shCreate').onclick = function () {
@@ -1872,8 +1880,10 @@ ${authed ? STATS_JS : ''}
         note: document.getElementById('shNote').value,
       }),
     }).then(function (r) {
-      if (r && r.error) { setMsg('shMsg', r.error, true); return; }
-      setMsg('shMsg', '已生成：' + location.origin + r.path, false);
+      if (gotoLoginIf401(r)) return;
+      var err = r.data && r.data.error;
+      if (err) { setMsg('shMsg', err, true); return; }
+      setMsg('shMsg', '已生成：' + location.origin + (r.data && r.data.path), false);
       loadShares();
     }).catch(function (e) { setMsg('shMsg', String(e && e.message || e), true); });
   };

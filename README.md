@@ -195,6 +195,7 @@ Worker 侧还有一组可选变量（`wrangler.toml` 的 `[vars]`，非敏感）
 ```
 worker.js              统一入口：绑定运行时 + 请求路由；scheduled 处理 DNS 定时任务
 wrangler.toml          Worker 配置：D1 绑定 DB（默认后端，migrations_dir=migrations）、KV 绑定 SITES、cron */5 * * * *、vars.GH_ACTIONS_URL
+AGENTS.md              AI 协作开发约束：单一真源、api 包装契约、注入脚本自包含等硬性约定（改代码前必读）
 src/
   runtime.js           平台注入绑定（KV / PASSWORD）的共享容器；按 STORAGE_BACKEND 选择 KV 或 D1
   storage.js           D1-backed KV 兼容适配层（createD1KV），业务模块无感切换后端
