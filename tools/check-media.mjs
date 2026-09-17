@@ -45,9 +45,11 @@ const flush = async (ctx) => { await Promise.all(ctx.pending); };
 
 console.log('\n[1] 缓存体积闸门：大文件绝不能进 Cache API');
 {
-  const big = 40 * 1024 * 1024;                     // 40MB，接近真实视频
-  check('上限值合理（1MB）', MAX_CACHE_BYTES === 1024 * 1024, `${MAX_CACHE_BYTES} bytes`);
+  const big = 40 * 1024 * 1024;                     // 40MB，接近真实整片视频
+  const seg4k = 4 * 1024 * 1024;                    // 4MB，主流 4K HLS 分片上限
+  check('上限值合理（4MB）', MAX_CACHE_BYTES === 4 * 1024 * 1024, `${MAX_CACHE_BYTES} bytes`);
   check('40MB 视频不可缓存', !cacheableSize(new Response('x', { headers: { 'content-length': String(big) } })));
+  check('4MB HLS 分片可缓存（边缘缓存对视频的主要价值点）', cacheableSize(new Response('x', { headers: { 'content-length': String(seg4k) } })));
 
   const c = fakeCaches();
   globalThis.caches = c;
