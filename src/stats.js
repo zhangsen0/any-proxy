@@ -79,6 +79,32 @@ export function isAdminScope(scope) {
   return ADMIN_SCOPES.indexOf(String(scope)) >= 0;
 }
 
+/** 桶里的累加动作集中在这里：hits / bytes / errors / 来访者都只有这一个入口 */
+function bump(scope, delta) {
+  const key = `${scope}|${bucketDate()}`;
+  let item = buffer.get(key);
+  if (!item) {
+    item = { hits: 0, bytes: 0, errors: 0, ips: null };
+    buffer.set(key, item);
+  }
+  if (delta.hits) item.hits += delta.hits;
+  if (delta.bytes) item.bytes += delta.bytes;
+  if (delta.errors) item.errors += delta.errors;
+  if (delta.ip) {
+    if (!item.ips) item.ips = new Set();
+    // 上限内才继续收集：超过就不再膨胀，最终 uv 记为「≥上限」
+    const limit = Number(delta.uvLimit) || 0;
+    if (!limit || item.ips.size < limit) item.ips.add(delta.ip);
+  }
+  return item;
+}
+
+/** 统计开关 + 通道分档的统一闸门：不满足就直接不记账 */
+function allowed(scope, cfg) {
+  if (!cfg || !cfg.enabled) return false;
+  return !(isAdminScope(scope) && !cfg.record_admin);
+}
+
 /**
  * 记录一次访问。设计约定：
  *   - 同步部分只做加法，绝不 await 存储 —— 调用方可以有 ctx 也可以没有（websocket 等场景）
@@ -96,28 +122,36 @@ export function record({ scope, response, ip, env, ctx, failed }) {
   // 开关没打开时一次哈希都不做：配置都还没读过，这条路径也必须零成本
   schedulePersist(env, ctx, async () => {
     const cfg = await readStatsConfig(env);
-    if (!cfg.enabled) return false;
-    if (isAdminScope(scope) && !cfg.record_admin) return false;
+    if (!allowed(scope, cfg)) return false;
 
     const status = response ? response.status : 0;
     const len = response ? Number(response.headers.get('content-length') || 0) : 0;
-    const key = `${scope}|${bucketDate()}`;
-    let item = buffer.get(key);
-    if (!item) {
-      item = { hits: 0, bytes: 0, errors: 0, ips: null };
-      buffer.set(key, item);
-    }
-    item.hits += 1;
-    item.bytes += Number.isFinite(len) && len > 0 ? len : 0;
-    if (failed || status >= 500) item.errors += 1;
-    if (cfg.track_visitors && ip) {
-      if (!item.ips) item.ips = new Set();
-      // 上限内才继续收集：超过就不再膨胀，最终 uv 记为「≥上限」
-      if (item.ips.size < cfg.uv_limit) item.ips.add(ip);
-    }
+    bump(scope, {
+      hits: 1,
+      bytes: Number.isFinite(len) && len > 0 ? len : 0,
+      errors: failed || status >= 500 ? 1 : 0,
+      ip: cfg.track_visitors && ip ? ip : '',
+      uvLimit: cfg.uv_limit,
+    });
     return true;
   });
   return;
+}
+
+/**
+ * 只累加流量。用于响应没有 Content-Length 的情况（上游 chunked 很常见）——
+ * 那种响应只有在流发完才知道有多少字节，所以由调用方在流结束时回填，
+ * 与 hits 分开记：万一流没结束，丢的只是字节数，请求数不会跟着丢。
+ */
+export function recordBytes({ scope, bytes, env, ctx }) {
+  const n = Number(bytes) || 0;
+  if (!scope || n <= 0) return;
+  schedulePersist(env, ctx, async () => {
+    const cfg = await readStatsConfig(env);
+    if (!allowed(scope, cfg)) return false;
+    bump(scope, { bytes: n });
+    return true;
+  });
 }
 
 /**

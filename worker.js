@@ -22,7 +22,7 @@ import { bindRuntime } from './src/runtime.js';
 import { handleRequest } from './src/router.js';
 import { scheduledDnsCheck } from './src/dns.js';
 import { readConfig, isActive, renderNotFound } from './src/disguise.js';
-import { record as recordVisit } from './src/stats.js';
+import { record as recordVisit, recordBytes } from './src/stats.js';
 
 /**
  * 请求路径 -> 统计通道。放在入口而不是路由内部：路由里分支太多，
@@ -43,11 +43,37 @@ function visitScope(pathname) {
   return '';
 }
 
+/**
+ * 响应没有 Content-Length 时（上游 chunked 很常见）边发边数真实字节数。
+ * 用 TransformStream 只做累加，不缓存内容，所以大文件也不会多占内存。
+ * 数完回填给统计：这一步失败只影响「流量」，不影响请求数。
+ */
+function countResponseBytes(response, scope, env, ctx) {
+  if (!response || !response.body) return response;
+  if (response.headers.get('content-length')) return response;
+  let total = 0;
+  const counter = new TransformStream({
+    transform(chunk, ctrl) {
+      total += chunk && chunk.byteLength ? chunk.byteLength : 0;
+      ctrl.enqueue(chunk);
+    },
+    flush() {
+      // 202 等状态码、以及 101（WebSocket）没有正常响应体，这里自然被上面的判断挡掉
+      try { recordBytes({ scope, bytes: total, env, ctx }); } catch {}
+    },
+  });
+  return new Response(response.body.pipeThrough(counter), {
+    status: response.status,
+    statusText: response.statusText,
+    headers: response.headers,
+  });
+}
+
 export default {
   async fetch(request, env, ctx) {
     try {
       bindRuntime(env);
-      const response = await handleRequest(request, env, ctx);
+      let response = await handleRequest(request, env, ctx);
       // 统计永不阻塞、永不抛：record 内部把落盘挂到 waitUntil，异常就地吞掉
       try {
         const scope = visitScope(new URL(request.url).pathname);
@@ -60,6 +86,7 @@ export default {
             ctx,
             failed: response.status >= 500,
           });
+          response = countResponseBytes(response, scope, env, ctx);
         }
       } catch {}
       return response;

@@ -45,10 +45,12 @@ function ok(name, cond, extra = '') {
 }
 function section(title) { console.log('\n=== ' + title + ' ==='); }
 
-// 上游一律用假源站，绝不真出网
-globalThis.fetch = async () => new Response('<!DOCTYPE html><html><body>ok</body></html>', {
+// 上游一律用假源站，绝不真出网。注意 proxy.js 内部有 30 秒 HTML 缓存，
+// 所以同一个路径请求两次会命中缓存 —— 要测真实字节数就得换路径。
+const UP_BODY = '<!DOCTYPE html><html><body>ok</body></html>';
+globalThis.fetch = async () => new Response(UP_BODY, {
   status: 200,
-  headers: { 'content-type': 'text/html; charset=utf-8', 'content-length': '120' },
+  headers: { 'content-type': 'text/html; charset=utf-8', 'content-length': String(Buffer.byteLength(UP_BODY)) },
 });
 
 /** 真实模拟一次请求：收集 waitUntil 的落盘任务并等它跑完，否则统计还在内存里没落盘 */
@@ -92,11 +94,12 @@ section('1. 请求出口的采集（曾经 record() 没有任何调用方）');
   ok('开启统计（面板接口）', on.status === 200 && on.data && on.data.config && on.data.config.enabled === true);
 
   // 第一个请求必须由 waitUntil 自动落盘（这是「不逐请求写存储、批量落盘」的关键路径）
-  await visit('/p/demo/', { headers: VISITOR });
+  await visit('/p/demo/a', { headers: VISITOR });
   ok('首个请求由 waitUntil 自动落盘', !!mem.get('stat:p:demo:' + today),
     mem.has('stat:p:demo:' + today) ? 'stat:p:demo:' + today : '(未落盘)');
 
-  await visit('/p/demo/', { headers: VISITOR });
+  // 换路径避开 proxy 的 30 秒 HTML 缓存，保证第二个请求真的走上游
+  await visit('/p/demo/b', { headers: VISITOR });
   await visit('/robots.txt', { headers: VISITOR });                       // 噪声路径：不该计入任何通道
   await visit('/__api/stats', { headers: { Cookie: COOKIE, ...VISITOR } }); // 管理通道：record_admin 关闭时不计入
   // 落盘是按间隔（默认 15s）触发的，测试里手动催一次，把内存里剩余计数写下去
@@ -106,8 +109,7 @@ section('1. 请求出口的采集（曾经 record() 没有任何调用方）');
   const d = after.data || {};
   const scopes = (d.series || []).map(s => s.scope);
   const demo = (d.series || []).find(s => s.scope === 'p:demo');
-  ok('反代站点请求被计入 p:<站点id>', !!demo && demo.hits === 2, demo ? `hits=${demo.hits}` : `scopes=${scopes.join(',')}`);
-  ok('伪装噪声路径（robots.txt）不计入', !scopes.includes('robots.txt') && !scopes.some(s => /robots|\.txt/.test(s)), scopes.join(','));
+  ok('反代站点请求被计入 p:<站点id>', !!demo && demo.hits === 2, demo ? `hits=${demo.hits}` : `scopes=${scopes.join(',')}`);  ok('伪装噪声路径（robots.txt）不计入', !scopes.includes('robots.txt') && !scopes.some(s => /robots|\.txt/.test(s)), scopes.join(','));
   ok('record_admin 关闭时管理通道不计入', !scopes.includes('admin'), scopes.join(',') || '(空)');
   ok('总量与通道一致', d.totals && d.totals.hits === 2, `totals.hits=${d.totals && d.totals.hits}`);
   ok('当日桶出现在 daily 里', (d.daily || []).some(x => x.date === today && x.hits === 2),
@@ -118,8 +120,42 @@ section('1. 请求出口的采集（曾经 record() 没有任何调用方）');
   ok('落盘内容不含原始 IP', !!raw && !raw.includes('203.0.113.9'), raw ? raw.slice(0, 90) : '(无)');
 }
 
-// ===================== 2. record_admin 打开后管理通道计入 =====================
-section('2. record_admin 语义（面板自己的访问单独控制）');
+// ===================== 2. 流量口径：上游 chunked（无 Content-Length）也要数得出来 =====================
+section('2. 流量口径（上游 chunked 时不能永远是 0）');
+{
+  // 上游真实情况：Transfer-Encoding: chunked，响应头里没有 content-length，
+  // 只有在流发完才知道字节数。这里造一个分块流，验证「边发边数」确实回填了流量。
+  const CHUNK = 'x'.repeat(500);
+  globalThis.fetch = async () => new Response(new ReadableStream({
+    start(c) {
+      c.enqueue(new TextEncoder().encode(CHUNK));
+      c.enqueue(new TextEncoder().encode(CHUNK));
+      c.close();
+    },
+  }), { status: 200, headers: { 'content-type': 'text/html; charset=utf-8' } });
+
+  const pending = [];
+  const ctx = { waitUntil: (p) => { pending.push(p); } };
+  // 换一个没请求过的路径：proxy 的 30 秒 HTML 缓存会让我们测到缓存体而不是上游流
+  const res = await worker.fetch(new Request(ORIGIN + '/p/demo/c', { headers: VISITOR }), env, ctx);
+  const body = await res.text();
+  ok('响应体被原样透传（未被计数影响）', body.length === 1000, `${body.length} 字节`);
+  // 流发完后计数才会回填：等 waitUntil + 一拍
+  await Promise.all(pending.map(p => Promise.resolve(p).catch(() => {})));
+  await new Promise(r => setTimeout(r, 10));
+  await flush(env);
+
+  const d = (await apiGet('/__api/stats?days=7', { Cookie: COOKIE })).data || {};
+  const demo = (d.series || []).find(s => s.scope === 'p:demo');
+  ok('无 Content-Length 的响应也记到了流量', !!demo && demo.bytes >= 1000, demo ? `bytes=${demo.bytes}` : '未找到 p:demo');
+  ok('请求数与流量不互相干扰', !!demo && demo.hits === 3, demo ? `hits=${demo.hits}` : '');
+
+  // 恢复成常规假源站
+  globalThis.fetch = async () => new Response('ok', { status: 200, headers: { 'content-type': 'text/html' } });
+}
+
+// ===================== 3. record_admin 打开后管理通道计入 =====================
+section('3. record_admin 语义（面板自己的访问单独控制）');
 {
   await apiPost('/__api/stats-config', { record_admin: true });
   await visit('/__api/stats-config', { headers: { Cookie: COOKIE, ...VISITOR } });
@@ -129,7 +165,7 @@ section('2. record_admin 语义（面板自己的访问单独控制）');
   ok('打开后管理通道被计入', !!admin && admin.hits >= 1, admin ? `hits=${admin.hits}` : '未出现');
 }
 
-// ===================== 3. 关闭统计后停止记录 =====================
+// ===================== 4. 关闭统计后停止记录 =====================
 section('3. 关闭后不再记录（但已有数据保留）');
 {
   // 一并关掉 record_admin：否则「读取统计」这一步自身也会被计入，把断言搅浑
@@ -145,7 +181,7 @@ section('3. 关闭后不再记录（但已有数据保留）');
   ok('已有数据仍然可读（关≠清）', after.totals && after.totals.hits > 0, `hits=${after.totals && after.totals.hits}`);
 }
 
-// ===================== 4. 汇总口径 =====================
+// ===================== 5. 汇总口径 =====================
 section('4. 汇总口径（日期补齐 / 保留天数上限）');
 {
   // 直接种两天的桶：验证「某个通道缺某天时补 0」而不是把日期拉直
@@ -169,7 +205,7 @@ section('4. 汇总口径（日期补齐 / 保留天数上限）');
   ok('请求天数被保留天数上限夹住', clamped.days === clamped.retention_days, `days=${clamped.days} retention=${clamped.retention_days}`);
 }
 
-// ===================== 5. 清空 =====================
+// ===================== 6. 清空 =====================
 section('5. 清空数据（保留配置）');
 {
   const r = await apiPost('/__api/stats/clear', {});
@@ -181,7 +217,7 @@ section('5. 清空数据（保留配置）');
   ok('清空只删数据，不动配置', !!d.retention_days, `retention=${d.retention_days}`);
 }
 
-// ===================== 6. 驾驶舱渲染与脚本 =====================
+// ===================== 7. 驾驶舱渲染与脚本 =====================
 section('6. 驾驶舱页面与注入脚本');
 {
   const html = await (await adminPage(true, ORIGIN, env)).text();
