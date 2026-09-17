@@ -240,6 +240,23 @@ console.log('\n[6] 上游无视 Accept-Encoding: identity 强发 br（整站乱�
       `enc=${b.headers.get('content-encoding')}`);
     ok('透传体就是上游原始压缩字节（未被当文本改写）',
       Buffer.compare(Buffer.from(b.buf), brBody) === 0, `len=${b.buf.length} vs ${brBody.length}`);
+
+    // 场景 C：上游在 CF 边缘后面，边缘把子响应压成 gzip 且**不带 content-encoding 头**
+    // （线上复发事故：头是空的、body 是 1f 8b 魔术字节）。按头裁决会当明文 → 整页乱码，
+    // 必须按魔术字节嗅探出来并解压。gzip 用本地 DecompressionStream 原生支持，无需桩。
+    globalThis.DecompressionStream = realDS;
+    const gzBody = zlib.gzipSync(Buffer.from(ORIGIN_BODY, 'utf8'));
+    globalThis.fetch = async () => new Response(gzBody, {
+      status: 200,
+      headers: { 'content-type': 'text/html; charset=utf-8' }, // 刻意不带 content-encoding
+    });
+    const c = await call('/p/demo/', { 'Accept-Encoding': 'identity' });
+    ok('无头 gzip：上游响应 200', c.status === 200, `status=${c.status}`);
+    const textC = new TextDecoder().decode(c.buf);
+    ok('无头 gzip 被嗅探并解压（正文可读、无乱码）',
+      textC.includes('演示站') && !textC.includes('\uFFFD'), `len=${c.buf.length}`);
+    ok('无头 gzip：输出不带 content-encoding（已解压，头必须干净）',
+      !c.headers.get('content-encoding'), `enc=${c.headers.get('content-encoding') || '无'}`);
   } finally {
     globalThis.fetch = realFetch;
     globalThis.DecompressionStream = realDS;

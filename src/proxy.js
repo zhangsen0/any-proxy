@@ -323,12 +323,13 @@ async function proxyRequest(request, site, crossHost, ctx, env) {
 
   // 编码检测：上游非 utf-8（gb2312/GBK 等老站）必须按实际编码解码，否则全文乱码。
   // 顺序：Content-Type charset -> HTML <meta> charset -> utf-8 兜底。
-  const { raw } = await plaintextBuffer(upstream);
+  const pb = await plaintextBuffer(upstream);
+  const raw = pb.raw;
   if (raw === null) {
     // 上游发了一种本环境解不了的压缩格式（如运行时不支持 br）：整响应原样透传，
     // 头里的 content-encoding 保留——头体一致，浏览器自己能解。绝不能把压缩字节
     // 当文本改写（那正是整站乱码的来源），也不能删头（删了浏览器更解不了）。
-    return new Response(upstream.body, { status: upstream.status, headers: headersOut });
+    return new Response(pb.body, { status: upstream.status, headers: headersOut });
   }
   let enc = 'utf-8';
   const ctCharset = ct.match(/charset=([^\s;]+)/i);
@@ -423,28 +424,55 @@ function rewriteSetCookies(out, upstream, cookiePath) {
  *   3. HTTPS 完全不可用时降级 HTTP（自签证书或纯 HTTP 源站）。
  */
 /**
+ * 按魔术字节识别压缩流格式。**头会撒谎或缺席，字节不会**：
+ * 实测上游也在 Cloudflare 后面时，Worker 明明发了 `Accept-Encoding: identity`，
+ * 边缘仍会把子响应压成 gzip 且**不带 Content-Encoding 头**（线上事故 0889479 后复发）。
+ * text/html / js / css 等文本永远不可能以这些字节开头，嗅探零误伤。
+ */
+function sniffCompression(raw) {
+  if (!raw || raw.byteLength < 4) return null;
+  const b = new Uint8Array(raw, 0, 4);
+  if (b[0] === 0x1f && b[1] === 0x8b) return 'gzip';                       // gzip
+  if (b[0] === 0x28 && b[1] === 0xb5 && b[2] === 0x2f && b[3] === 0xfd) return 'zstd'; // zstd
+  if (b[0] === 0x78 && (b[1] === 0x01 || b[1] === 0x5e || b[1] === 0x9c || b[1] === 0xda)) return 'deflate'; // zlib
+  return null;
+}
+
+async function decompressBuffer(raw, fmt) {
+  const stream = new Response(raw).body.pipeThrough(new DecompressionStream(fmt));
+  return await new Response(stream).arrayBuffer();
+}
+
+/**
  * 把上游响应体读成明文 Buffer。
  *
- * Workers 运行时只自动解 gzip/deflate；br / zstd 会**原样透传**。上游若无视
- * 上面发出去的 `Accept-Encoding: identity` 强行返回 br（真实事故：uhdnow 整站乱码），
- * 压缩字节按文本解码就是整页乱码，且后面还会删掉 content-encoding 头，体头彻底对不上。
- * 所以这里识别「运行时不自动解」的格式，能用 DecompressionStream 就地解成明文；
+ * 两类真实事故，一个裁决原则——「头说了不算，字节才是最终裁决」：
+ * 1. 上游无视 `Accept-Encoding: identity` 强行返回 br/zstd 且带着头（uhdnow 整站乱码）；
+ * 2. 上游在 CF 边缘后面，边缘给子响应悄悄压了 gzip **还不带头**（乱码复发，线上抓包
+ *    body 是 1f 8b 魔术字节、头是空）。第 2 种头根本没说，只能靠嗅探。
+ *
  * 解不了（运行时不认识该格式）就返回 null，由调用方整响应透传（头体一致）。
  *
- * @returns {{ raw: ArrayBuffer|null, compressed: boolean }}
- *          raw=null 表示无法解压，调用方必须连头带体原样透传
+ * @returns {{ raw: ArrayBuffer|null, compressed: boolean, body: ArrayBuffer }}
+ *          raw=null 表示无法解压，调用方必须用 body（原始压缩字节）连头带体原样透传
  */
 async function plaintextBuffer(upstream) {
-  const enc = String(upstream.headers.get('content-encoding') || '').trim().toLowerCase();
-  if (!enc || enc === 'identity' || enc === 'gzip' || enc === 'deflate' || enc === 'x-gzip') {
-    // 这些情况拿到的已是明文：gzip/deflate 由运行时透明解压，其余本就未压缩
-    return { raw: await upstream.arrayBuffer(), compressed: false };
+  const declared = String(upstream.headers.get('content-encoding') || '').trim().toLowerCase();
+  const raw = await upstream.arrayBuffer();
+  // 字节优先：嗅探命中就直接按字节解，头说了什么无关紧要（覆盖「带头压缩」「不带头压缩」「头撒谎」三种）。
+  // 字节看着是明文时，只有 br/zstd 这种「运行时不会自动解」的声明编码才值得再试——
+  // gzip/deflate 若声明了，运行时早就透明解压完了，再解一遍就是把明文当压缩流、必然抛错。
+  const sniffed = sniffCompression(raw);
+  let fmt = sniffed || (declared && declared !== 'identity' ? declared : '');
+  if (fmt === 'x-gzip') fmt = 'gzip';
+  if (!fmt || (!sniffed && (fmt === 'gzip' || fmt === 'deflate'))) {
+    return { raw, compressed: false, body: raw };
   }
   try {
-    const stream = upstream.body.pipeThrough(new DecompressionStream(enc));
-    return { raw: await new Response(stream).arrayBuffer(), compressed: true };
+    return { raw: await decompressBuffer(raw, fmt), compressed: true, body: raw };
   } catch {
-    return { raw: null, compressed: true };
+    // body 已经在上面被 arrayBuffer() 消费掉了，透传必须用这份缓冲的原始压缩字节
+    return { raw: null, compressed: true, body: raw };
   }
 }
 
