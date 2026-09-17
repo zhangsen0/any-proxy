@@ -181,26 +181,46 @@ async function main() {
   section('限流与防滥用');
   const rl0 = await getJson('/__api/ratelimit');
   assert('限流配置可读', rl0.status === 200 && !!rl0.data, `实际 ${rl0.status}`);
+  // 原配置留着，测完原样还原 —— 这个脚本可能被指向生产实例，不能留下副作用
+  const rlOrig = (rl0.data && rl0.data.config) || {};
+  // 两个刻意的设置：
+  //   exempt_authed:false —— 本脚本是登录态，豁免开着就永远挡不到自己，等于没测
+  //   exempt_paths 带上管理接口 —— 否则把自己锁在外面，连「关掉限流」这一步都会 429
   const rlOn = await req('/__api/ratelimit', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ enabled: true, window_seconds: 60, max_requests: 2, scope: 'ip', exempt_authed: true }),
+    body: JSON.stringify({
+      enabled: true,
+      window_seconds: 60,
+      max_requests: 2,
+      scope: 'ip',
+      whitelist: '',
+      exempt_paths: '/__api/ratelimit',
+      exempt_authed: false,
+      ban_enabled: false,
+    }),
   });
   assert('开启限流 200', rlOn.status === 200, `实际 ${rlOn.status}`);
+  // 配置在实例内有 3 秒缓存，且请求可能落到不同 isolate，刚保存的开关要几秒才全面生效。
+  // 所以在 10 秒预算内反复打，一出现 429 就收工 —— 别把「缓存还没过期」误判成「限流坏了」。
   const hits = [];
-  for (let i = 0; i < 4; i++) {
-    const r = await req('/__api/sites');
-    hits.push(r.status);
+  const deadline = Date.now() + 10000;
+  while (Date.now() < deadline) {
+    hits.push((await req('/__api/sites')).status);
+    if (hits.includes(429)) break;
+    await new Promise((r) => setTimeout(r, 400));
   }
-  assert('超阈值后返回 429', hits.some(s => s === 429), `状态码 ${hits.join(',')}`);
+  assert('超阈值后返回 429', hits.includes(429), `状态码 ${hits.slice(-8).join(',')}`);
   const bans = await getJson('/__api/ratelimit/bans');
   assert('封禁列表可读', bans.status === 200, `实际 ${bans.status}`);
-  const rlOff = await req('/__api/ratelimit', {
+  const rlBack = await req('/__api/ratelimit', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ enabled: false }),
+    body: JSON.stringify(rlOrig),
   });
-  assert('关闭限流（恢复原状）', rlOff.status === 200, `实际 ${rlOff.status}`);
+  assert('限流配置已还原', rlBack.status === 200, `实际 ${rlBack.status}`);
+  const rlAfter = await getJson('/__api/sites');
+  assert('还原后不再被挡', rlAfter.status !== 429, `实际 ${rlAfter.status}`);
 
   section('告警通知');
   const al = await getJson('/__api/alert');
