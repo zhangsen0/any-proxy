@@ -1,5 +1,5 @@
 import { cors, isText, esc, isNavigation, isFingerprinted } from './util.js';
-import { CROSS_PREFIX, mapAbsoluteUrl, rewriteContent, contentKind } from './url.js';
+import { CROSS_PREFIX, mapAbsoluteUrl, rewriteContent, contentKind, isHlsManifest } from './url.js';
 import { injectLinkFix, buildDocWritePage, rewriteLocations } from './inject.js';
 import { finalizeResponse } from './compress.js';
 
@@ -283,9 +283,16 @@ async function proxyRequest(request, site, crossHost, ctx, env) {
 
   const ct = headersOut.get('content-type') || '';
   const isHtml = ct.includes('text/html');
-  // 只有 HTML 必须 no-store：每次都要拿到最新的重写结果与注入脚本。
-  // JS/CSS/图片若也 no-store，每次导航都得重下全部 bundle，页面会长时间停在加载态。
-  if (isHtml) {
+  const isHls = isHlsManifest(ct);
+  // 播放清单绝不长缓存：直播场景下清单每次都在变，缓存一小时会让播放器一直拿到旧分片列表，
+  // 表现为播到某一段就卡死不再往下走。清单体积很小，每次回源的代价可以忽略。
+  if (isHls) {
+    headersOut.set('Cache-Control', 'no-store');
+    headersOut.delete('ETag');
+    headersOut.delete('Last-Modified');
+  } else if (isHtml) {
+    // 只有 HTML 必须 no-store：每次都要拿到最新的重写结果与注入脚本。
+    // JS/CSS/图片若也 no-store，每次导航都得重下全部 bundle，页面会长时间停在加载态。
     headersOut.set('Cache-Control', 'no-store');
     headersOut.delete('ETag');
     headersOut.delete('Last-Modified');
@@ -299,7 +306,9 @@ async function proxyRequest(request, site, crossHost, ctx, env) {
     headersOut.set('Cache-Control', 'public, max-age=3600, stale-while-revalidate=86400');
   }
 
-  if (!isText(ct)) {
+  // HLS 清单是明文但不在 isText 白名单里，必须单独判定。漏掉这一条，清单会走进下面的
+  // 「非文本直传」分支：分片地址与 AES 密钥 URI 原样透出，播放器按根路径去取 → 404 / 解密失败
+  if (!isText(ct) && !isHls) {
     // 非文本资源（图片/字体/音视频）：fingerprinted 走共享缓存，其余直接回源
     if (request.method === 'GET' && upstream.status === 200 && isFingerprinted(url.pathname)) {
       return serveCached(ctx, cacheKeyOf(targetUrl), () =>

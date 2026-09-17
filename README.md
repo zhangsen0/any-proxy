@@ -290,6 +290,7 @@ tools/                 本地开发与验证脚本（不参与部署）
   check-nodes.py       实测订阅里每个节点的可用性（TCP→TLS→WebSocket→真实转发出网）
   check-anycast.mjs    CDN 任播兜底自检：CIDR 判定、数据源降级、绝不编造国名
   check-compress.mjs   出口编码契约自检：任何 Accept-Encoding 下都不许输出压缩字节；上游重试/对冲策略
+  check-hls.mjs        HLS 清单自检：分片 / 密钥 URI 必须改写进代理命名空间，标签属性一个字不许动
   check-themes.mjs     主题系统自检：10 套预设齐全、自定义可增删、CSS 注入写不穿、轮换结果收敛
   check-guard.mjs      防护三件套自检：默认关闭不误伤、封禁与解封、告警脱敏、临时链接双重到期
   check-configui.mjs   配置页与目录自检：字段与 SPEC 双向对齐、每项恰好渲染一次、全页无重复配置、转义完备、各选项卡内容同宽
@@ -338,28 +339,32 @@ node tools/check-anycast.mjs
 # 8. 出口编码契约与请求策略自检（改 compress.js / proxy.js 后必跑）
 node tools/check-compress.mjs
 
-# 9. 代理链路冒烟（改任何一处请求处理链路后必跑）
+# 9. HLS 播放清单自检（改 url.js / proxy.js 的文本改写分支后必跑）
+#    守的是「清单被当非文本直传」：分片与 AES 密钥 URI 不改写，视频就完全播不了
+node tools/check-hls.mjs
+
+# 10. 代理链路冒烟（改任何一处请求处理链路后必跑）
 node tools/check-smoke.mjs
 
-# 10. 主题系统自检（改 themes.js / admin.js 主题部分后必跑）
+# 11. 主题系统自检（改 themes.js / admin.js 主题部分后必跑）
 node tools/check-themes.mjs
 
-# 11. 防护三件套自检（改 ratelimit.js / alert.js / share.js 后必跑）
+# 12. 防护三件套自检（改 ratelimit.js / alert.js / share.js 后必跑）
 node tools/check-guard.mjs
 
-# 12. 配置页与接口目录自检（改配置项 / api-catalog.js 后必跑）
+# 13. 配置页与接口目录自检（改配置项 / api-catalog.js 后必跑）
 node tools/check-configui.mjs
 
-# 13. 配置单一真源自检（新增默认值 / 加一个常量前先跑；同一个设定不允许写两份）
+# 14. 配置单一真源自检（新增默认值 / 加一个常量前先跑；同一个设定不允许写两份）
 node tools/check-single-source.mjs
 
-# 14. 操作手册的速查表与代码是否同步（改配置项后跑 --write 重新生成）
+# 15. 操作手册的速查表与代码是否同步（改配置项后跑 --write 重新生成）
 node tools/gen-manual.mjs
 
-# 15. 部署后线上冒烟：传目标地址与口令，跑主题、防护与配置接口（结束会自动恢复默认配置）
+# 16. 部署后线上冒烟：传目标地址与口令，跑主题、防护与配置接口（结束会自动恢复默认配置）
 node tools/check-live.mjs https://<你的-worker>.workers.dev <PASSWORD>
 
-# 16. 实测订阅里每个节点是否真的可用（需 Python 3）
+# 17. 实测订阅里每个节点是否真的可用（需 Python 3）
 SUB_URL=https://proxy.example.com/tsub/xxxx python3 - <<'EOF'
 import urllib.request
 open('/tmp/sub.txt','wb').write(urllib.request.urlopen('$SUB_URL').read())

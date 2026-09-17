@@ -59,6 +59,10 @@ function cors(h) {
   h.set('Access-Control-Allow-Headers', '*');
 }
 
+// 注意：HLS 播放清单（m3u8）虽是明文，但不在这里判定。判定放在 url.js 的 isHlsManifest
+// （单一来源）—— url.js 是自包含模块、要被前端注入脚本复用，不能反向依赖 util.js
+// （util.js 带 KV/env 语义，打进浏览器会炸）。调用方需同时看 isText 与 isHlsManifest。
+
 function isText(ct) {
   return /text\/html|text\/javascript|application\/javascript|application\/x-javascript|text\/css|application\/json|text\/xml|application\/xml|application\/x-font-ttf|application\/vnd.ms-fontobject|font\/opentype|text\/plain/.test(ct);
 }

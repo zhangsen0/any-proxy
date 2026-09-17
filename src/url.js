@@ -94,11 +94,64 @@ function isSchemeRelative(s) {
  * 一旦被改写就产生语法错误 → 整个 bundle 被丢弃 → 页面交互失效。
  * 限定在字符串字面量 / url() 语境内替换，既能覆盖所有真实 URL，也不会破坏语法。
  */
+/** HLS 播放清单的 Content-Type。放在 url.js 作单一来源：inject.js 复用本模块，
+ *  url.js 必须保持自包含（不依赖 util.js，否则 KV/env 语义会被打进浏览器脚本）。 */
+const RE_HLS_MANIFEST = /application\/vnd\.apple\.mpegurl|audio\/mpegurl|audio\/x-mpegurl|application\/x-mpegurl/i;
+
+function isHlsManifest(ct) {
+  return RE_HLS_MANIFEST.test(String(ct || ''));
+}
+
 function contentKind(ct) {
   const t = String(ct || '').toLowerCase();
+  // HLS 清单要先于 xml/html 判定：它是纯文本但不是标记语言，
+  // 走 HTML 的属性/srcset 正则会破坏 #EXT 标签结构
+  if (isHlsManifest(t)) return 'm3u8';
   if (t.includes('html') || t.includes('xml')) return 'html';
   if (t.includes('css')) return 'css';
   return 'literal';
+}
+
+/**
+ * HLS 播放清单（m3u8）改写 —— 逐行处理，规则与 HTML 完全不同：
+ *
+ * 1. `#` 开头的标签行：只改 `URI="..."` 的值（AES-128 密钥、初始化段、子清单都在这里）。
+ *    `IV=`、`BANDWIDTH=` 等其他属性一律不动 —— 改了就会解不出分片。
+ * 2. 非 `#` 开头的行：整行就是一个 URL。
+ * 3. 纯相对文件名（如 `seg0.ts`）**保持原样**：播放器会按清单 URL 的目录去解析，
+ *    改写成根相对反而会指到错误路径。
+ *
+ * 真正的坑是根相对（`/hls/seg1.ts`、`URI="/hls/key.bin"`）与绝对 URL：
+ * 前者会被解析到代理站点的根、后者会绕过代理直连源站，两种情况都播不了。
+ */
+function rewriteM3u8(content, site, sitePrefix, base) {
+  const prefix = base.prefix;
+  const rootPrefix = base && isSiteHost(base.host, site.host) ? sitePrefix : prefix;
+  const rootRel = rootPrefix.slice(1);
+  const mapAbs = (raw) => mapAbsoluteUrl(raw, site, sitePrefix, base);
+
+  const mapOne = (raw) => {
+    const u = String(raw).trim();
+    if (!u) return u;
+    if (/^https?:/i.test(u)) return mapAbs(u);
+    if (u.startsWith('//')) return isSchemeRelative(u) ? mapAbs('https:' + u) : u;
+    if (u.startsWith('/')) {
+      // 已在代理命名空间内就不再套前缀（幂等）
+      if (u.slice(1) === rootRel || u.slice(1).startsWith(rootRel + '/')) return u;
+      return rootPrefix + u;
+    }
+    return u;                       // 相对文件名：交给播放器按清单 URL 解析
+  };
+
+  return content.split('\n').map(line => {
+    const t = line.trim();
+    if (!t) return line;
+    if (t.startsWith('#')) {
+      // 只动 URI 属性：IV / KEYFORMAT 等必须原样保留
+      return line.replace(/URI\s*=\s*"([^"]*)"/gi, (m, uri) => 'URI="' + mapOne(uri) + '"');
+    }
+    return mapOne(t);
+  }).join('\n');
 }
 
 /**
@@ -171,6 +224,9 @@ function absOnOrigin(v, origin) {
  * 已在代理命名空间内的路径不会被二次套前缀。
  */
 function rewriteContent(content, site, sitePrefix, base, kind = 'html') {
+  // HLS 清单必须走专用的逐行改写：它的 URL 形态（裸 URL 行 + URI="..." 属性）
+  // 不在下面 HTML/CSS 的 URL 特征扫描范围内，若先过快速通道会被当成「无 URL」直接返回
+  if (kind === 'm3u8') return rewriteM3u8(content, site, sitePrefix, base);
   // 一次廉价扫描：完全没有 URL / url() / 根相对属性 / <base> / integrity 的内容直接返回，
   // 省掉下面所有正则轮 REPLACE 的成本（大 bundle、纯数据 JSON 常命中）
   if (!RE_ANY_URLISH.test(content)) return content;
@@ -273,7 +329,7 @@ function rewriteContent(content, site, sitePrefix, base, kind = 'html') {
 
 export {
   CROSS_PREFIX, hostOf, isSiteHost, mapAbsoluteUrl,
-  isSchemeRelative, contentKind, rewriteContent,
+  isSchemeRelative, contentKind, rewriteContent, isHlsManifest, rewriteM3u8,
   // 导出给前端注入脚本复用：运行时脚本里的协议相对判定必须与后端完全一致，
   // 两边各写一份正则迟早会漂移，导致后端改写过的内容在前端被二次（错误）处理
   SCHEME_RELATIVE_RE,
