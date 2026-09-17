@@ -199,8 +199,8 @@ src/
   runtime.js           平台注入绑定（KV / PASSWORD）的共享容器；按 STORAGE_BACKEND 选择 KV 或 D1
   storage.js           D1-backed KV 兼容适配层（createD1KV），业务模块无感切换后端
   config.js            统一配置层：面板配置 → 环境变量 → 规范默认值，三级降级；下发前自动脱敏
-  api-catalog.js       接口 / 配置项清单（数据），管理页表单按它渲染，加功能只改这一处
-  config-ui.js         按清单渲染配置分区的前端表单
+  api-catalog.js       接口 / 配置项清单（数据）：字段来源、呈现方式、归属哪个选项卡，三件事都在这里声明
+  config-ui.js         按清单渲染设置表单 / 工具区 / 跳转索引；各功能页的设置块也复用它
   router.js            HTTP 路由与全部访问路径
   proxy.js             反代核心：请求转发、响应重写、WebSocket 透传、Set-Cookie 收敛、上游重试、幂等还原
   url.js               URL 命名空间映射与内容重写（通用规则，无站点特判）
@@ -240,7 +240,10 @@ tools/                 本地开发与验证脚本（不参与部署）
   check-compress.mjs   出口压缩与上游请求策略自检：压完必须能还原、SSE/二进制不压、幂等请求才允许对冲
   check-themes.mjs     主题系统自检：10 套预设齐全、自定义可增删、CSS 注入写不穿、轮换结果收敛
   check-guard.mjs      防护三件套自检：默认关闭不误伤、封禁与解封、告警脱敏、临时链接双重到期
+  check-configui.mjs   配置页与目录自检：字段与 SPEC 双向对齐、每项恰好渲染一次、全页无重复配置、转义完备
+  gen-manual.mjs       操作手册附录生成器：速查表从目录与 SPEC 生成，--check 模式进 CI
   check-smoke.mjs      路由级冒烟：从请求入口走到页面出口，专治「单测全绿但组合起来就炸」
+docs/                  软件生命周期文档（09 是面向使用者的操作手册）
 .github/workflows/
   deploy-cloudflare.yml   push master 自动部署（含 D1 迁移应用 + Secret 注入）
   healthcheck.yml         每 12 小时健康检查 + 自愈（workflow_dispatch 可手动触发）
@@ -291,10 +294,16 @@ node tools/check-themes.mjs
 # 11. 防护三件套自检（改 ratelimit.js / alert.js / share.js 后必跑）
 node tools/check-guard.mjs
 
-# 12. 部署后线上冒烟：传目标地址与口令，跑主题、防护与配置接口（结束会自动恢复默认配置）
+# 12. 配置页与接口目录自检（改配置项 / api-catalog.js 后必跑）
+node tools/check-configui.mjs
+
+# 13. 操作手册的速查表与代码是否同步（改配置项后跑 --write 重新生成）
+node tools/gen-manual.mjs
+
+# 14. 部署后线上冒烟：传目标地址与口令，跑主题、防护与配置接口（结束会自动恢复默认配置）
 node tools/check-live.mjs https://<你的-worker>.workers.dev <PASSWORD>
 
-# 13. 实测订阅里每个节点是否真的可用（需 Python 3）
+# 15. 实测订阅里每个节点是否真的可用（需 Python 3）
 SUB_URL=https://proxy.example.com/tsub/xxxx python3 - <<'EOF'
 import urllib.request
 open('/tmp/sub.txt','wb').write(urllib.request.urlopen('$SUB_URL').read())
@@ -597,16 +606,37 @@ python3 tools/check-nodes.py /tmp/sub.txt 16
 
 | 文档 | 阶段 |
 |---|---|
+| [系统操作手册](./docs/09-系统操作手册.md) | **怎么用**：每一步在哪一屏、怎么点，附症状对照表与配置速查表 |
 | [需求与迭代](./docs/01-需求与迭代.md) | 每轮需求的来源、取舍与验收 |
 | [架构设计](./docs/02-架构设计.md) | 模块地图、三档访客模型、降级策略 |
 | [开发规范](./docs/03-开发规范.md) | 这个项目特有的硬约束（含反例） |
-| [测试体系](./docs/04-测试体系.md) | 8 个自检脚本各守哪一段 |
+| [测试体系](./docs/04-测试体系.md) | 10 个自检脚本各守哪一段 |
 | [部署上线](./docs/05-部署上线.md) | 流水线三步、Secrets 清单、验收清单 |
 | [运维与自愈](./docs/06-运维与自愈.md) | 健康检查、假健康事故的教训 |
 | [踩坑记录](./docs/07-踩坑记录.md) | 13 个能复现的坑，按代价排序 |
 | [归档说明](./docs/08-归档说明.md) | 归档后能做什么、不能做什么 |
 
-> 第一次接手建议按 **踩坑记录 → 架构设计 → 部署上线** 的顺序读。
+> 只想用起来：读**系统操作手册**。要接手维护：按 **踩坑记录 → 架构设计 → 部署上线** 的顺序读。
+
+---
+
+## 面板结构
+
+一块功能只归属一个选项卡。这条规矩是踩过坑才立起来的：优选池曾经同时长在
+「优选 IP」和「配置」两页里，改完一边忘了另一边就会「面板显示 A、实际生效 B」。
+
+| 选项卡 | 管什么 |
+|---|---|
+| 站点 | 反代站点的增删改、复制链接 |
+| 代理节点 | 订阅链接、节点国家标注、代理面板与临时订阅入口 |
+| 优选 IP | 自动优选频率、立即优选、优选 IP 池、**候选域名池与健康检查** |
+| 伪装与安全 | 首页伪装的模板、文案、隐蔽路径、口令、严格模式 |
+| 外观主题 | 10 套内置主题、自定义主题、自动轮换 |
+| 临时链接 | 临时链接的开关与默认值、生成、停用、删除 |
+| 配置 | 只放**没有独立选项卡**的设置（访问统计 / 限流防滥用 / 告警通知）+ 诊断工具 + 各页入口 |
+
+「配置」页由 [`src/api-catalog.js`](./src/api-catalog.js) 驱动：加一条配置项只需在目录里加一条，
+界面自动出现。`group.tab` 声明这块内容归哪个选项卡，标了就不再在配置页重复渲染表单。
 
 ---
 

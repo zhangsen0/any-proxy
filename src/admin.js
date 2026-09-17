@@ -22,7 +22,7 @@ import {
   readShareConfig, saveShareConfig, createShare, listShares,
   revokeShare, enableShare, deleteShare, linkPath, SHARE_SPEC,
 } from './share.js';
-import { renderConfigPanels, CONFIG_JS } from './config-ui.js';
+import { renderConfigPanels, settingFormById, CONFIG_JS, CONFIG_CSS } from './config-ui.js';
 
 // 站点管理：REST API + 服务端渲染的管理页
 
@@ -768,12 +768,9 @@ async function adminPage(authed, origin, env) {
   .theme-card .meta b { display:block; font-size:13px; font-weight:600; }
   .theme-card .meta em { display:block; font-style:normal; font-size:11px; color:var(--muted); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   .theme-rows { display:grid; grid-template-columns:1fr; gap:0; }
-  /* 配置分区：目录驱动的通用表单。每条接口一个块，参数即目录里声明的字段 */
-  .endpoint { border:1px solid var(--line); border-radius:var(--radius-sm); padding:var(--sp-2) var(--sp-3); margin-bottom:var(--sp-2); background:var(--card-2, var(--card)); }
-  .endpoint-head { display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin-bottom:4px; }
-  .endpoint-head b { font-size:14px; font-weight:600; }
-  .endpoint .row { margin-top:var(--sp-2); }
-  hr.sep { border:none; border-top:1px solid var(--line); margin:var(--sp-3) 0; }
+  /* 配置页：设置表单 / 工具 / 跳转行。样式与渲染同源于 src/config-ui.js，
+     布局细节随主题变量走，换主题时这一屏跟着一起变 */
+${CONFIG_CSS}
 </style>
 ${themeScript}
 </head>
@@ -876,7 +873,7 @@ ${themeScript}
     <div class="msg" id="dnsRunMsg"></div>
     <div class="msg" id="prefMsg"></div>
   </div>
-  <div class="card" id="poolCard">
+  <div class="card" id="poolCard" data-pane="preferred">
     <h2>优选池 &amp; 健康检查</h2>
     <div class="hint" style="margin:-8px 0 4px;">已验证可用集（GOOD_IPS，自动优选 / 健康检查优先使用的 CF 泛播 IP）：<b id="poolGood" style="color:var(--ok);font-family:ui-monospace,Menlo,Consolas,monospace;font-weight:600;">加载中…</b></div>
     <div class="hint" style="margin:6px 0 4px;">健康检查：GitHub Actions 每 12 小时自动检测 A 记录，发现 1034 / 不可达时从可用集自愈（Actions 页可手动触发「Health Check &amp; Auto Repair」）。上次执行：<b id="poolLast">—</b></div>
@@ -1068,8 +1065,10 @@ ${authed ? `
   ${authed ? `
   <div class="card" id="shareCard" data-pane="share">
     <h2>站点临时访问链接</h2>
-    <div class="hint" style="margin:-8px 0 8px;">给某个站点开一条到期自动作废的短链，适合「发给别人看一眼」。开关、链接前缀与默认天数在「配置 → 站点临时访问链接」里。</div>
-    <div class="row" style="margin-top:0;">
+    <div class="hint" style="margin:-8px 0 12px;">给某个站点开一条到期自动作废的短链，适合「发给别人看一眼」。有效期与访问次数任一先到即失效，随时可以停用或删除。</div>
+    ${settingFormById('share-config')}
+    <h2 style="margin:18px 0 0;">生成链接</h2>
+    <div class="row" style="margin-top:10px;">
       <select id="shSite" style="flex:1;min-width:150px;"><option value="">选择站点…</option></select>
       <input type="number" id="shDays" placeholder="天数" min="1" style="width:88px;">
       <input type="number" id="shHits" placeholder="次数 0=不限" min="0" style="width:130px;">
@@ -1750,7 +1749,7 @@ if (ntEnabled) {
     ntSaveBtn.disabled = false;
   };
 }
-${CONFIG_JS}
+${authed ? CONFIG_JS : ''}
 
 /* ===== 站点临时访问链接：列表 + 生成 + 停用 / 启用 + 删除 ===== */
 (function () {
