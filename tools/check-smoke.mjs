@@ -13,6 +13,7 @@
  *   node tools/check-smoke.mjs
  */
 import { handleRequest } from '../src/router.js';
+import { handleWebSocket } from '../src/proxy.js';
 import { bindRuntime } from '../src/runtime.js';
 import { kvKey } from '../src/util.js';
 import zlib from 'node:zlib';
@@ -67,9 +68,9 @@ const NAV = {
   'Sec-Fetch-Dest': 'document',
 };
 
-async function call(path, headers = {}) {
+async function call(path, headers = {}, method = 'GET') {
   try {
-    const res = await handleRequest(new Request(ORIGIN + path, { method: 'GET', headers }), env, {});
+    const res = await handleRequest(new Request(ORIGIN + path, { method, headers }), env, {});
     const buf = await res.arrayBuffer();
     return { status: res.status, buf, headers: res.headers };
   } catch (e) {
@@ -266,6 +267,72 @@ console.log('\n[6] 上游无视 Accept-Encoding: identity 强发 br（整站乱�
     globalThis.fetch = realFetch;
     globalThis.DecompressionStream = realDS;
   }
+}
+
+// [7] WebSocket 透传：上游 OPEN 前到达的客户端消息必须被缓冲、OPEN 后按序冲刷。
+// 真实事故：按 readyState===1 直接放行，客户端在 101 后立刻发出的第一条消息
+// 撞上出站握手仍在 CONNECTING 的窗口被静默丢弃 —— 表现为「握手成功但回显永远不来」。
+// Cloudflare 的 WebSocketPair 是运行时能力，这里用最小桩还原握手时序做行为级验证。
+{
+  console.log('\n[7] WebSocket 透传：CONNECTING 窗口的消息不得丢弃');
+  let lastPair = null;
+  let lastUpstream = null;
+  class FakeSock {
+    constructor() { this.listeners = {}; this.sent = []; this.readyState = 1; this.closed = false; }
+    accept() {}
+    addEventListener(t, fn) { (this.listeners[t] = this.listeners[t] || []).push(fn); }
+    send(d) { if (this.readyState !== 1) throw new Error('send on non-open socket'); this.sent.push(d); }
+    close() { this.closed = true; }
+    fire(t, ev) { for (const fn of this.listeners[t] || []) fn(ev); }
+  }
+  const RealWS = globalThis.WebSocket;
+  const RealPair = globalThis.WebSocketPair;
+  const RealResponse = globalThis.Response;
+  // Node 的 undici Response 不接受 101；CF 运行时允许 { status:101, webSocket }，桩掉即可
+  globalThis.Response = class {
+    constructor(body, init = {}) { this.status = init.status; this.webSocket = init.webSocket; }
+  };
+  globalThis.WebSocketPair = class { constructor() { this[0] = new FakeSock(); this[1] = new FakeSock(); lastPair = this; } };
+  globalThis.WebSocket = class {
+    constructor() { this.readyState = 0; this.listeners = {}; this.sent = []; lastUpstream = this; }
+    addEventListener(t, fn) { (this.listeners[t] = this.listeners[t] || []).push(fn); }
+    send(d) { if (this.readyState !== 1) throw new Error('send on non-open upstream'); this.sent.push(d); }
+    close() { this.readyState = 3; }
+    fire(t, ev) { if (t === 'open') this.readyState = 1; for (const fn of this.listeners[t] || []) fn(ev); }
+  };
+  try {
+    const req = new Request('https://proxy.example.com/p/demo/ws', { headers: { Upgrade: 'websocket' } });
+    const resp = await handleWebSocket(req, { id: 'demo', host: 'demo.com' }, null);
+    ok('升级返回 101 且携带客户端侧 socket', resp.status === 101 && !!resp.webSocket && resp.webSocket === lastPair[0]);
+    const server = lastPair[1];
+    const upstream = lastUpstream;
+    ok('出站握手尚未完成（CONNECTING 窗口存在）', upstream.readyState === 0);
+    server.fire('message', { data: 'early' });
+    ok('OPEN 前到达的消息不外发、先入队', upstream.sent.length === 0);
+    upstream.fire('open');
+    ok('OPEN 后按序冲刷积压消息', upstream.sent.join(',') === 'early', `sent=${upstream.sent.join(',')}`);
+    server.fire('message', { data: 'late' });
+    ok('OPEN 后消息直通上游', upstream.sent.join(',') === 'early,late', `sent=${upstream.sent.join(',')}`);
+    upstream.fire('message', { data: 'from-upstream' });
+    ok('上游消息中继回客户端侧', server.sent.join(',') === 'from-upstream', `sent=${server.sent.join(',')}`);
+    upstream.fire('close', {});
+    ok('上游断开联动关闭客户端侧', server.closed === true);
+  } finally {
+    globalThis.WebSocket = RealWS;
+    globalThis.WebSocketPair = RealPair;
+    globalThis.Response = RealResponse;
+  }
+}
+
+// [8] OPTIONS 预检必须 204。真实事故：router.js 用了 cors() 却漏 import，任何预检
+// 一进来就 ReferenceError → 全局兜底渲染成伪装 404。本地从未真打过 OPTIONS，漏网至今。
+console.log('\n[8] OPTIONS 预检：不得 5xx / 伪装 404');
+{
+  const r = await call('/p/demo/', {}, 'OPTIONS');
+  ok('预检返回 204', r.status === 204, `status=${r.status} ${r.err || ''}`);
+  ok('响应带 CORS 放行头', !!r.headers.get('access-control-allow-origin'), `${r.headers.get('access-control-allow-origin')}`);
+  const r2 = await call('/', {}, 'OPTIONS');
+  ok('根路径预检同样 204', r2.status === 204, `status=${r2.status} ${r2.err || ''}`);
 }
 
 console.log(`\n=== ${fail === 0 ? '全部通过' : '存在失败'} ===`);

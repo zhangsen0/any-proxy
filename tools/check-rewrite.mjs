@@ -37,6 +37,15 @@ t('转义引号包裹的 URL 仍被重写', () => {
   const out = rewriteContent('var cfg = {origin: \\\"https://github.com/demo\\\"};', site, P, base, 'literal');
   return ok(out.includes(`${ORIGIN}${P}/__x/github.com/demo`), 'escaped quote URL', out);
 });
+t('复合字符串里引号不配对的 URL 仍被重写（闭合引号必须原样保留）', () => {
+  // 真实案例：百度降级页 document.write('<a href="http://www.baidu.com/...'+enc+'">登录</a>')
+  // 开引号是 href 的 "、闭引号是外层字符串的 '；漏改则链接跳出代理命名空间
+  const src = "document.write('<a href=\"https://demo.com/next?u='+encodeURIComponent(location.href)+'\">x</a>');";
+  const out = rewriteContent(src, site, P, base, 'literal');
+  const okRewritten = out.includes(`${ORIGIN}${P}/next?u=`);
+  const okQuotes = out.includes("href=\"" + ORIGIN) && out.includes("u='+encodeURIComponent");
+  return ok(okRewritten && okQuotes, 'mixed-quote literal', out);
+});
 t('JS 里的 URL 必须是绝对地址（单参数 new URL 只接受绝对 URL）', () => {
   const out = rewriteContent('const u = new URL("https://json-schema.org/");', site, P, base, 'literal');
   const m = out.match(/new URL\("([^"]+)"\)/);

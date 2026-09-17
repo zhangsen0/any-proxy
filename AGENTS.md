@@ -11,6 +11,13 @@
 - **失败要响**。降级路径（try/catch 兜底）必须可观测或至少有注释说明静默的理由；禁止裸 `catch {}` 吞掉会改变行为的错误。
 - **先读懂再改**。动手前先读相关模块与本文档；改完跑第 7 节的全套自检。
 
+### 0.5 命名规范（《阿里巴巴开发规范》适用条款）
+
+- 【强制】标识符（变量 / 函数 / 类 / 参数 / 导出符号）一律**英文**，禁止中文与拼音命名。注释使用中文是本仓库约定，不受此条约束。
+- 【强制】变量与函数用小驼峰（`sitePrefix`）；类型 / 构造器用大驼峰；常量用 `UPPER_SNAKE_CASE`（`CANDIDATE_LIMIT`）。
+- 【强制】杜绝望文不知义的缩写（`cnd` / `calc` 之类要写全）；布尔量用 `is / has / can / should` 前缀（`isAuthed`）；函数名动词开头（`rewriteContent`）。
+- 【豁免】`vendor/` 是第三方 vendored 代码（edgetunnel 上游原样拷贝，含大量中文标识符），**保持原样跟随上游，不做命名整改**；如需改动，先核对上游对应实现，能不改就不改。
+
 ## 1. 一个设定只允许一份定义（单一真源）
 
 同一个业务默认值 / 校验规则 / 区间约束**禁止出现两份**。每份实现自己都是「对」的，所以 bug 不报错、单测全绿，只会静默地对不上。历史事故：面板 IPv4 校验宽松、运行时严格 → 填 `999.999.999.999` 提示已保存、池子静默为空。
@@ -42,7 +49,7 @@ api('/__api/sites').then(r => { const sites = (r.data && r.data.sites) || []; })
 - **伪装（cloaking）把一切未捕获异常渲染成 404**。「某接口 404」≠「被拦截」，先怀疑 handler 抛异常。判别法：同秒同 colo 同 cookie，对比只差一个字符的兄弟路径——兄弟正常而它 404 ⇒ handler 内部问题。
 - **看路径的行为，不看名字**：路径跟着代码改名一起变，就一定是代码问题。
 - `git status` 的 `ahead N` 不可信（本机 `refs/remotes` 不落盘），核对远端一律用 `api.github.com/repos/zhangsen0/any-proxy/commits/master`。
-- 自检只断言「HTML 含某字符串」抓不到运行时错误（漏 import、契约不对、元素没填充）。**新增接口/区块一律从渲染产物里把脚本抠出来沙箱真跑一遍**（见 check-configui 第 11 段、check-stats 第 8 段的先例），或上 Puppeteer 真浏览器。
+- 自检只断言「HTML 含某字符串」抓不到运行时错误（漏 import、契约不对、元素没填充）。**新增接口/区块一律从渲染产物里把脚本抠出来沙箱真跑一遍**（见 check-configui 第 11 段、check-stats 第 8 段的先例），或上 Puppeteer 真浏览器。真实案例：router.js 的 OPTIONS 预检分支用了 `cors()` 却漏 import，所有预检静默变成伪装 404，上线多月才被全类型实测发现（回归：check-smoke 第 8 组）。
 
 ## 5. 新写的检查必须先证明它会红（牙齿验证）
 
@@ -52,6 +59,7 @@ api('/__api/sites').then(r => { const sites = (r.data && r.data.sites) || []; })
 
 - Workers 里 `ctx.waitUntil` 必须在 **Response 返回之前**注册；流式响应的字节计数用「Promise 占位 + TransformStream flush 里 resolve」模式（见 `worker.js` 的 `countResponseBytes`）。在 flush 里才调 `waitUntil` 会被运行时静默丢弃（症状：流量统计恒为 0 B）。
 - `summarize` 之类的汇总必须基于**全量**数据算 totals，不许拿截断后的 top-N 列表求和（症状：总数 0 但图上有柱子）。
+- WebSocket 透传：客户端在 101 返回后立即可 `send`，出站握手此刻常还在 CONNECTING——这段时间到达的消息必须缓冲、open 后按序冲刷，按 `readyState===1` 直接放行会静默丢首条消息（症状：握手成功但回显永远不来，check-smoke 第 7 组回归）。
 
 ## 6.5 出口编码：Worker 一律发明文，禁止自己压缩
 

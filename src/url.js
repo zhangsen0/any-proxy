@@ -131,7 +131,12 @@ const RE_ALL_URL = new RegExp([
   '|url\\(\\s*(?<cssq>["\']?)\\/(?!\\/)(?<csspath>[^)"\']*)',
 ].join(''), 'g');
 // JS/JSON 字符串可能来自 HTML 属性或序列化配置，边界引号会写成 \\\"；保留转义形式，避免漏改 URL。
-const RE_LITERAL_URL = /(\\?["'])(https?:\/\/|\/\/)([^'"\s\\]+)\\?\1/g;
+// 闭合引号不要求与开头配对：URL 常嵌在「多段拼接的复合字符串」里，例如
+//   document.write('<a href="https://host/x?u='+enc+'">..</a>')
+// 开引号是 href 的 "、闭引号是外层字符串的 '，若强求配对就会漏改（线上事故：
+// 百度降级页「登录」按钮 URL 未被改写，点击后跳出代理命名空间）。
+// 仍限定「引号紧跟 URL、URL 内不含引号/空白」的字面量语境，注释与表达式不受影响。
+const RE_LITERAL_URL = /(\\?["'])(https?:\/\/|\/\/)([^'"\s\\]+)\\?(["'])/g;
 const RE_CSS_URL = /url\(\s*(['"]?)([^'")]+)\1\s*\)/g;
 const RE_CSS_IMPORT = /@import\s+(['"])([^'"]+)\1/g;
 /** 快速判定：内容里是否**可能**存在需要重写的片段（一次扫描替换掉后续多轮正则） */
@@ -189,11 +194,12 @@ function rewriteContent(content, site, sitePrefix, base, kind = 'html') {
    * 脚本 / 数据上下文的重写：只动被引号包裹的 URL 字面量，并输出绝对地址。
    * 外链脚本与文档里的内联 <script> 块共用这一套。
    */
-  const rewriteLiteral = (s) => s.replace(RE_LITERAL_URL, (m, q, scheme, body) => {
+  const rewriteLiteral = (s) => s.replace(RE_LITERAL_URL, (m, q, scheme, body, qclose) => {
     const raw = scheme + body;
     const next = scheme === '//' ? mapRel(raw) : mapAbs(raw);
     if (next === raw) return m;                   // 没被映射（不是 URL / 已原样保留），不动
-    return q + absOnOrigin(next, origin) + q;
+    // 开引号与闭引号原样保留：闭引号往往是外层字符串的结束符，吞掉会破坏语法
+    return q + absOnOrigin(next, origin) + qclose;
   });
 
   // ---- 脚本 / 数据 / 其它文本：只重写字符串字面量里的 URL ----

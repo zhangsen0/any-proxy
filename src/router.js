@@ -1,5 +1,5 @@
 import vlessHandler from '../vendor/vless.js';
-import { json, b64, esc, isNavigation } from './util.js';
+import { json, b64, esc, cors, isNavigation } from './util.js';
 import { bindRuntime, runtime } from './runtime.js';
 import { getSite } from './sites.js';
 import { isAuthed, handleLogin, handleLogout, loginPage, noConfigPage } from './auth.js';

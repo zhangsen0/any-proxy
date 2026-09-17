@@ -591,10 +591,21 @@ async function handleWebSocket(request, site, crossHost) {
     return new Response(null, { status: 101, webSocket: client });
   }
 
-  // 双向消息转发
+  // 双向消息转发。
+  // 竞态：101 响应一返回客户端就能 send，而出站 WebSocket 与上游的握手此刻往往
+  // 还在 CONNECTING——按 readyState===1 直接放行会把这段窗口里的消息静默丢弃
+  // （线上症状：握手成功但第一条回显永远收不到）。因此上游 OPEN 前到达的消息
+  // 先入队，OPEN 事件后按序冲刷；上游断开/出错时清队，避免悬挂引用。
+  const pending = [];
+  let upstreamOpen = false;
   server.addEventListener('message', (ev) => {
-    if (upstream.readyState === 1) {
-      try { upstream.send(ev.data); } catch (e) {}
+    if (!upstreamOpen) { pending.push(ev.data); return; }
+    try { upstream.send(ev.data); } catch (e) {}
+  });
+  upstream.addEventListener('open', () => {
+    upstreamOpen = true;
+    while (pending.length) {
+      try { upstream.send(pending.shift()); } catch (e) { break; }
     }
   });
   upstream.addEventListener('message', (ev) => {
@@ -606,9 +617,11 @@ async function handleWebSocket(request, site, crossHost) {
     try { upstream.close(); } catch (e) {}
   });
   upstream.addEventListener('close', () => {
+    pending.length = 0;
     try { server.close(); } catch (e) {}
   });
   upstream.addEventListener('error', () => {
+    pending.length = 0;
     try { server.close(); } catch (e) {}
   });
 
