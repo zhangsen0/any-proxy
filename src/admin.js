@@ -1817,7 +1817,7 @@ ${authed ? STATS_JS : ''}
     if (!list.length) { shList.innerHTML = '<div class="empty">还没有临时链接</div>'; return; }
     shList.innerHTML = list.map(function (s) {
       var hits = (s.hits || 0) + (s.max_hits > 0 ? ' / ' + s.max_hits : ' 次');
-      return '<div class="site" data-token="' + esc(s.token) + '">'
+      return '<div class="site" data-token="' + esc(s.token) + '" data-path="' + esc(s.path) + '">'
         + '<div class="site-head"><span class="site-name">' + esc(s.note || '临时链接')
         + ' <span class="tag">' + esc(s.site) + '</span> <span class="tag">' + fmtLeft(s) + '</span></span></div>'
         + '<div class="site-target">' + esc(s.path) + '　访问 ' + hits + '</div>'
@@ -1852,9 +1852,11 @@ ${authed ? STATS_JS : ''}
     var token = row.getAttribute('data-token');
     var act = btn.getAttribute('data-act');
     if (act === 'copy') {
-      var p = row.querySelector('.site-target').textContent.trim().split(/\s/)[0];
-      var full = location.origin + p;
-      if (navigator.clipboard) navigator.clipboard.writeText(full);
+      // 完整 URL 直接取行上的 data-path 拼 origin，不从展示文本反解析
+      // （展示文案一改 split 就解析错）；copyText 自带 execCommand 降级，
+      // navigator.clipboard 不可用/被拒时也能复制成功
+      var full = location.origin + (row.getAttribute('data-path') || '');
+      copyText(full, btn);
       setMsg('shMsg', '已复制：' + full, false);
       return;
     }

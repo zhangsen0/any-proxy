@@ -387,6 +387,11 @@ section('11. 临时链接区块（api 包装契约行为校验）');
     ok('成功截取完整 IIFE（以 })(); 结尾）', code.endsWith('})();'));
     ok('share 脚本不经 r.sites / r.shares 等旧契约读字段（一律走 r.data.*）',
       code.length > 0 && !/\br\.(sites|shares|path|error)\b/.test(code));
+    // 复制链接：路径必须来自 data-path 属性（不从展示文本反解析——文案一改就解析错），
+    // 且必须走带 execCommand 降级的 copyText（裸 navigator.clipboard 失败即静默丢）
+    ok('复制链接基于行上的 data-path', code.includes("getAttribute('data-path')")
+      && !code.includes("querySelector('.site-target').textContent"));
+    ok('复制链接走 copyText 助手（带降级）', /copyText\(full/.test(code));
 
     const runShare = async data => {
       const els = {};
@@ -395,7 +400,7 @@ section('11. 临时链接区块（api 包装契约行为校验）');
       const api = () => Promise.resolve({ ok: true, status: 200, data });
       let err = '';
       try {
-        new Function('document', 'api', code)(doc, api);
+        new Function('document', 'api', 'copyText', code)(doc, api, () => {});
         await new Promise(r => setTimeout(r, 20));
       } catch (e) { err = String(e && e.message || e); }
       return {
