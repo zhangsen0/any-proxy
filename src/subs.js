@@ -6,6 +6,7 @@
 // 唯一允许出现的 URL 是远端数据源的默认地址，且随时可用环境变量覆盖。
 
 import { runtime } from './runtime.js';
+import { b64 } from './util.js';
 
 // 远端边缘 IP 段数据源。可用 CF_IP_RANGES_URL 覆盖；返回形如 {"result":{"ipv4_cidrs":[...]}} 的 JSON。
 const DEFAULT_RANGES_URL = 'https://api.cloudflare.com/client/v4/ips';
@@ -224,6 +225,20 @@ async function resolveDomains(domains, opts = {}) {
 }
 
 /**
+ * 判断订阅地址是否指向本 Worker 自身（同源自拉）。
+ * 兜底推导的 /sub?token=… 一定是同源；面板也可能把 SUB_URL 配成本机 /tsub/<id>。
+ */
+function isSelfFetch(url, origin) {
+  try {
+    const a = new URL(url);
+    const b = new URL(origin || '');
+    return a.host === b.host;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * 拉取订阅候选 IP。
  * @returns {{ips:string[], source:string, note:string, filtered:number, addresses:number}}
  */
@@ -236,8 +251,15 @@ async function fetchSubscriptionCandidates(env, opts = {}) {
   }
   let text = '';
   try {
+    const headers = { 'User-Agent': String((env && env.SUB_UA) || 'Mozilla/5.0') };
+    // 同源自拉补凭据：伪装开启时，这个 fetch 对 Worker 来说是一个不带任何 cookie 的
+    // 全新请求，会被首页伪装当成陌生人挡在伪装 404 上（表现为「订阅拉取失败: HTTP 404」）。
+    // 这里以「已登录」身份补上 ap_auth 过门禁；外部订阅地址绝不带凭据，避免泄漏口令。
+    if (isSelfFetch(url, origin) && runtime.PASSWORD) {
+      headers.Cookie = 'ap_auth=' + b64(runtime.PASSWORD);
+    }
     const r = await fetch(url, {
-      headers: { 'User-Agent': String((env && env.SUB_UA) || 'Mozilla/5.0') },
+      headers,
       redirect: 'follow',
       signal: opts.signal || AbortSignal.timeout(8000),
     });

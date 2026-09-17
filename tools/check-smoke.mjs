@@ -128,6 +128,60 @@ console.log('\n[4] 站点不存在时不炸');
   ok('返回 404 而不是异常', r.status === 404 || r.status === 200, `status=${r.status}`);
 }
 
+console.log('\n[5] 优选候选的同源自拉必须带凭据（否则被自家伪装挡成 404）');
+// 背景：伪装开启时，Worker 内部 fetch 自己的 /sub 是一个不带 cookie 的全新请求，
+// 会被首页伪装当成陌生人渲染成伪装 404 —— 面板表现即「订阅拉取失败: HTTP 404」。
+// 回归口径：同源自拉必须带 ap_auth；外部订阅地址绝不能带（避免泄漏口令）。
+{
+  const realFetch = globalThis.fetch;
+  const seen = []; // { url, cookie }
+  const SUB_BODY = Buffer.from(
+    ['vless://00000000-0000-4000-8000-000000000000@104.16.1.1:443?a=1#edge', 'vless://00000000-0000-4000-8000-000000000000@8.8.8.8:443?a=1#dns'].join('\n')
+  ).toString('base64');
+  globalThis.fetch = async (url, init) => {
+    const u = String(url);
+    if (u.includes('/sub?token=') || u.includes('external-sub.example.com')) {
+      const h = (init && init.headers) || {};
+      seen.push({ url: u, cookie: h.Cookie || h.cookie || '' });
+      if (u.includes('external-sub.example.com')) return new Response('vless://x@1.2.3.4:443#n', { status: 200 });
+      return new Response(SUB_BODY, { status: 200, headers: { 'content-type': 'text/plain; charset=utf-8' } });
+    }
+    if (u.includes('api.cloudflare.com/client/v4/ips')) {
+      return new Response(JSON.stringify({ result: { ipv4_cidrs: ['104.16.0.0/12'] } }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    return realFetch(url, init);
+  };
+
+  const AUTH = 'ap_auth=' + Buffer.from(PASSWORD).toString('base64');
+  try {
+    // 场景 A：SUB_URL 指向本机 /sub（同源）
+    mem.set('SUB_URL', '/sub?token=smoketest');
+    seen.length = 0;
+    const ra = await call('/__api/preferred-candidates', { Cookie: AUTH });
+    const ja = JSON.parse(new TextDecoder().decode(ra.buf));
+    ok('HTTP 200 且拉到候选 IP', ra.status === 200 && ja.ok && (ja.ips || []).length > 0,
+      `status=${ra.status} ips=${(ja.ips || []).length} note=${ja.note || ''}`);
+    const selfCall = seen.find(s => s.url.includes('/sub?token='));
+    ok('确实发起了同源自拉', !!selfCall, selfCall ? selfCall.url.slice(ORIGIN.length) : '(未发起)');
+    ok('同源自拉带上了 ap_auth 凭据', !!selfCall && selfCall.cookie === AUTH,
+      selfCall ? `cookie=${selfCall.cookie ? '有' : '无'}` : '');
+    ok('边缘段过滤生效（8.8.8.8 被滤掉）', (ja.ips || []).includes('104.16.1.1') && !(ja.ips || []).includes('8.8.8.8'),
+      `ips=${JSON.stringify(ja.ips)}`);
+
+    // 场景 B：SUB_URL 指向外部订阅 —— 绝不能把凭据带出去
+    mem.set('SUB_URL', 'https://external-sub.example.com/sub?token=ext');
+    seen.length = 0;
+    const rb = await call('/__api/preferred-candidates', { Cookie: AUTH });
+    JSON.parse(new TextDecoder().decode(rb.buf));
+    const extCall = seen.find(s => s.url.includes('external-sub.example.com'));
+    ok('外部订阅请求不带本站凭据', !!extCall && extCall.cookie === '',
+      extCall ? `cookie=${extCall.cookie ? '泄漏了!' : '无'}` : '(未发起)');
+  } finally {
+    mem.delete('SUB_URL');
+    globalThis.fetch = realFetch;
+  }
+}
+
 console.log(`\n=== ${fail === 0 ? '全部通过' : '存在失败'} ===`);
 console.log(`代理链路冒烟：${pass} 项，失败 ${fail} 项\n`);
 process.exit(fail ? 1 : 0);
