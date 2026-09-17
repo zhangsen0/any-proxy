@@ -28,6 +28,8 @@ import {
 } from './share.js';
 import { renderConfigPanels, settingFormById, CONFIG_JS, CONFIG_CSS } from './config-ui.js';
 import { renderStatsPane, STATS_JS, STATS_CSS } from './stats-ui.js';
+import { renderCfPane, CF_JS, CF_CSS } from './cf-panel.js';
+import { cfAnalytics } from './cf-analytics.js';
 import { readTagSettings, saveTagSettings } from './nodetag.js';
 
 /**
@@ -310,6 +312,11 @@ async function handleAdmin(request, url, env) {
   if (request.method === 'POST' && path === '/__api/stats/clear') {
     const r = await clearAll();
     return json({ ok: true, removed: r.removed });
+  }
+
+  // ---- Cloudflare 用量驾驶舱：直接查 CF 边缘统计（登录保护由 router.js 统一拦截） ----
+  if (request.method === 'GET' && path === '/__api/cf-analytics') {
+    return json(await cfAnalytics(env));
   }
 
   // ---- 限流与防滥用 ----
@@ -804,6 +811,8 @@ async function adminPage(authed, origin, env) {
 ${CONFIG_CSS}
   /* 数据驾驶舱（KPI / 趋势图 / 通道排行），同样只走主题变量 */
 ${STATS_CSS}
+  /* CF 用量驾驶舱（数据来自 Cloudflare 边缘统计，复用 st-* 布局类） */
+${CF_CSS}
 </style>
 ${themeScript}
 </head>
@@ -826,6 +835,7 @@ ${themeScript}
   <nav class="tabs" id="paneTabs">
     <button type="button" class="tab" data-tab="sites">站点</button>
     <button type="button" class="tab" data-tab="stats">数据驾驶舱</button>
+    <button type="button" class="tab" data-tab="edge">CF 用量</button>
     <button type="button" class="tab" data-tab="proxy">代理节点</button>
     <button type="button" class="tab" data-tab="preferred">优选 IP</button>
     <button type="button" class="tab" data-tab="security">伪装与安全</button>
@@ -835,6 +845,8 @@ ${themeScript}
   </nav>` : ''}
 
   ${authed ? renderStatsPane() : ''}
+
+  ${authed ? renderCfPane() : ''}
 
   ${authed ? `
   <div class="card" data-pane="proxy" style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;">
@@ -1754,6 +1766,7 @@ function switchPane(name) {
   });
   // 驾驶舱要给全部历史做聚合，切到它才取数（脚本未就绪时它是空函数，直接跳过）
   if (name === 'stats' && typeof window.__statsEnsure === 'function') window.__statsEnsure();
+  if (name === 'edge' && typeof window.__cfEnsure === 'function') window.__cfEnsure();
   try { history.replaceState(null, '', '#' + name); } catch (e) {}
 }
 if (paneTabs.length) {
@@ -1794,6 +1807,7 @@ if (ntEnabled) {
 }
 ${authed ? CONFIG_JS : ''}
 ${authed ? STATS_JS : ''}
+${authed ? CF_JS : ''}
 
 /* ===== 站点临时访问链接：列表 + 生成 + 停用 / 启用 + 删除 ===== */
 (function () {

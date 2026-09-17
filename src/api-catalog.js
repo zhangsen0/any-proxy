@@ -39,6 +39,7 @@ import { SHARE_SPEC } from './share.js';
 export const TAB_LABELS = {
   sites: '站点',
   stats: '数据驾驶舱',
+  edge: 'CF 用量',
   proxy: '代理节点',
   preferred: '优选 IP',
   security: '伪装与安全',
@@ -90,6 +91,20 @@ export const API_CATALOG = [
         id: 'stats-clear', name: '清空统计数据', kind: 'action', method: 'POST', path: '/__api/stats/clear',
         desc: '删掉已落盘的全部访问记录，保留统计设置本身',
         danger: true,
+      },
+    ],
+  },
+  // ===================== 归属「CF 用量」：Cloudflare 边缘统计，不用登录 CF 控制台 =====================
+  {
+    id: 'cf-analytics',
+    name: 'CF 用量',
+    desc: 'Cloudflare 用量驾驶舱的数据源：直接查 CF 边缘统计（GraphQL），展示当前 Worker 绑定的账户基础用量，无需登录 CF 控制台。',
+    tab: 'edge',
+    items: [
+      {
+        id: 'cf-analytics', name: '查看 CF 用量', kind: 'query', path: '/__api/cf-analytics',
+        desc: '按天请求数/带宽/缓存命中 + 近 24h 状态码分布与 Top 路径 + 当前 Worker 脚本近 30 天调用（5 分钟缓存，单源失败自动降级并注明）',
+        params: [],
       },
     ],
   },
