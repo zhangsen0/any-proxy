@@ -38,6 +38,10 @@ jobs:
       # CDN 任播兜底：守住「GeoIP 查不到就编一个国名」，以及拿不到官方段时不能拖垮订阅
       - name: 任播兜底校验
         run: node tools/check-anycast.mjs
+      # 主题系统：守住「10 套预设都在」「自定义主题能存能删」，以及最要紧的一条——
+      # 自定义主题的内容会被拼进 <style>，不能被写穿成 CSS 注入
+      - name: 主题系统校验
+        run: node tools/check-themes.mjs
       # 出口压缩 + 上游请求策略：压缩错了会让浏览器解不开整站资源，必须验证「压完能还原」
       - name: 出口压缩校验
         run: node tools/check-compress.mjs
