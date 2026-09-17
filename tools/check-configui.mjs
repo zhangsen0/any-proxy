@@ -9,6 +9,8 @@
  *   - 同一个配置在配置页和功能页各有一份表单 → 改完一边忘了另一边，两边口径打架
  *   - 卡片漏写 data-pane → 它不参与选项卡切换，于是「在好几个选项卡里都有」
  *     （优选池 & 健康检查就是这么长在所有选项卡里的）
+ *   - 某个选项卡的卡片自己写一套内边距、或者套一层带内边距的盒子 → 它的字段
+ *     比别的选项卡窄一圈。宽度这类问题不报错、只是难看，所以要按数值验一遍
  *   - 目录写了不存在的接口 → 点下去只会拿到 404
  *
  * 用法：node tools/check-configui.mjs
@@ -18,7 +20,8 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { bindRuntime } from '../src/runtime.js';
 import { API_CATALOG, flatCatalog, placementOf, splitCatalog, TAB_LABELS } from '../src/api-catalog.js';
-import { renderConfigPanels, renderSettingForm, renderToolItem, CONFIG_JS } from '../src/config-ui.js';
+import { renderConfigPanels, renderSettingForm, renderToolItem, CONFIG_JS, CONFIG_CSS } from '../src/config-ui.js';
+import { BASE_VARS } from '../src/themes.js';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const read = p => readFileSync(join(ROOT, p), 'utf8');
@@ -267,8 +270,91 @@ section('9. 前端脚本');
   ok('未登录分支不渲染配置分区', !/data-setting/.test(anonHtml));
 }
 
+// ===================== 10. 各选项卡的内容宽度 =====================
+section('10. 布局度量一致（选项卡之间同宽）');
+{
+  // 起因：「临时链接」和「配置」两页的内容比前面几个选项卡窄一圈。三处叠加造成的 ——
+  // 卡片内边距被各写一份（20px vs var(--sp-3) var(--sp-4)）、设置块外面又套了一层
+  // 带内边距的盒子、字段栅格还是另一套列宽（210px 起排，被排成 3 列）。
+  // 这一节把度量钉在唯一来源上：以后想让某个页面单独窄一点，只能改主题变量，
+  // 改不动就会被这里拦下。
+  ok('主题里声明了卡片内边距', !!BASE_VARS['--card-pad'], BASE_VARS['--card-pad']);
+  ok('主题里声明了字段最小列宽', !!BASE_VARS['--field-min'], BASE_VARS['--field-min']);
+  ok('主题里声明了栅格间距', !!BASE_VARS['--grid-gap'], BASE_VARS['--grid-gap']);
+
+  // 变量值可能是引用（--grid-gap: var(--sp-3)），算数前先展开
+  const expand = (value, depth = 0) => String(value).replace(
+    /var\((--[a-z0-9-]+)(?:,\s*([^)]*))?\)/gi,
+    (m, name, fallback) => (depth > 6 ? '' : expand(BASE_VARS[name] !== undefined ? BASE_VARS[name] : (fallback || ''), depth + 1)),
+  );
+  const pxOf = v => { const m = /^(-?[\d.]+)px$/.exec(String(v).trim()); return m ? parseFloat(m[1]) : null; };
+  const cssRule = (css, selector) => {
+    const re = new RegExp(selector.replace(/[.[\]()*+?^${}|\\]/g, '\\$&') + '\\s*\\{([^}]*)\\}');
+    const m = re.exec(css);
+    return m ? m[1].trim() : '';
+  };
+  const declOf = (block, prop) => {
+    const m = new RegExp('(?:^|;)\\s*' + prop + '\\s*:([^;]*)').exec(block);
+    return m ? m[1].trim() : '';
+  };
+  /** padding:32px 16px 64px -> 左右 16px */
+  const padXOf = v => {
+    const parts = String(v).trim().split(/\s+/).filter(Boolean).map(pxOf);
+    if (!parts.length || parts.some(n => n === null)) return null;
+    return parts.length === 1 ? parts[0] : parts[1];
+  };
+
+  const cardBlock = cssRule(adminJs, '.card');
+  ok('全站卡片的 padding 来自 --card-pad',
+    declOf(cardBlock, 'padding') === 'var(--card-pad)', declOf(cardBlock, 'padding') || '(无)');
+
+  const cfgCard = declOf(cssRule(CONFIG_CSS, '.cfg-card'), 'padding');
+  ok('配置页卡片沿用同一度量', cfgCard === 'var(--card-pad)', cfgCard || '(无)');
+
+  const cfgSet = cssRule(CONFIG_CSS, '.cfg-set');
+  const setPad = declOf(cfgSet, 'padding');
+  const setSide = declOf(cfgSet, 'padding-left') || declOf(cfgSet, 'padding-right');
+  ok('设置块不再横向缩进（字段与卡片内容对齐）',
+    !setSide && (!setPad || /^0(\s+0){0,3}$/.test(setPad)), setPad || '(无)');
+
+  const grid = cssRule(CONFIG_CSS, '.cfg-grid');
+  ok('字段栅格用 --field-min 定列宽', grid.includes('--field-min'));
+  ok('字段栅格用 --grid-gap 定间距', declOf(grid, 'gap') === 'var(--grid-gap)', declOf(grid, 'gap'));
+
+  ok('配置页文案行与卡片内容对齐',
+    declOf(cssRule(CONFIG_CSS, '.cfg-lead'), 'padding') === '0 var(--card-pad)',
+    declOf(cssRule(CONFIG_CSS, '.cfg-lead'), 'padding') || '(无)');
+
+  // 选项卡的顶层块必须是同一种卡片：换个 class 就等于换了宽度来源
+  const paneTags = [...pageHtml.matchAll(/<[a-z][^>]*\sdata-pane="[^"]*"[^>]*>/g)].map(m => m[0]);
+  ok('选项卡顶层块数量与选项卡一致', paneTags.length >= Object.keys(TAB_LABELS).length, `${paneTags.length} 块`);
+  const noCard = paneTags.filter(t => !/class="[^"]*\bcard\b/.test(t));
+  ok('每个选项卡顶层块都是卡片', noCard.length === 0, noCard.join(' | ') || '—');
+  // 横向度量写进行内样式，就绕过了主题变量，也没法被这一节盯住
+  const SIZING_RE = /(?:^|;|\s)(width|max-width|min-width|padding|padding-left|padding-right|margin-left|margin-right)\s*:/;
+  const inlineSize = paneTags.filter(t => {
+    const m = /style="([^"]*)"/.exec(t);
+    return m ? SIZING_RE.test(m[1]) : false;
+  });
+  ok('选项卡块的横向尺寸不写在行内样式里', inlineSize.length === 0, inlineSize.join(' | ') || '—');
+
+  // 算一遍真实宽度：配置页的栅格自动列数要和站点页的固定列数排出同样的字段宽
+  const wrapBlock = cssRule(adminJs, '.wrap');
+  const pageMax = pxOf(declOf(wrapBlock, 'max-width'));
+  const pagePadX = padXOf(declOf(wrapBlock, 'padding'));
+  const cardPad = pxOf(expand(BASE_VARS['--card-pad']));
+  const fieldMin = pxOf(expand(BASE_VARS['--field-min']));
+  const gridGap = pxOf(expand(BASE_VARS['--grid-gap']));
+  const inner = pageMax - 2 * pagePadX - 2 * cardPad;
+  const siteCols = (declOf(cssRule(adminJs, '.grid2'), 'grid-template-columns').match(/1fr/g) || []).length;
+  const cfgCols = Math.floor((inner + gridGap) / (fieldMin + gridGap));
+  ok('配置页字段列数与站点页一致', cfgCols === siteCols,
+    `配置页 ${cfgCols} 列 / 站点页 ${siteCols} 列（卡片内容宽 ${inner}px）`);
+  const colW = n => (inner - (n - 1) * gridGap) / n;
+  ok('两页字段宽度一致', Math.abs(colW(cfgCols) - colW(siteCols)) < 0.01, `${colW(cfgCols)}px vs ${colW(siteCols)}px`);
+}
+
 globalThis.fetch = undefined;
 
-console.log(`\n=== ${fail === 0 ? '全部通过' : '存在失败'} ===`);
-console.log(`配置页与接口目录：${pass + fail} 项，失败 ${fail} 项`);
+console.log(`\n=== ${fail === 0 ? '全部通过' : '存在失败'} ===`);console.log(`配置页与接口目录：${pass + fail} 项，失败 ${fail} 项`);
 if (fail) { console.log('失败项：' + failures.join('、')); process.exit(1); }

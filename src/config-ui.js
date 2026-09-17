@@ -433,10 +433,18 @@ const CONFIG_JS = `(${configInit.toString()})();`;
 // 全部走主题变量：换主题时配置页跟着一起变，不会留下一块「自成一套」的孤岛。
 
 const CONFIG_CSS = `
-  .cfg-lead { font-size:13px; color:var(--muted); line-height:1.8; margin:2px 0 var(--sp-2); }
-  .cfg-card { padding:var(--sp-3) var(--sp-4); }
-  .cfg-set { border:1px solid var(--line); border-radius:var(--radius-sm); background:var(--input); padding:var(--sp-3); }
-  .cfg-set + .cfg-set { margin-top:var(--sp-2); }
+  /* 文案行本就在卡片之外，用卡片内边距对齐它，读起来才和卡片里的内容同一条竖线 */
+  .cfg-lead { font-size:13px; color:var(--muted); line-height:1.8; margin:2px 0 var(--sp-2); padding:0 var(--card-pad); }
+  /* 卡片度量必须跟全站同源：曾经这里写死成 var(--sp-3) var(--sp-4)，
+     于是配置页的输入框比其它选项卡左右各窄一截 */
+  .cfg-card { padding:var(--card-pad); }
+  /* 设置块：一个块 = 一个可读可写的接口。
+     这里刻意**不给横向内边距**，字段左右边界直接对齐卡片内容区；
+     它以前是一层带边框和底色的内嵌盒子，等于在卡片里又缩进 16px ——
+     配置页和临时链接页的输入框因此比前面几个选项卡窄一圈。块与块之间用一条
+     分隔线区分，比套盒子更轻。 */
+  .cfg-set { padding:0; }
+  .cfg-set + .cfg-set { margin-top:var(--sp-3); border-top:1px solid var(--line); padding-top:var(--sp-3); }
   .cfg-set-head { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
   .cfg-set-head b { font-size:14px; font-weight:600; }
   .cfg-state { font-size:12px; color:var(--muted); }
@@ -444,23 +452,23 @@ const CONFIG_CSS = `
   .cfg-state.done { color:var(--ok); }
   .cfg-state.bad { color:var(--err); }
   .cfg-desc { font-size:12px; color:var(--muted); line-height:1.7; margin:4px 0 var(--sp-3); }
-  .cfg-grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(210px, 1fr)); gap:var(--sp-3) var(--sp-3); align-items:start; }
+  /* 列宽走 --field-min：容器够宽多排一列、窄屏自然回落一列，
+     min(…, 100%) 保证极窄屏下不会撑出横向滚动条 */
+  .cfg-grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(min(var(--field-min), 100%), 1fr)); gap:var(--grid-gap); align-items:start; }
   .cfg-field { min-width:0; }
   .cfg-field.wide { grid-column:1 / -1; }
   .cfg-field > label:not(.cfg-switch) { display:flex; align-items:center; gap:6px; margin:0 0 5px; font-size:12px; font-weight:500; color:var(--muted); }
-  .cfg-field input[type="text"], .cfg-field input[type="password"],
-  .cfg-field input[type="number"], .cfg-field select, .cfg-field textarea {
-    width:100%; box-sizing:border-box; margin:0; background:var(--card); color:var(--txt);
-    border:1px solid var(--line); border-radius:var(--radius-xs);
-    padding:8px 10px; font-size:13px; font-family:inherit; line-height:1.4;
-  }
+  /* 输入控件的外观**不在这里重写**。全站那条 input/select/textarea 规则已经定义了
+     背景、圆角、内边距、字号和聚焦描边，配置页沿用同一套才可能和别的选项卡长得一样
+     —— 之前这里又抄了一份紧凑版（灰底换成白底、内边距 8/10、字号 13），
+     于是同一页里出现两种输入框。这里只补两件全站没有的事： */
   .cfg-field textarea { font-family:var(--font-mono); font-size:12px; line-height:1.7; resize:vertical; }
-  .cfg-field input:focus, .cfg-field select:focus, .cfg-field textarea:focus { outline:none; border-color:var(--accent); box-shadow:var(--ring); }
   .cfg-field [data-dirty] { border-color:var(--accent); }
   .cfg-hint { font-size:11px; color:var(--muted); line-height:1.7; margin:5px 0 0; }
   .cfg-num { position:relative; display:block; }
   .cfg-num em { position:absolute; right:11px; top:50%; transform:translateY(-50%); font-style:normal; font-size:11px; color:var(--muted); pointer-events:none; }
-  .cfg-num input { padding-right:46px !important; }
+  /* 右侧要让出「单位」后缀的位置；选择器比全站那条更具体，不必用 !important */
+  .cfg-num input { padding-right:46px; }
   .cfg-switch { display:inline-flex; align-items:center; gap:9px; cursor:pointer; user-select:none; padding:6px 0; }
   .cfg-switch input { position:absolute; width:0; height:0; opacity:0; }
   .cfg-switch .cfg-track { flex:none; position:relative; width:38px; height:22px; border-radius:999px; background:var(--line); border:1px solid var(--line); transition:background .18s, border-color .18s; }

@@ -705,10 +705,10 @@ async function adminPage(authed, origin, env) {
   a.ghost-link:hover { color:var(--txt); border-color:var(--muted); background:var(--hover); }
   h1 { font-size:22px; margin:0 0 6px; letter-spacing:-.01em; }
   .sub { color:var(--muted); font-size:13px; margin:0 0 var(--sp-4); line-height:1.7; }
-  .card { background:var(--card); border:1px solid var(--line); border-radius:var(--radius); padding:20px; margin-bottom:var(--sp-3); box-shadow:var(--shadow); transition:border-color .15s, box-shadow .15s; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:var(--radius); padding:var(--card-pad); margin-bottom:var(--sp-3); box-shadow:var(--shadow); transition:border-color .15s, box-shadow .15s; }
   .card > h2:first-child { margin-top:0; }
   .card h2 { font-size:15px; margin:0 0 var(--sp-3); font-weight:600; }
-  .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:0 var(--sp-3); }
+  .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:0 var(--grid-gap); }
   @media (max-width:560px){ .grid2{ grid-template-columns:1fr; gap:0; } }
   label { display:block; font-size:13px; color:var(--muted); margin:var(--sp-3) 0 6px; }
   input, textarea, select { width:100%; padding:10px 12px; border-radius:var(--radius-sm); border:1px solid var(--line); background:var(--input); color:var(--txt); font-size:14px; outline:none; transition:border-color .15s, box-shadow .15s, background .15s; }
@@ -746,7 +746,8 @@ async function adminPage(authed, origin, env) {
   .notice a { color:var(--accent); }
   @media (max-width:640px) {
     .wrap { padding:20px 12px 48px; }
-    .card { padding:16px; }
+    /* 窄屏卡片略收内边距，但仍由 --card-pad 派生，跟主题一起变 */
+    .card { padding:calc(var(--card-pad) - 4px); }
     .topbar { margin-bottom:var(--sp-3); }
     .row { gap:var(--sp-1); }
     button { padding:10px 14px; }
