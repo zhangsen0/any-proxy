@@ -66,10 +66,29 @@ function cacheKeyOf(u) {
 }
 
 /**
+ * 进 Cache API 的体积上限。写缓存必须把整个响应体读完（put 需要完整的 body），
+ * 因此「缓存什么」等价于「允许把多大的东西读进 Worker 内存」——
+ * 这套缓存是为 JS/CSS/小图片设计的，那些资源都在几百 KB 量级。
+ *
+ * 踩过的坑：isFingerprinted 的正则（[._-] + 8 位以上十六进制）会命中大量视频分片名
+ * （segment-1234567890.ts、1080p-00000001.ts），于是几十 MB 的视频被整个读进内存
+ * 去写缓存 —— 请求拖到超时、播放器重试又重新下一遍，表现为「网速极慢 + 转发流量暴涨
+ * + 最后还是播不了」。大文件必须挡在缓存之外。
+ */
+const MAX_CACHE_BYTES = 1024 * 1024;
+
+/** 是否允许写入 Cache API：体积已知且不超过上限。
+ *  没有 content-length（分块/流式）一律不缓存 —— 无法预知体积时读满整个流是在赌。 */
+function cacheableSize(res) {
+  const len = parseInt(res.headers.get('content-length') || '0', 10);
+  return len > 0 && len <= MAX_CACHE_BYTES;
+}
+
+/**
  * 经 CF Cache API 提供不可变资源（fingerprinted：文件名含 hash，内容永不变）。
  * 跨隔离共享：首次回源后所有请求直接命中，避免每个用户每次都要 Worker 回源 + 重写，
  * 也避免大 bundle（数百 KB）在浏览器端等 4-7 秒才执行、拖垮 React 水合。
- * 只命中 200 的 GET；miss 时构建响应并 waitUntil 写入缓存。
+ * 只命中 200 的 GET，且体积在上限内；miss 时构建响应并 waitUntil 写入缓存。
  */
 async function serveCached(ctx, cacheKey, build) {
   if (!ctx || !cacheKey || typeof caches === 'undefined') return build();
@@ -77,7 +96,7 @@ async function serveCached(ctx, cacheKey, build) {
   const hit = await caches.default.match(key).catch(() => null);
   if (hit) return hit;
   const res = build();
-  if (res && res.status === 200) {
+  if (res && res.status === 200 && cacheableSize(res)) {
     try { ctx.waitUntil(caches.default.put(key, res.clone())); } catch {}
   }
   return res;
@@ -228,8 +247,12 @@ async function proxyRequest(request, site, crossHost, ctx, env) {
 
   // 上游取一次。对冲阈值由环境变量给出，未配置即 0（关闭），默认行为与原先一致；
   // 突发 handful 场景下把隔 1200ms 的慢请求重发一次，能明显削掉长尾。
-  const hedgeMs = Number(env && (env.PROXY_HEDGE_MS || env.proxy_hedge_ms)) || 0;
-  let upstream = await fetchUpstream(targetUrl, reqInit, hedgeMs);
+  //
+  // 带 Range 的请求（视频/大文件分片）一律不对冲、不重试：分片本来就慢，必然触发对冲，
+  // 于是每个分片都下两遍 —— 流量翻倍、带宽被自己吃掉、反而更慢，最后还是播不了。
+  const wantsRange = request.headers.has('range') || request.headers.has('if-range');
+  const hedgeMs = wantsRange ? 0 : (Number(env && (env.PROXY_HEDGE_MS || env.proxy_hedge_ms)) || 0);
+  let upstream = await fetchUpstream(targetUrl, reqInit, hedgeMs, { noRetry: wantsRange });
 
   /**
    * 代理路径 -> 目标站绝对路径（用于 Location / Referer 还原）
@@ -484,7 +507,15 @@ async function plaintextBuffer(upstream) {
   }
 }
 
-async function fetchUpstream(targetUrl, reqInit, hedgeMs = 0) {
+/**
+ * opts.noRetry：不做失败重试、也不做 https→http 降级重发。
+ *
+ * 用于 Range 请求（视频/大文件分片）：这类请求一旦中断，重发就是再下一遍整个分片，
+ * 而播放器自己有更聪明的重试（换码率、只补那一段、限制并发）。让它快速失败比在
+ * Worker 里盲目重发划算得多 —— 后者正是「转发流量暴涨但网速反而更慢」的来源之一。
+ */
+async function fetchUpstream(targetUrl, reqInit, hedgeMs = 0, opts = {}) {
+  const noRetry = opts.noRetry === true;
   const method = String(reqInit.method || 'GET').toUpperCase();
   const idempotent = (method === 'GET' || method === 'HEAD') && !reqInit.body;
   const once = signal => (signal
@@ -517,8 +548,9 @@ async function fetchUpstream(targetUrl, reqInit, hedgeMs = 0) {
   let res = null;
   try {
     res = await fetch(targetUrl, reqInit);
-    if (res.status >= 500 || res.status === 429) res = await fetch(targetUrl, reqInit);
+    if (!noRetry && (res.status >= 500 || res.status === 429)) res = await fetch(targetUrl, reqInit);
   } catch (e) {
+    if (noRetry) throw e;
     try {
       res = await fetch(targetUrl, reqInit);
     } catch (e2) {
@@ -637,4 +669,9 @@ async function handleWebSocket(request, site, crossHost) {
   return new Response(null, { status: 101, webSocket: client });
 }
 
-export { proxyRequest, rewriteSetCookies, fetchUpstream, friendlyError, handleWebSocket };
+export {
+  proxyRequest, rewriteSetCookies, fetchUpstream, friendlyError, handleWebSocket,
+  // 导出供自检使用（与 fetchUpstream 同理）：缓存体积这道闸门只能靠断言守住，
+  // 一旦有人放宽它，check-media.mjs 必须变红
+  serveCached, cacheableSize, MAX_CACHE_BYTES,
+};
