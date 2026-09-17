@@ -9,6 +9,3 @@ tools/.worker.local.mjs
 # Python
 __pycache__/
 *.pyc
-
-# 临时主题测试部署配置
-wrangler.theme-test.toml
