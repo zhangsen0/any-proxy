@@ -292,6 +292,7 @@ tools/                 本地开发与验证脚本（不参与部署）
   check-compress.mjs   出口编码契约自检：任何 Accept-Encoding 下都不许输出压缩字节；上游重试/对冲策略
   check-hls.mjs        HLS 清单自检：分片 / 密钥 URI 必须改写进代理命名空间，标签属性一个字不许动
   check-media.mjs      媒体与大文件自检：大文件不进 Cache API、Range 分片不重试不对冲（防流量放大）
+  check-path.mjs       路径归一化自检：双斜杠 /p/<id>//xxx 必须折叠（Emby 客户端拼接会产出它，否则视频 404）
   check-themes.mjs     主题系统自检：10 套预设齐全、自定义可增删、CSS 注入写不穿、轮换结果收敛
   check-guard.mjs      防护三件套自检：默认关闭不误伤、封禁与解封、告警脱敏、临时链接双重到期
   check-configui.mjs   配置页与目录自检：字段与 SPEC 双向对齐、每项恰好渲染一次、全页无重复配置、转义完备、各选项卡内容同宽
@@ -348,28 +349,33 @@ node tools/check-hls.mjs
 #     守的是流量放大：视频不能进 Cache API，Range 分片不能重试或对冲
 node tools/check-media.mjs
 
-# 11. 代理链路冒烟（改任何一处请求处理链路后必跑）
+# 11. 路径归一化自检（改 proxy.js 的路径处理 / url.js 的 URL 映射后必跑）
+#     守的是双斜杠：客户端把带尾斜杠的 base 地址与绝对路径拼接会产出 /p/<id>//xxx，
+#     源站与代理都回 404，症状是「能登录、能刷首页、就是播不了」
+node tools/check-path.mjs
+
+# 12. 代理链路冒烟（改任何一处请求处理链路后必跑）
 node tools/check-smoke.mjs
 
-# 12. 主题系统自检（改 themes.js / admin.js 主题部分后必跑）
+# 13. 主题系统自检（改 themes.js / admin.js 主题部分后必跑）
 node tools/check-themes.mjs
 
-# 13. 防护三件套自检（改 ratelimit.js / alert.js / share.js 后必跑）
+# 14. 防护三件套自检（改 ratelimit.js / alert.js / share.js 后必跑）
 node tools/check-guard.mjs
 
-# 14. 配置页与接口目录自检（改配置项 / api-catalog.js 后必跑）
+# 15. 配置页与接口目录自检（改配置项 / api-catalog.js 后必跑）
 node tools/check-configui.mjs
 
-# 15. 配置单一真源自检（新增默认值 / 加一个常量前先跑；同一个设定不允许写两份）
+# 16. 配置单一真源自检（新增默认值 / 加一个常量前先跑；同一个设定不允许写两份）
 node tools/check-single-source.mjs
 
-# 16. 操作手册的速查表与代码是否同步（改配置项后跑 --write 重新生成）
+# 17. 操作手册的速查表与代码是否同步（改配置项后跑 --write 重新生成）
 node tools/gen-manual.mjs
 
-# 17. 部署后线上冒烟：传目标地址与口令，跑主题、防护与配置接口（结束会自动恢复默认配置）
+# 18. 部署后线上冒烟：传目标地址与口令，跑主题、防护与配置接口（结束会自动恢复默认配置）
 node tools/check-live.mjs https://<你的-worker>.workers.dev <PASSWORD>
 
-# 18. 实测订阅里每个节点是否真的可用（需 Python 3）
+# 19. 实测订阅里每个节点是否真的可用（需 Python 3）
 SUB_URL=https://proxy.example.com/tsub/xxxx python3 - <<'EOF'
 import urllib.request
 open('/tmp/sub.txt','wb').write(urllib.request.urlopen('$SUB_URL').read())

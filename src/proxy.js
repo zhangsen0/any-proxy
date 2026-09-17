@@ -154,6 +154,13 @@ async function proxyRequest(request, site, crossHost, ctx, env) {
   // 去掉通道前缀后剩下的就是原始路径
   let rest = url.pathname.slice(base.prefix.length);
   if (!rest.startsWith('/')) rest = '/';
+  // 折叠前导的连续斜杠：客户端常把「以 / 结尾的 base 地址」与「以 / 开头的绝对路径」
+  // 直接拼接，于是产生 //xxx。语义上等价于单斜杠，但源站与代理都会当成不同路径
+  // 并回 404 —— 典型现场是 Emby：System/Info 里的 LocalAddress 是站点根，改写成代理
+  // 地址后带上了尾斜杠，客户端再拼 /play/video/... 就变成 /p/<id>//play/video/...，
+  // 表现为「视频点开就失败、播放器反复重试、流量疯涨但始终播不了」。
+  // 只折叠前导部分：路径中间的双斜杠可能是源站自己的语义，不去动。
+  rest = rest.replace(/^\/{2,}/, '/');
   // 自愈：历史链接 / 源站回传可能让前缀重复出现（/p/<id>/p/<id>/xxx），
   // 逐层剥掉多余的前缀，保证最终送到源站的始终是干净路径
   while (rest.startsWith(sitePrefix + '/') || rest === sitePrefix) {
