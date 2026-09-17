@@ -170,6 +170,90 @@ export const API_CATALOG = [
     ],
   },
   {
+    id: 'ratelimit',
+    name: '限流与防滥用',
+    desc: '按来访者 + 时间窗计数，超阈值挡下，屡犯可临时封禁',
+    items: [
+      {
+        id: 'ratelimit-config', name: '限流开关与阈值', method: 'GET', path: '/__api/ratelimit', writeMethod: 'POST',
+        desc: '计数在 isolate 内存里（单实例级平滑限流），只有封禁落盘', auth: true,
+        params: [
+          { key: 'enabled', label: '启用限流', type: 'bool' },
+          { key: 'window_seconds', label: '时间窗（秒）', type: 'number', placeholder: '60' },
+          { key: 'max_requests', label: '窗口内允许请求数', type: 'number', placeholder: '120' },
+          { key: 'scope', label: '计数口径（ip / ip_path）', type: 'text', placeholder: 'ip' },
+          { key: 'whitelist', label: '放行名单（每行一个 IP 或 CIDR）', type: 'textarea', placeholder: '203.0.113.0/24' },
+          { key: 'exempt_paths', label: '豁免路径前缀（每行一个）', type: 'textarea', placeholder: '/__api/login' },
+          { key: 'exempt_authed', label: '已登录豁免', type: 'bool' },
+          { key: 'ban_enabled', label: '启用屡犯封禁', type: 'bool' },
+          { key: 'ban_threshold', label: '触发封禁的被挡次数', type: 'number', placeholder: '5' },
+          { key: 'ban_seconds', label: '封禁时长（秒）', type: 'number', placeholder: '600' },
+          { key: 'message', label: '被挡时的提示文案', type: 'text', placeholder: '请求过于频繁，请稍后再试' },
+        ],
+      },
+      {
+        id: 'ratelimit-bans', name: '当前封禁列表', method: 'GET', path: '/__api/ratelimit/bans',
+        desc: '跨实例生效的封禁记录，到期自动解除', auth: true,
+      },
+      {
+        id: 'ratelimit-clear', name: '解除全部封禁', method: 'POST', path: '/__api/ratelimit/clear',
+        desc: '一键解封；内存计数随 isolate 回收自然失效，无需清理', auth: true, danger: true,
+      },
+    ],
+  },
+  {
+    id: 'alert',
+    name: '告警通知',
+    desc: '把异常推到可配置的 Webhook（企业微信 / 钉钉 / 自建服务）',
+    items: [
+      {
+        id: 'alert-config', name: '通道与节流', method: 'GET', path: '/__api/alert', writeMethod: 'POST',
+        desc: 'Webhook 地址属敏感项，只返回 has_webhook_url；留空则不修改', auth: true,
+        params: [
+          { key: 'enabled', label: '启用告警', type: 'bool' },
+          { key: 'webhook_url', label: 'Webhook 地址（留空保持不变）', type: 'password', placeholder: 'https://…' },
+          { key: 'webhook_type', label: '格式（generic / wecom / dingtalk）', type: 'text', placeholder: 'generic' },
+          { key: 'title_prefix', label: '标题前缀', type: 'text', placeholder: '[Any-Proxy]' },
+          { key: 'cooldown_minutes', label: '同一事件冷却（分钟）', type: 'number', placeholder: '30' },
+          { key: 'max_per_hour', label: '每小时最多发几条', type: 'number', placeholder: '20' },
+          { key: 'timeout_ms', label: '发送超时（毫秒）', type: 'number', placeholder: '4000' },
+          { key: 'events', label: '订阅的事件（每行一个，留空=全部）', type: 'textarea', placeholder: 'login_fail' },
+        ],
+      },
+      {
+        id: 'alert-test', name: '发一条测试告警', method: 'POST', path: '/__api/alert/test',
+        desc: '绕过冷却走完整发送链路，用来确认通道配对了', auth: true,
+      },
+      {
+        id: 'alert-recent', name: '最近发送记录', method: 'GET', path: '/__api/alert/recent',
+        desc: '含跳过原因，排查「为什么没收到」就看这里', auth: true,
+      },
+    ],
+  },
+  {
+    id: 'share',
+    name: '站点临时访问链接',
+    desc: '给反代站点开一条到期自动作废的短链',
+    items: [
+      {
+        id: 'share-config', name: '开关与默认值', method: 'GET', path: '/__api/share-config', writeMethod: 'POST',
+        desc: '链接前缀可改（默认 /s）；不能占用 /p /__ /edt 等保留段', auth: true,
+        params: [
+          { key: 'enabled', label: '启用临时链接', type: 'bool' },
+          { key: 'path_prefix', label: '链接前缀', type: 'text', placeholder: '/s' },
+          { key: 'default_days', label: '默认有效期（天）', type: 'number', placeholder: '1' },
+          { key: 'max_days', label: '允许的最长天数', type: 'number', placeholder: '30' },
+          { key: 'default_max_hits', label: '默认次数上限（0=不限）', type: 'number', placeholder: '0' },
+          { key: 'count_hits', label: '记录访问次数', type: 'bool' },
+        ],
+      },
+      {
+        id: 'share-list', name: '临时链接列表', method: 'GET', path: '/__api/shares',
+        desc: '含剩余时间与访问次数，面板里可直接复制 / 停用 / 删除', auth: true,
+      },
+    ],
+  },
+  {
     id: 'disguise',
     name: '首页伪装',
     desc: '访客视角的一切从这里配置',

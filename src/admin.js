@@ -11,6 +11,17 @@ import {
   rotatingTheme, rotatePool,
 } from './themes.js';
 import { readStatsConfig, saveStatsConfig, summarize, STATS_SPEC } from './stats.js';
+import {
+  readLimitConfig, saveLimitConfig, listBans, clearBans, RATELIMIT_SPEC,
+} from './ratelimit.js';
+import {
+  readAlertConfig, saveAlertConfig, safeAlertConfig, testAlert, recentAlerts,
+  ALERT_SPEC, ALERT_EVENTS,
+} from './alert.js';
+import {
+  readShareConfig, saveShareConfig, createShare, listShares,
+  revokeShare, enableShare, deleteShare, linkPath, SHARE_SPEC,
+} from './share.js';
 import { renderConfigPanels, CONFIG_JS } from './config-ui.js';
 
 // 站点管理：REST API + 服务端渲染的管理页
@@ -273,6 +284,106 @@ async function handleAdmin(request, url, env) {
   // ---- 访问统计数据：?days=N 指定天数（默认 7，上限为配置的保留天数） ----
   if (request.method === 'GET' && path === '/__api/stats') {
     return json(await summarize(env, url.searchParams.get('days')));
+  }
+
+  // ---- 限流与防滥用 ----
+  if (path === '/__api/ratelimit') {
+    if (request.method === 'GET') return json({ ok: true, config: await readLimitConfig(env) });
+    if (request.method === 'POST') {
+      let body;
+      try { body = await request.json(); } catch { return json({ error: 'invalid json' }, 400); }
+      const patch = {};
+      for (const k of Object.keys(RATELIMIT_SPEC)) {
+        if (body[k] !== undefined) patch[k] = body[k];
+      }
+      const r = await saveLimitConfig(env, patch);
+      if (r && r.error) return json({ error: r.error }, 400);
+      return json({ ok: true, config: r.values });
+    }
+  }
+  if (request.method === 'GET' && path === '/__api/ratelimit/bans') {
+    return json({ ok: true, bans: await listBans() });
+  }
+  if (request.method === 'POST' && path === '/__api/ratelimit/clear') {
+    return json({ ok: true, cleared: await clearBans() });
+  }
+
+  // ---- 告警通知 ----
+  if (path === '/__api/alert') {
+    if (request.method === 'GET') {
+      const cfg = await readAlertConfig(env);
+      return json({ ok: true, config: safeAlertConfig(cfg), events: ALERT_EVENTS });
+    }
+    if (request.method === 'POST') {
+      let body;
+      try { body = await request.json(); } catch { return json({ error: 'invalid json' }, 400); }
+      const patch = {};
+      for (const k of Object.keys(ALERT_SPEC)) {
+        if (body[k] === undefined) continue;
+        // 空串表示「不修改」：避免面板漏填把已配好的地址抹掉
+        if (k === 'webhook_url' && String(body[k]).trim() === '') continue;
+        patch[k] = body[k];
+      }
+      const r = await saveAlertConfig(env, patch);
+      if (r && r.error) return json({ error: r.error }, 400);
+      return json({ ok: true, config: safeAlertConfig(r.values) });
+    }
+  }
+  if (request.method === 'POST' && path === '/__api/alert/test') {
+    return json({ ok: true, result: await testAlert(env) });
+  }
+  if (request.method === 'GET' && path === '/__api/alert/recent') {
+    return json({ ok: true, items: recentAlerts(), events: ALERT_EVENTS });
+  }
+
+  // ---- 站点临时访问链接 ----
+  if (path === '/__api/share-config') {
+    if (request.method === 'GET') return json({ ok: true, config: await readShareConfig(env) });
+    if (request.method === 'POST') {
+      let body;
+      try { body = await request.json(); } catch { return json({ error: 'invalid json' }, 400); }
+      const patch = {};
+      for (const k of Object.keys(SHARE_SPEC)) {
+        if (body[k] !== undefined) patch[k] = body[k];
+      }
+      const r = await saveShareConfig(env, patch);
+      if (r && r.error) return json({ error: r.error }, 400);
+      return json({ ok: true, config: r.values });
+    }
+  }
+  if (path === '/__api/shares') {
+    if (request.method === 'GET') {
+      // 顺带把可直接复制的完整路径拼好：前缀可配，前端不该自己拼
+      const cfg = await readShareConfig(env);
+      const shares = (await listShares(env)).map(s => ({ ...s, path: linkPath(cfg, s.token) }));
+      return json({ ok: true, config: cfg, shares });
+    }
+    if (request.method === 'POST') {
+      let body;
+      try { body = await request.json(); } catch { return json({ error: 'invalid json' }, 400); }
+      const r = await createShare(env, body);
+      if (r && r.error) return json({ error: r.error }, 400);
+      return json({ ok: true, share: r.share, path: r.path });
+    }
+  }
+  if (path.startsWith('/__api/shares/')) {
+    const rest = path.slice('/__api/shares/'.length);
+    const [token, action] = rest.split('/');
+    if (request.method === 'DELETE' && token) {
+      const r = await deleteShare(decodeURIComponent(token));
+      if (r && r.error) return json({ error: r.error }, 404);
+      return json({ ok: true, shares: await listShares(env) });
+    }
+    if (request.method === 'POST' && action === 'revoke') {
+      const r = await revokeShare(decodeURIComponent(token));
+      if (r && r.error) return json({ error: r.error }, 404);
+      return json({ ok: true, shares: await listShares(env) });
+    }
+    if (request.method === 'POST' && action === 'enable') {
+      const r = await enableShare(decodeURIComponent(token));
+      if (r && r.error) return json({ error: r.error }, 404);
+      return json({ ok: true, shares: await listShares(env) });
+    }
   }
 
   // GET / POST /__api/node-tag -> 节点备注的国家标注开关与样式
@@ -688,6 +799,7 @@ ${themeScript}
     <button type="button" class="tab" data-tab="preferred">优选 IP</button>
     <button type="button" class="tab" data-tab="security">伪装与安全</button>
     <button type="button" class="tab" data-tab="theme">外观主题</button>
+    <button type="button" class="tab" data-tab="share">临时链接</button>
     <button type="button" class="tab" data-tab="config">配置</button>
   </nav>` : ''}
 
@@ -952,6 +1064,21 @@ ${authed ? `
 </div>` : ''}
 
   ${authed ? renderConfigPanels() : ''}
+
+  ${authed ? `
+  <div class="card" id="shareCard" data-pane="share">
+    <h2>站点临时访问链接</h2>
+    <div class="hint" style="margin:-8px 0 8px;">给某个站点开一条到期自动作废的短链，适合「发给别人看一眼」。开关、链接前缀与默认天数在「配置 → 站点临时访问链接」里。</div>
+    <div class="row" style="margin-top:0;">
+      <select id="shSite" style="flex:1;min-width:150px;"><option value="">选择站点…</option></select>
+      <input type="number" id="shDays" placeholder="天数" min="1" style="width:88px;">
+      <input type="number" id="shHits" placeholder="次数 0=不限" min="0" style="width:130px;">
+      <input type="text" id="shNote" placeholder="备注（可选）" style="flex:1;min-width:130px;">
+      <button type="button" id="shCreate">生成链接</button>
+    </div>
+    <div class="msg" id="shMsg" style="min-height:18px;"></div>
+    <div id="shList" style="margin-top:8px;"><div class="empty">加载中…</div></div>
+  </div>` : ''}
 
 <script>
 // 顶栏「外观」按钮：跳到主题分区，选主题在那一屏里做（不再三档循环 —— 主题多了循环点不过来）
@@ -1624,6 +1751,92 @@ if (ntEnabled) {
   };
 }
 ${CONFIG_JS}
+
+/* ===== 站点临时访问链接：列表 + 生成 + 停用 / 启用 + 删除 ===== */
+(function () {
+  var shSite = document.getElementById('shSite');
+  if (!shSite) return;
+  var shList = document.getElementById('shList');
+  var shMsg = document.getElementById('shMsg');
+
+  function fmtLeft(s) {
+    if (s.disabled) return '已停用';
+    if (s.expired_by_time) return '已过期';
+    if (s.expired_by_hits) return '次数用尽';
+    return '还剩 ' + s.left_hours + ' 小时';
+  }
+  function esc(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
+  }
+  function render(list) {
+    if (!list.length) { shList.innerHTML = '<div class="empty">还没有临时链接</div>'; return; }
+    shList.innerHTML = list.map(function (s) {
+      var hits = (s.hits || 0) + (s.max_hits > 0 ? ' / ' + s.max_hits : ' 次');
+      return '<div class="site" data-token="' + esc(s.token) + '">'
+        + '<div class="site-head"><span class="site-name">' + esc(s.note || '临时链接')
+        + ' <span class="tag">' + esc(s.site) + '</span> <span class="tag">' + fmtLeft(s) + '</span></span></div>'
+        + '<div class="site-target">' + esc(s.path) + '　访问 ' + hits + '</div>'
+        + '<div class="site-actions">'
+        + '<button type="button" class="mini" data-act="copy">复制链接</button>'
+        + (s.disabled ? '<button type="button" class="mini" data-act="enable">启用</button>'
+                      : '<button type="button" class="mini" data-act="revoke">停用</button>')
+        + '<button type="button" class="danger mini" data-act="del">删除</button>'
+        + '</div></div>';
+    }).join('');
+  }
+  function loadShares() {
+    return api('/__api/shares').then(function (r) { render(r.shares || []); });
+  }
+  function loadSites() {
+    return api('/__api/sites').then(function (r) {
+      var sites = (r && r.sites) || [];
+      shSite.innerHTML = '<option value="">选择站点…</option>'
+        + sites.map(function (s) { return '<option value="' + esc(s.id) + '">' + esc(s.name || s.id) + '</option>'; }).join('');
+    });
+  }
+  shList.addEventListener('click', function (e) {
+    var btn = e.target.closest('button[data-act]');
+    if (!btn) return;
+    var row = e.target.closest('.site');
+    var token = row.getAttribute('data-token');
+    var act = btn.getAttribute('data-act');
+    if (act === 'copy') {
+      var p = row.querySelector('.site-target').textContent.trim().split(/\s/)[0];
+      var full = location.origin + p;
+      if (navigator.clipboard) navigator.clipboard.writeText(full);
+      setMsg('shMsg', '已复制：' + full, false);
+      return;
+    }
+    var call = act === 'del'
+      ? api('/__api/shares/' + encodeURIComponent(token), { method: 'DELETE' })
+      : api('/__api/shares/' + encodeURIComponent(token) + '/' + act, { method: 'POST', body: JSON.stringify({}) });
+    call.then(function (r) {
+      setMsg('shMsg', r && r.error ? r.error : '已更新', !!r && !!r.error);
+      render(r.shares || []);
+    }).catch(function (err) { setMsg('shMsg', String(err && err.message || err), true); });
+  });
+  document.getElementById('shCreate').onclick = function () {
+    var site = shSite.value;
+    if (!site) { setMsg('shMsg', '请先选择站点', true); return; }
+    api('/__api/shares', {
+      method: 'POST',
+      body: JSON.stringify({
+        site: site,
+        days: document.getElementById('shDays').value,
+        max_hits: document.getElementById('shHits').value,
+        note: document.getElementById('shNote').value,
+      }),
+    }).then(function (r) {
+      if (r && r.error) { setMsg('shMsg', r.error, true); return; }
+      setMsg('shMsg', '已生成：' + location.origin + r.path, false);
+      loadShares();
+    }).catch(function (e) { setMsg('shMsg', String(e && e.message || e), true); });
+  };
+  loadSites();
+  loadShares();
+})();
 </script>
 </body>
 </html>`;

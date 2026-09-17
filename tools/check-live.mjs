@@ -178,6 +178,63 @@ async function main() {
   const stats = await getJson('/__api/stats?days=7');
   assert('统计数据可读', stats.status === 200, `实际 ${stats.status}`);
 
+  section('限流与防滥用');
+  const rl0 = await getJson('/__api/ratelimit');
+  assert('限流配置可读', rl0.status === 200 && !!rl0.data, `实际 ${rl0.status}`);
+  const rlOn = await req('/__api/ratelimit', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ enabled: true, window_seconds: 60, max_requests: 2, scope: 'ip', exempt_authed: true }),
+  });
+  assert('开启限流 200', rlOn.status === 200, `实际 ${rlOn.status}`);
+  const hits = [];
+  for (let i = 0; i < 4; i++) {
+    const r = await req('/__api/sites');
+    hits.push(r.status);
+  }
+  assert('超阈值后返回 429', hits.some(s => s === 429), `状态码 ${hits.join(',')}`);
+  const bans = await getJson('/__api/ratelimit/bans');
+  assert('封禁列表可读', bans.status === 200, `实际 ${bans.status}`);
+  const rlOff = await req('/__api/ratelimit', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ enabled: false }),
+  });
+  assert('关闭限流（恢复原状）', rlOff.status === 200, `实际 ${rlOff.status}`);
+
+  section('告警通知');
+  const al = await getJson('/__api/alert');
+  assert('告警配置可读', al.status === 200 && !!al.data, `实际 ${al.status}`);
+  assert('告警配置含事件清单', Array.isArray(al.data && al.data.events) && al.data.events.length > 0, '没有返回事件清单');
+  assert('敏感项已脱敏', al.data && al.data.config && !('webhook_url' in al.data.config), JSON.stringify(al.data && al.data.config).slice(0, 80));
+  const alTest = await req('/__api/alert/test', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+  assert('测试告警接口 200', alTest.status === 200, `实际 ${alTest.status}`);
+  const alRecent = await getJson('/__api/alert/recent');
+  assert('发送记录可读', alRecent.status === 200, `实际 ${alRecent.status}`);
+
+  section('站点临时访问链接');
+  const sc = await getJson('/__api/share-config');
+  assert('分享配置可读', sc.status === 200 && !!sc.data, `实际 ${sc.status}`);
+  const sl = await getJson('/__api/shares');
+  assert('分享列表可读', sl.status === 200 && Array.isArray(sl.data && sl.data.shares), `实际 ${sl.status}`);
+  const sites = await getJson('/__api/sites');
+  const first = (sites.data && sites.data.sites && sites.data.sites[0]) || null;
+  if (first) {
+    const mk = await req('/__api/shares', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ site: first.id, days: 1, max_hits: 0, note: '线上自检' }),
+    });
+    const mkData = await mk.clone().json().catch(() => null);
+    assert('可创建临时链接', mk.status === 200 && mkData && mkData.path, `实际 ${mk.status}`);
+    if (mkData && mkData.share) {
+      const rm = await req(`/__api/shares/${encodeURIComponent(mkData.share.token)}`, { method: 'DELETE' });
+      assert('可删除临时链接', rm.status === 200, `实际 ${rm.status}`);
+    }
+  } else {
+    console.log('    · 该实例没有站点，跳过创建临时链接');
+  }
+
   section('恢复默认');
   const restore = await req('/__api/themes', {
     method: 'POST',
