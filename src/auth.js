@@ -3,6 +3,10 @@ import { MD5MD5 } from '../vendor/vless.js';
 import { runtime } from './runtime.js';
 // 伪装模块只用到「清除进门标记」，直接内联该 cookie 名规则，避免 auth <-> disguise 互相依赖
 import { expiredGateCookie } from './disguise.js';
+import {
+  listThemes, themeCss, baseVarsCss, applyScript, rotatingTheme, rotatePool,
+} from './themes.js';
+import { notify as notifyAlert } from './alert.js';
 
 // 统一口令的登录态：主页 / 管理页共用一份 Cookie
 
@@ -33,6 +37,11 @@ async function handleLogin(request, env) {
     h.append('Set-Cookie', `auth=${await MD5MD5(ua + key + runtime.PASSWORD)}; Path=/; Max-Age=86400; HttpOnly; SameSite=Lax${secure}`);
     return new Response(JSON.stringify({ ok: true }), { status: 200, headers: h });
   }
+  // 口令错误：按订阅的事件发一条告警（撞口令是最值得知道的事）。
+  // 只上报来源 IP 与 UA，不回传被尝试的口令。
+  const ip = String(request.headers.get('CF-Connecting-IP') || '').trim();
+  const ua = String(request.headers.get('User-Agent') || '').slice(0, 120);
+  await notifyAlert(env, 'login_fail', `来源 IP：${ip || '未知'}\n客户端：${ua || '未知'}`);
   return json({ error: '密码错误' }, 401);
 }
 
@@ -45,33 +54,53 @@ function handleLogout(cfg) {
   return new Response(JSON.stringify({ ok: true }), { status: 200, headers: h });
 }
 
+// 伪装入口用的一套中性配色：它属于「给别人看的门面」，跟着管理面板换肤反而更像后台。
+// 正常入口则完全跟随站点主题，和管理页一致（见 themeSkin）。
+const LOGIN_NEUTRAL_VARS = `:root { --bg:#f4f6fb; --card:#ffffff; --line:#e2e8f0; --txt:#0f172a; --muted:#64748b; --accent:#2563eb; --accent-hover:#1d4ed8; --ok:#16a34a; --err:#dc2626; --input:#f1f5f9; --on-accent:#ffffff; --radius:14px; --radius-sm:10px; --radius-xs:8px; --shadow:0 1px 2px rgba(15,23,42,.04), 0 6px 18px rgba(15,23,42,.06); --ring:0 0 0 3px rgba(37,99,235,.18); --err-bg:rgba(220,38,38,.10); --hover:rgba(100,116,139,.06); }`;
+
+/**
+ * 登录页外观：变量表 + 首屏前生效的脚本，与管理页共用同一套主题配置。
+ * 主题清单为空（存储异常等）时 listThemes 仍会返回预设，因此这里不做额外兜底。
+ */
+async function themeSkin(env) {
+  const view = await listThemes(env);
+  const ids = view.themes.map(t => t.id);
+  // 轮换命中哪套由服务端按时间片算好，避免刷新两次换两套
+  const rotateId = rotatingTheme(view, ids);
+  const effective = rotateId || view.default_theme;
+  return {
+    attr: ` data-theme="${esc(effective)}"`,
+    vars: `${baseVarsCss()}\n  ${await themeCss(env)}`,
+    script: applyScript({ ...view, default_theme: effective }, ids, rotatePool(view, ids)),
+  };
+}
+
 /**
  * 登录页。
  * opts.plain = true（首页伪装开启时）：脱掉项目名称与功能描述，只保留口令输入框 ——
  * 否则陌生人只要猜到 /__login 就能确认「这是个代理面板」。
  * opts.plain 下的标题取伪装配置的站点标题（管理员自己的文案），不回落到任何内置品牌名。
  */
-function loginPage(opts = {}) {
+async function loginPage(opts = {}, env) {
   const plain = !!(opts && opts.plain);
   const brand = plain ? String((opts && opts.title) || '').trim() : 'Any-Proxy';
   const pageTitle = brand ? `登录 · ${esc(brand)}` : '登录';
   const h1 = brand ? esc(brand) : '进入';
   const sub = plain ? '请输入访问口令以继续' : '统一代理入口 · 多站反向代理 + 优选 IP 节点，一个域名全部搞定';
+  const skin = plain
+    ? { attr: '', vars: LOGIN_NEUTRAL_VARS, script: '' }
+    : await themeSkin(env);
   const html = `<!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="zh-CN"${skin.attr}>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>${pageTitle}</title>
   <style>
-  :root { --bg:#f4f6fb; --card:#ffffff; --line:#e2e8f0; --txt:#0f172a; --muted:#64748b; --accent:#2563eb; --accent-hover:#1d4ed8; --ok:#16a34a; --err:#dc2626; --input:#f1f5f9; --on-accent:#ffffff; --radius:14px; --radius-sm:10px; --radius-xs:8px; --shadow:0 1px 2px rgba(15,23,42,.04), 0 6px 18px rgba(15,23,42,.06); --ring:0 0 0 3px rgba(37,99,235,.18); --err-bg:rgba(220,38,38,.10); --hover:rgba(100,116,139,.06); }
-  :root[data-theme="dark"] { --bg:#0f172a; --card:#1e293b; --line:#334155; --txt:#e2e8f0; --muted:#94a3b8; --accent:#38bdf8; --accent-hover:#7dd3fc; --ok:#4ade80; --err:#f87171; --input:#0b1220; --on-accent:#06283d; --shadow:0 1px 2px rgba(0,0,0,.30), 0 8px 24px rgba(0,0,0,.35); --ring:0 0 0 3px rgba(56,189,248,.25); --err-bg:rgba(248,113,113,.12); --hover:rgba(148,163,184,.08); }
-  @media (prefers-color-scheme: dark) { :root[data-theme="auto"] { --bg:#0f172a; --card:#1e293b; --line:#334155; --txt:#e2e8f0; --muted:#94a3b8; --accent:#38bdf8; --accent-hover:#7dd3fc; --ok:#4ade80; --err:#f87171; --input:#0b1220; --on-accent:#06283d; --shadow:0 1px 2px rgba(0,0,0,.30), 0 8px 24px rgba(0,0,0,.35); --ring:0 0 0 3px rgba(56,189,248,.25); --err-bg:rgba(248,113,113,.12); --hover:rgba(148,163,184,.08); } }
+  ${skin.vars}
   * { box-sizing:border-box; }
   body { margin:0; font-family:-apple-system,"PingFang SC","Microsoft YaHei",system-ui,sans-serif; background:var(--bg); color:var(--txt); min-height:100vh; font-size:14px; line-height:1.6; -webkit-font-smoothing:antialiased; display:flex; align-items:center; justify-content:center; }
   .box { width:340px; max-width:92vw; background:var(--card); border:1px solid var(--line); border-radius:var(--radius); padding:28px 24px; position:relative; box-shadow:var(--shadow); }
-  #themeBtn { position:absolute; top:10px; right:10px; background:transparent; color:var(--muted); border:1px solid var(--line); padding:5px 10px; font-size:12px; border-radius:var(--radius-xs); margin:0; width:auto; cursor:pointer; transition:color .15s, border-color .15s, background .15s; }
-  #themeBtn:hover { color:var(--txt); border-color:var(--muted); background:var(--hover); }
   h1 { font-size:19px; margin:0 0 4px; letter-spacing:-.01em; }
   .sub { color:var(--muted); font-size:13px; margin:0 0 22px; line-height:1.6; }
   input { width:100%; padding:11px 12px; border-radius:var(--radius-sm); border:1px solid var(--line); background:var(--input); color:var(--txt); font-size:14px; outline:none; transition:border-color .15s, box-shadow .15s; }
@@ -85,10 +114,10 @@ function loginPage(opts = {}) {
   .msg { font-size:13px; margin-top:12px; min-height:18px; line-height:1.5; }
   .msg.err { color:var(--err); }
 </style>
+${skin.script}
 </head>
 <body>
 <div class="box">
-  <button type="button" id="themeBtn"></button>
   <h1>${h1}</h1>
   <div class="sub">${sub}</div>
   <input type="password" id="pw" placeholder="访问口令" autofocus>
@@ -96,18 +125,6 @@ function loginPage(opts = {}) {
   <div class="msg err" id="msg"></div>
 </div>
 <script>
-const THEMES = ['auto', 'light', 'dark'];
-const THEME_LABEL = { auto: '跟随系统', light: '亮色', dark: '暗色' };
-const saved = localStorage.getItem('ap_theme') || 'auto';
-document.documentElement.dataset.theme = saved;
-const themeBtn = document.getElementById('themeBtn');
-themeBtn.textContent = THEME_LABEL[saved];
-themeBtn.onclick = () => {
-  const next = THEMES[(THEMES.indexOf(document.documentElement.dataset.theme) + 1) % 3];
-  document.documentElement.dataset.theme = next;
-  localStorage.setItem('ap_theme', next);
-  themeBtn.textContent = THEME_LABEL[next];
-};
 const pw = document.getElementById('pw');
 const btn = document.getElementById('btn');
 const msg = document.getElementById('msg');

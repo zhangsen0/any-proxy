@@ -14,6 +14,45 @@ import {
   renderHome, renderNotFound, renderRobots, emptyFavicon,
 } from './disguise.js';
 import { subscriptionTaggingEnabled, styleFrom, tagSubscriptionResponse } from './nodetag.js';
+import { check as rateLimitCheck } from './ratelimit.js';
+import { readShareConfig, resolve as resolveShare } from './share.js';
+import { notify as notifyAlert } from './alert.js';
+
+/** 被限流 / 被封禁时的统一响应：状态码与文案都取自配置，不在这里写死 */
+function rateLimitedResponse(rl) {
+  const msg = (rl.cfg && rl.cfg.message) || '请求过于频繁，请稍后再试';
+  const h = { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' };
+  if (rl.retryAfter > 0) h['Retry-After'] = String(rl.retryAfter);
+  return new Response(msg, { status: 429, headers: h });
+}
+
+/**
+ * 临时访问链接：/<prefix>/<token>/<path> —— 命中且有效就按站点分发反代，
+ * 否则按「没这个东西」处理（与伪装口径一致，不泄漏 token 是否存在过）。
+ */
+async function dispatchShare(request, url, ctx, env, cfg) {
+  const prefix = String(cfg.path_prefix || '/s').replace(/\/+$/, '') + '/';
+  const rest = url.pathname.slice(prefix.length);
+  const token = rest.split('/')[0] || '';
+  const r = await resolveShare(env, token);
+  if (r.status === 'ok') {
+    const tail = rest.slice(token.length);
+    const sub = tail.startsWith('/') ? tail : (tail ? '/' + tail : '/');
+    const proxied = new URL(`/p/${encodeURIComponent(r.site)}${sub}${url.search}`, url.origin);
+    return await dispatchProxy(request, proxied, ctx, env);
+  }
+  // 过期 / 停用 / 不存在：提示文案统一，顺带按订阅的事件发一条告警
+  if (ctx && typeof ctx.waitUntil === 'function' && r.status === 'expired') {
+    ctx.waitUntil(notifyAlert(env, 'temp_link_expired', `有人访问了已失效的临时链接（${r.status}）`));
+  }
+  return friendlyError(
+    '链接不可用',
+    '这条临时链接已过期或已被停用，请联系发送者重新生成。',
+    '',
+    404,
+    isNavigation(request)
+  );
+}
 
 /** 给节点备注增强用的参数：统一收敛在这儿，两个订阅出口共用同一口径。 */
 function tagOpts(env, ctx) {
@@ -85,6 +124,27 @@ async function handleRequest(request, env, ctx) {
     });
   }
 
+  // ---- 站点临时访问链接：配置开启时才启用，前缀可配 ----
+  // 放在访客分档之前：临时链接本来就是给「没进过门的人」用的。
+  const shareCfg = await readShareConfig(env);
+  const sharePrefix = String(shareCfg.path_prefix || '/s').replace(/\/+$/, '') + '/';
+  if (shareCfg.enabled && path.startsWith(sharePrefix)) {
+    return await dispatchShare(request, url, ctx, env, shareCfg);
+  }
+
+  // ---- 限流与防滥用 ----
+  // WebSocket 一律不参与：代理客户端的长连接被 429 会直接断线，且很难从客户端日志定位。
+  const isWs = (request.headers.get('Upgrade') || '').toLowerCase() === 'websocket';
+  if (!isWs) {
+    const rl = await rateLimitCheck(env, request, { authed });
+    if (!rl.allowed) {
+      if (ctx && typeof ctx.waitUntil === 'function' && rl.reason === 'banned') {
+        ctx.waitUntil(notifyAlert(env, 'ratelimit_block', `来访者 ${rl.ip} 已被封禁 ${rl.retryAfter} 秒`));
+      }
+      return rateLimitedResponse(rl);
+    }
+  }
+
   // ---- 陌生人：只允许「一个普通网站该有的东西」，其余一律伪装 404 ----
   if (stranger) {
     if (path === '/favicon.ico') return emptyFavicon();
@@ -97,7 +157,7 @@ async function handleRequest(request, env, ctx) {
     // 登录 / 登出必须匿名可达：面板 401 后要跳登录页，Actions 自愈也靠它取 cookie
     if (path === '/__api/login') return handleLogin(request, env);
     if (path === '/__api/logout') return handleLogout(cfg);
-    if (path === '/__login') return loginPageResp(cfg, cloaked);
+    if (path === '/__login') return await loginPageResp(cfg, cloaked, env);
     return renderNotFound(cfg, request);
   }
 
@@ -178,7 +238,7 @@ async function handleRequest(request, env, ctx) {
   if (path === '/__login' || path === '/__api/login' || path === '/__api/logout') {
     if (request.method === 'POST' && path === '/__api/login') return handleLogin(request, env);
     if (path === '/__api/logout') return handleLogout(cfg);
-    return loginPageResp(cfg, cloaked);
+    return await loginPageResp(cfg, cloaked, env);
   }
 
   // 管理页 / 首页
@@ -292,8 +352,8 @@ async function dispatchProxy(request, url, ctx, env) {
  * 登录页：普通页面身份返回（面板 401 后跳转、Actions 自愈取 cookie 都经过这里）。
  * 伪装开启时脱掉品牌字样与项目名称，页面本身不泄漏任何身份信息。
  */
-function loginPageResp(cfg, cloaked) {
-  const resp = loginPage({ plain: !!cloaked, title: cloaked ? cfg.title : '' });
+async function loginPageResp(cfg, cloaked, env) {
+  const resp = await loginPage({ plain: !!cloaked, title: cloaked ? cfg.title : '' }, env);
   resp.headers.set('Cache-Control', 'no-store');
   return resp;
 }
