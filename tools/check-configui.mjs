@@ -106,7 +106,7 @@ section('2. 字段与模块 SPEC 对齐');
 // ===================== 3. 渲染覆盖：每一项都出现，且只出现一次 =====================
 section('3. 面板渲染覆盖');
 {
-  const { cards, tools, jumps } = splitCatalog();
+  const { cards, tools } = splitCatalog();
   const rendered = [];
   for (const { items } of cards) rendered.push(...items.map(i => i.id));
   rendered.push(...tools.map(i => i.id));
@@ -256,7 +256,7 @@ section('8. 目录内容进 HTML 必须转义');
 section('9. 前端脚本');
 {
   ok('脚本语法可解析', (() => { try { new Function(CONFIG_JS); return true; } catch (e) { return false; } })());
-  for (const marker of ['data-setting', 'data-tool', 'data-goto', 'data-key', 'switchPane']) {
+  for (const marker of ['data-setting', 'data-tool', 'data-act', 'data-key', 'data-state']) {
     ok('脚本覆盖 ' + marker, CONFIG_JS.includes(marker));
   }
   ok('脚本被注入到管理页', pageHtml.includes('cfg-switch-label'));
@@ -321,6 +321,18 @@ section('10. 布局度量一致（选项卡之间同宽）');
   ok('字段栅格用 --field-min 定列宽', grid.includes('--field-min'));
   ok('字段栅格用 --grid-gap 定间距', declOf(grid, 'gap') === 'var(--grid-gap)', declOf(grid, 'gap'));
 
+  // 站点页(.grid2) 与配置页(.cfg-grid) 必须共用同一套列公式（都走 --field-min 的 auto-fit），
+  // 这样无论窗口多宽两页字段宽度都一致；谁把某一页改回 1fr 1fr 会被这条断言抓到
+  const grid2Decl = declOf(cssRule(adminJs, '.grid2'), 'grid-template-columns');
+  const cfgGridDecl = declOf(grid, 'grid-template-columns');
+  const usesShared = s => /auto-fit/.test(s) && s.includes('--field-min');
+  ok('站点页与配置页栅格共用 --field-min 公式（防某页被改窄）',
+    usesShared(grid2Decl) && usesShared(cfgGridDecl),
+    `grid2: ${grid2Decl} | cfg-grid: ${cfgGridDecl}`);
+  const colsOf = decl => /auto-fit/.test(decl)
+    ? Math.floor((inner + gridGap) / (fieldMin + gridGap))
+    : ((decl.match(/1fr/g) || []).length || 1);
+
   ok('配置页文案行与卡片内容对齐',
     declOf(cssRule(CONFIG_CSS, '.cfg-lead'), 'padding') === '0 var(--card-pad)',
     declOf(cssRule(CONFIG_CSS, '.cfg-lead'), 'padding') || '(无)');
@@ -346,8 +358,8 @@ section('10. 布局度量一致（选项卡之间同宽）');
   const fieldMin = pxOf(expand(BASE_VARS['--field-min']));
   const gridGap = pxOf(expand(BASE_VARS['--grid-gap']));
   const inner = pageMax - 2 * pagePadX - 2 * cardPad;
-  const siteCols = (declOf(cssRule(adminJs, '.grid2'), 'grid-template-columns').match(/1fr/g) || []).length;
-  const cfgCols = Math.floor((inner + gridGap) / (fieldMin + gridGap));
+  const siteCols = colsOf(grid2Decl);
+  const cfgCols = colsOf(cfgGridDecl);
   ok('配置页字段列数与站点页一致', cfgCols === siteCols,
     `配置页 ${cfgCols} 列 / 站点页 ${siteCols} 列（卡片内容宽 ${inner}px）`);
   const colW = n => (inner - (n - 1) * gridGap) / n;

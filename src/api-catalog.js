@@ -343,17 +343,13 @@ export function placementOf(group, item) {
 export function splitCatalog(groups = API_CATALOG) {
   const cards = [];
   const tools = [];
-  const jumps = [];
   for (const g of groups) {
     const staying = g.items.filter(i => placementOf(g, i) === 'stay');
     const kept = g.items.filter(i => placementOf(g, i) === 'keep');
     if (staying.length) cards.push({ group: g, items: staying });
     for (const i of kept) tools.push({ ...i, groupName: g.name });
-    if (placementOf(g, g.items[0]) === 'jump') {
-      jumps.push({ id: g.id, name: g.name, desc: g.desc, tab: g.tab, tabName: TAB_LABELS[g.tab] || g.tab });
-    }
   }
-  return { cards, tools, jumps };
+  return { cards, tools };
 }
 
 export { STATS_SPEC, RATELIMIT_SPEC, ALERT_SPEC, SHARE_SPEC };

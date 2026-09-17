@@ -708,7 +708,9 @@ async function adminPage(authed, origin, env) {
   .card { background:var(--card); border:1px solid var(--line); border-radius:var(--radius); padding:var(--card-pad); margin-bottom:var(--sp-3); box-shadow:var(--shadow); transition:border-color .15s, box-shadow .15s; }
   .card > h2:first-child { margin-top:0; }
   .card h2 { font-size:15px; margin:0 0 var(--sp-3); font-weight:600; }
-  .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:0 var(--grid-gap); }
+  /* 站点/代理等页的栅格与配置页 .cfg-grid 用同一套列公式（都走 --field-min），
+     因此无论窗口多宽，各选项卡的字段宽度都一致 —— 不再出现「某个选项卡比别的窄」 */
+  .grid2 { display:grid; grid-template-columns:repeat(auto-fit, minmax(min(var(--field-min), 100%), 1fr)); gap:var(--grid-gap); }
   @media (max-width:560px){ .grid2{ grid-template-columns:1fr; gap:0; } }
   label { display:block; font-size:13px; color:var(--muted); margin:var(--sp-3) 0 6px; }
   input, textarea, select { width:100%; padding:10px 12px; border-radius:var(--radius-sm); border:1px solid var(--line); background:var(--input); color:var(--txt); font-size:14px; outline:none; transition:border-color .15s, box-shadow .15s, background .15s; }

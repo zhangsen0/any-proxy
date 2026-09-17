@@ -168,24 +168,13 @@ export function settingFormById(id, opts = {}) {
 
 // ===================== 配置页 =====================
 
-function jumpRowHtml(row) {
-  return `<div class="cfg-jump">
-    <div class="cfg-jump-text">
-      <b>${esc(row.name)}</b>
-      <span>${esc(row.desc || '')}</span>
-    </div>
-    <button type="button" class="mini" data-goto="${esc(row.tab)}">前往「${esc(row.tabName)}」</button>
-  </div>`;
-}
-
-/** 配置分区：设置卡 + 诊断工具 + 跳转索引。内容与顺序全部由目录决定 */
+/** 配置分区：设置卡 + 诊断工具。内容与顺序全部由目录决定 */
 function renderConfigPanels() {
-  const { cards, tools, jumps } = splitCatalog();
+  const { cards, tools } = splitCatalog();
   const parts = [];
 
   parts.push('<div class="cfg-lead">这里只放没有独立选项卡的设置项。'
-    + '已经有专属选项卡的功能（站点、优选 IP、伪装、主题、临时链接）只留入口，不再重复一份表单 —— '
-    + '同一份配置只在一个地方能改，避免两边口径打架。</div>');
+    + '其余功能（站点、优选 IP、伪装、主题、临时链接）各自有专属选项卡，用顶部标签切换即可。</div>');
 
   for (const { group, items } of cards) {
     const settings = items.filter(i => kindOf(i) === 'setting');
@@ -206,14 +195,6 @@ function renderConfigPanels() {
       <h2>诊断工具</h2>
       <div class="hint" style="margin:-8px 0 4px;">排查问题时才用得上，不参与日常配置。</div>
       ${tools.map(i => renderToolItem(i)).join('')}
-    </div>`);
-  }
-
-  if (jumps.length) {
-    parts.push(`<div class="card cfg-card" data-pane="config" data-group="__jump">
-      <h2>前往其它功能</h2>
-      <div class="hint" style="margin:-8px 0 4px;">这些功能各有专属选项卡，点进去即可。</div>
-      ${jumps.map(jumpRowHtml).join('')}
     </div>`);
   }
 
@@ -417,13 +398,6 @@ function configInit() {
     const btn = $('[data-act="run"]', tool);
     if (btn) btn.onclick = () => runTool(tool);
   });
-
-  $$('[data-goto]').forEach(btn => {
-    btn.onclick = () => {
-      const target = btn.getAttribute('data-goto');
-      if (typeof switchPane === 'function') switchPane(target);
-    };
-  });
 }
 
 const CONFIG_JS = `(${configInit.toString()})();`;
@@ -494,11 +468,6 @@ const CONFIG_CSS = `
   .cfg-tool-params { margin-top:var(--sp-2); }
   .cfg-result { margin-top:var(--sp-2); }
   .cfg-result pre { margin:0; max-height:260px; overflow:auto; background:var(--input); border:1px solid var(--line); border-radius:var(--radius-xs); padding:10px; font-family:var(--font-mono); font-size:11.5px; line-height:1.7; color:var(--txt); white-space:pre-wrap; word-break:break-all; }
-  .cfg-jump { display:flex; align-items:center; justify-content:space-between; gap:var(--sp-2); flex-wrap:wrap; padding:10px 0; }
-  .cfg-jump + .cfg-jump { border-top:1px solid var(--line); }
-  .cfg-jump-text { min-width:0; }
-  .cfg-jump-text b { font-size:13px; font-weight:600; }
-  .cfg-jump-text span { display:block; font-size:12px; color:var(--muted); line-height:1.7; margin-top:2px; }
 `;
 
 export { renderConfigPanels, CONFIG_JS, CONFIG_CSS, ADMIN_PATHS, AUTHED_PATHS, TAB_LABELS };
