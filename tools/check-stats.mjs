@@ -16,6 +16,7 @@ import { adminPage } from '../src/admin.js';
 import { flush } from '../src/stats.js';
 import { STATS_JS, renderStatsPane } from '../src/stats-ui.js';
 import { CONFIG_JS } from '../src/config-ui.js';
+import { VISIT_SCOPES, matchVisitScope, isAdminScope, scopeLabels } from '../src/scopes.js';
 
 const ORIGIN = 'https://proxy.example.com';
 const PASSWORD = 'dev';
@@ -53,17 +54,24 @@ globalThis.fetch = async () => new Response(UP_BODY, {
   headers: { 'content-type': 'text/html; charset=utf-8', 'content-length': String(Buffer.byteLength(UP_BODY)) },
 });
 
-/** 真实模拟一次请求：收集 waitUntil 的落盘任务并等它跑完，否则统计还在内存里没落盘 */
+/**
+ * 真实模拟一次请求：收集 waitUntil 的落盘任务并等它跑完，否则统计还在内存里没落盘。
+ *
+ * ⚠️ 顺序：必须**先读完 body，再等 waitUntil**。走流式计数的响应，那个 waitUntil
+ * Promise 要等响应体发完（flush）才会 settle —— 先 await waitUntil 就成了互相等待的
+ * 死锁。线上由运行时负责读 body，所以只有测试脚手架上会踩到这一点。
+ */
 async function visit(path, init = {}) {
   const pending = [];
   const ctx = { waitUntil: (p) => { pending.push(p); } };
   const headers = { ...(init.headers || {}) };
   if (init.body && !headers['Content-Type']) headers['Content-Type'] = 'application/json';
   const res = await worker.fetch(new Request(ORIGIN + path, { method: init.method || 'GET', headers, body: init.body }), env, ctx);
+  const text = await res.text();
   await Promise.all(pending.map(p => Promise.resolve(p).catch(() => {})));
   // 落盘可能还挂在下一轮 waitUntil（flush 内部再挂任务的情况），多等一拍
   await new Promise(r => setTimeout(r, 10));
-  return res;
+  return { status: res.status, text: async () => text };
 }
 
 async function apiGet(path, headers = {}) {
@@ -120,11 +128,22 @@ section('1. 请求出口的采集（曾经 record() 没有任何调用方）');
   ok('落盘内容不含原始 IP', !!raw && !raw.includes('203.0.113.9'), raw ? raw.slice(0, 90) : '(无)');
 }
 
-// ===================== 2. 流量口径：上游 chunked（无 Content-Length）也要数得出来 =====================
-section('2. 流量口径（上游 chunked 时不能永远是 0）');
+// ===================== 2. 流量口径 =====================
+section('2. 流量口径（Content-Length 与 chunked 两条路都要记上）');
 {
-  // 上游真实情况：Transfer-Encoding: chunked，响应头里没有 content-length，
-  // 只有在流发完才知道字节数。这里造一个分块流，验证「边发边数」确实回填了流量。
+  // 2a. 上游给了 Content-Length → record() 照响应头记，不必套流。
+  //     （反代文本响应会主动删掉 content-length，所以这条主要覆盖 JSON 与直通大文件。）
+  const d0 = (await apiGet('/__api/stats?days=7', { Cookie: COOKIE })).data || {};
+  const before = ((d0.series || []).find(s => s.scope === 'p:demo') || {}).bytes || 0;
+  await visit('/p/demo/d', { headers: VISITOR });
+  await flush(env);
+  const d1 = (await apiGet('/__api/stats?days=7', { Cookie: COOKIE })).data || {};
+  const after = ((d1.series || []).find(s => s.scope === 'p:demo') || {}).bytes || 0;
+  ok('普通反代响应的流量不为 0（面板上这一项曾经恒为 0 B）', after - before >= UP_BODY.length,
+    `本次 +${after - before} 字节，响应体 ${UP_BODY.length} 字节`);
+
+  // 2b. 上游 chunked（无 Content-Length）：只有在流发完才知道字节数，必须边发边数。
+  //     这正是反代 HTML 页面的真实形态 —— proxy.js 会删掉 content-length。
   const CHUNK = 'x'.repeat(500);
   globalThis.fetch = async () => new Response(new ReadableStream({
     start(c) {
@@ -145,13 +164,48 @@ section('2. 流量口径（上游 chunked 时不能永远是 0）');
   await new Promise(r => setTimeout(r, 10));
   await flush(env);
 
-  const d = (await apiGet('/__api/stats?days=7', { Cookie: COOKIE })).data || {};
-  const demo = (d.series || []).find(s => s.scope === 'p:demo');
+  const d2 = (await apiGet('/__api/stats?days=7', { Cookie: COOKIE })).data || {};
+  const demo = (d2.series || []).find(s => s.scope === 'p:demo');
   ok('无 Content-Length 的响应也记到了流量', !!demo && demo.bytes >= 1000, demo ? `bytes=${demo.bytes}` : '未找到 p:demo');
-  ok('请求数与流量不互相干扰', !!demo && demo.hits === 3, demo ? `hits=${demo.hits}` : '');
+  ok('请求数与流量不互相干扰', !!demo && demo.hits === 4, demo ? `hits=${demo.hits}` : '');
+
+  // 2c. ⭐ 登记时机：waitUntil 必须在**响应交出去之前**就登记。
+  //     Cloudflare 在 handler 返回后再调 ctx.waitUntil() 会直接丢弃（抛错），
+  //     而字节数只有流发完才有 —— 旧实现就是在流的 flush() 里才调，于是线上
+  //     请求数一切正常、流量永远 0。这里把「时机错了」变成红灯，而不是线上那种静默丢数据。
+  mem.set('site:demo2', JSON.stringify({
+    id: 'demo2', name: '二号码头', host: '127.0.0.1', target: 'http://127.0.0.1', scheme: 'http',
+  }));
+  const CHUNK2 = 'y'.repeat(250);
+  globalThis.fetch = async () => new Response(new ReadableStream({
+    start(c) { c.enqueue(new TextEncoder().encode(CHUNK2)); c.close(); },
+  }), { status: 200, headers: { 'content-type': 'text/html; charset=utf-8' } });
+
+  const registered = [];
+  let returned = false;
+  const timingCtx = {
+    waitUntil(p) {
+      if (returned) throw new Error('waitUntil 在响应发出之后才调用（运行时不会等它）');
+      registered.push(p);
+    },
+  };
+  const res2 = await worker.fetch(new Request(ORIGIN + '/p/demo2/x', { headers: VISITOR }), env, timingCtx);
+  ok('响应返回前就已经登记了流量统计', registered.length >= 2, `已登记 ${registered.length} 个任务`);
+  returned = true;               // 之后一切 waitUntil 都视为非法，和运行时一致
+  await res2.text();             // 流发完；旧实现恰在这一刻才去登记
+  await Promise.all(registered.map(p => Promise.resolve(p).catch(() => {})));
+  await flush(env);
+
+  const d3 = (await apiGet('/__api/stats?days=7', { Cookie: COOKIE })).data || {};
+  const demo2 = (d3.series || []).find(s => s.scope === 'p:demo2');
+  ok('「响应后才登记」的约束下 chunked 流量仍然记上了', !!demo2 && demo2.bytes === 250,
+    demo2 ? `bytes=${demo2.bytes}（期望 250）` : '未找到 p:demo2');
 
   // 恢复成常规假源站
-  globalThis.fetch = async () => new Response('ok', { status: 200, headers: { 'content-type': 'text/html' } });
+  globalThis.fetch = async () => new Response(UP_BODY, {
+    status: 200,
+    headers: { 'content-type': 'text/html; charset=utf-8', 'content-length': String(Buffer.byteLength(UP_BODY)) },
+  });
 }
 
 // ===================== 3. record_admin 打开后管理通道计入 =====================
@@ -165,8 +219,30 @@ section('3. record_admin 语义（面板自己的访问单独控制）');
   ok('打开后管理通道被计入', !!admin && admin.hits >= 1, admin ? `hits=${admin.hits}` : '未出现');
 }
 
+// ===================== 4. 总量口径：不能被 top_limit 截断 =====================
+section('4. 总量口径（totals 曾经取的是「榜内之和」，榜外通道被悄悄扣掉）');
+{
+  // top_limit 只该影响「排行显示几条」，不该影响总量：
+  // daily 从不截断，所以「总量 == 按天之和」是必须成立的硬约束。
+  await apiPost('/__api/stats-config', { enabled: true, record_admin: false, top_limit: 1 });
+  const d = (await apiGet('/__api/stats?days=7', { Cookie: COOKIE })).data || {};
+  const dailyHits = (d.daily || []).reduce((a, x) => a + x.hits, 0);
+  const dailyBytes = (d.daily || []).reduce((a, x) => a + x.bytes, 0);
+  const dailyErrors = (d.daily || []).reduce((a, x) => a + x.errors, 0);
+
+  ok('top_limit=1 时排行确实只剩 1 条', (d.series || []).length === 1, `series=${(d.series || []).length}`);
+  ok('总请求数与按天汇总一致（榜外通道没被扣掉）', d.totals && d.totals.hits === dailyHits,
+    `totals=${d.totals && d.totals.hits} daily=${dailyHits}`);
+  ok('总流量与按天汇总一致', d.totals && d.totals.bytes === dailyBytes,
+    `totals=${d.totals && d.totals.bytes} daily=${dailyBytes}`);
+  ok('错误数与按天汇总一致', d.totals && d.totals.errors === dailyErrors,
+    `totals=${d.totals && d.totals.errors} daily=${dailyErrors}`);
+
+  await apiPost('/__api/stats-config', { top_limit: 10 });
+}
+
 // ===================== 4. 关闭统计后停止记录 =====================
-section('3. 关闭后不再记录（但已有数据保留）');
+section('5. 关闭后不再记录（但已有数据保留）');
 {
   // 一并关掉 record_admin：否则「读取统计」这一步自身也会被计入，把断言搅浑
   await apiPost('/__api/stats-config', { enabled: false, record_admin: false });
@@ -182,7 +258,7 @@ section('3. 关闭后不再记录（但已有数据保留）');
 }
 
 // ===================== 5. 汇总口径 =====================
-section('4. 汇总口径（日期补齐 / 保留天数上限）');
+section('6. 汇总口径（日期补齐 / 保留天数上限）');
 {
   // 直接种两天的桶：验证「某个通道缺某天时补 0」而不是把日期拉直
   const y1 = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
@@ -206,7 +282,7 @@ section('4. 汇总口径（日期补齐 / 保留天数上限）');
 }
 
 // ===================== 6. 清空 =====================
-section('5. 清空数据（保留配置）');
+section('7. 清空数据（保留配置）');
 {
   const r = await apiPost('/__api/stats/clear', {});
   ok('清空返回成功并报出删除条数', r.status === 200 && r.data && r.data.ok === true && r.data.removed >= 3,
@@ -217,8 +293,8 @@ section('5. 清空数据（保留配置）');
   ok('清空只删数据，不动配置', !!d.retention_days, `retention=${d.retention_days}`);
 }
 
-// ===================== 7. 驾驶舱渲染与脚本 =====================
-section('6. 驾驶舱页面与注入脚本');
+// ===================== 8. 驾驶舱渲染与脚本 =====================
+section('8. 驾驶舱页面与注入脚本');
 {
   const html = await (await adminPage(true, ORIGIN, env)).text();
   ok('驾驶舱卡片挂在 stats 选项卡上', /data-pane="stats"/.test(html));
@@ -247,6 +323,125 @@ section('6. 驾驶舱页面与注入脚本');
   }
   ok('驾驶舱脚本与配置页脚本共存（页面同时注入）', html.includes('cfg-switch-label') && html.includes('__statsEnsure'));
   ok('配置页脚本同样带兜底', CONFIG_JS.startsWith('var __name='));
+
+  // ⭐ 把 STATS_JS 丢进一个「只有浏览器全局」的裸沙盒真跑一遍。
+  //    注入出去的脚本会被 toString() 带走，闭包里只剩它自己声明的东西：
+  //    一旦引用了本模块 import 进来的任何标识符（比如从 util.js 来的 esc），
+  //    浏览器里就是 ReferenceError，整块排行渲染不出来。
+  //    而源码里 esc「明明存在」，所以查字符串的自检永远是绿的 —— 只有真跑才抓得到。
+  const freshEl = () => ({
+    innerHTML: '', textContent: '', hidden: false, className: '', style: {},
+    disabled: false, value: '', onclick: null,
+    addEventListener() {}, appendChild() {}, contains: () => true,
+    getAttribute: () => null, setAttribute() {},
+    classList: { toggle() {}, add() {}, remove() {} },
+    querySelectorAll: () => [], querySelector: () => null,
+  });
+  const nodes = new Map();
+  // getElementById('stRank') 与 querySelector('#stRank') 必须落到同一个节点，
+  // 否则断言会读到一个谁也写不到的空壳（脚本里两种取法都有用）
+  const nodeOf = sel => { const k = String(sel).replace(/^#/, ''); if (!nodes.has(k)) nodes.set(k, freshEl()); return nodes.get(k); };
+  const sandboxDoc = {
+    getElementById: nodeOf,
+    querySelector: nodeOf,
+    querySelectorAll: () => [],
+    body: { contains: () => true },
+    addEventListener() {},
+  };
+  const payload = {
+    ok: true, enabled: true, days: 7, retention_days: 30, top_limit: 10,
+    dates: [today],
+    daily: [{ date: today, hits: 9, bytes: 1536, errors: 1 }],
+    totals: { hits: 9, bytes: 1536, errors: 1, uv: 3 },
+    series: [{
+      scope: 'p:demo', hits: 9, bytes: 1536, errors: 1, uv: 3,
+      days: [{ date: today, hits: 9, bytes: 1536, errors: 1, uv: 0 }],
+    }],
+  };
+  const fakeApi = (path) => Promise.resolve(
+    path.includes('/sites') ? { data: { sites: [{ id: 'demo', name: '演示站' }] } } : { data: payload });
+
+  let sandboxErr = '';
+  try {
+    new Function('document', 'window', 'api', STATS_JS)(sandboxDoc, {}, fakeApi);
+  } catch (e) { sandboxErr = String(e && e.message || e); }
+  ok('脚本在裸沙盒里能跑起来（没有引用模块级变量）', !sandboxErr, sandboxErr);
+  // 数据是异步来的，放一拍再断言
+  await new Promise(r => setTimeout(r, 30));
+  ok('KPI 区渲染出了数字', /\d/.test(nodeOf('#stKpis').innerHTML), nodeOf('#stKpis').innerHTML.slice(0, 60) || '(空)');
+  ok('通道排行渲染出了内容（esc 之类闭包变量缺失会整块空白）',
+    /st-row-name/.test(nodeOf('#stRank').innerHTML) && nodeOf('#stRank').innerHTML.includes('演示站'),
+    nodeOf('#stRank').innerHTML.slice(0, 90) || '(空)');
+  ok('渲染异常没有被显示成「读取失败」', !/读取失败/.test(nodeOf('#stAlert').textContent || ''),
+    nodeOf('#stAlert').textContent || '(无报错)');
+  ok('更新时间戳被写上（render 跑到底了）', /更新于/.test(nodeOf('#stUpdated').textContent || ''),
+    nodeOf('#stUpdated').textContent || '(空)');
+}
+
+// ===================== 9. 通道登记表 =====================
+section('9. 通道登记表（路径 / 中文名 / 是否管理通道只有一处真源）');
+{
+  // 这张表同时喂三个地方：入口认路径、统计判管理通道、驾驶舱显示中文名。
+  // 所以「加一个通道」必须只改 scopes.js 一处 —— 下面这些用例就是钉住这件事。
+  const cases = [
+    ['/p/uhdnow/', 'p:uhdnow'],
+    ['/p/uhdnow/a/b', 'p:uhdnow'],
+    ['/p/', ''],
+    ['/s/abc123', 'share'],
+    ['/tsub', 'tsub'],
+    ['/tsub/xyz', 'tsub'],
+    ['/sub', 'sub'],
+    ['/sub/x', 'sub'],
+    ['/edt', 'edt'],
+    ['/admin', 'edt-admin'],
+    ['/__admin', 'admin'],
+    ['/__tsub', 'admin'],
+    ['/__api/stats', 'admin'],
+    ['/__login', 'login'],
+    ['/login', 'login'],
+    // 噪声与边界：前缀匹配不能吃掉同前缀的其它路径
+    ['/', ''],
+    ['/robots.txt', ''],
+    ['/favicon.ico', ''],
+    ['/administrator', ''],
+    ['/pdan', ''],
+  ];
+  for (const [path, want] of cases) {
+    const got = matchVisitScope(path);
+    ok(`路径 ${path} → ${want || '（不计入）'}`, got === want, got || '（空）');
+  }
+
+  ok('管理通道由登记表判定（stats.js 不再自带一份名单）',
+    isAdminScope('admin') && isAdminScope('login') && isAdminScope('edt-admin') && isAdminScope('__x') === false,
+    `admin=${isAdminScope('admin')} login=${isAdminScope('login')} edt-admin=${isAdminScope('edt-admin')}`);
+  ok('动态通道按基名判管理属性', isAdminScope('p:uhdnow') === false && isAdminScope('edt-admin:9') === true);
+
+  const labels = scopeLabels();
+  ok('每个通道都有中文名', VISIT_SCOPES.length > 0 && VISIT_SCOPES.every(s => !!s.label && labels[s.id] === s.label),
+    VISIT_SCOPES.map(s => s.id).join(','));
+  ok('中文名表是注入的纯数据（前端没有另抄一份映射）',
+    VISIT_SCOPES.every(s => STATS_JS.includes(`"${s.id}":"${s.label}"`)),
+    JSON.stringify(labels).slice(0, 120));
+  // 前端拿到的是数据，所以「改名」只改 scopes.js，不用碰脚本里的分支
+  ok('注入的标签表可直接被脚本读取', /var SCOPE_LABELS=\{/.test(STATS_JS));
+}
+
+// ===================== 10. 驾驶舱的可配置项 =====================
+section('10. 驾驶舱可配置项（天数档位 / 指标都是数据表驱动，不在两处各写一份）');
+{
+  const pane = renderStatsPane();
+  const days = [...pane.matchAll(/data-days="(\d+)"/g)].map(m => Number(m[1]));
+  ok('天数档位由档位表生成且升序', days.length >= 2 && days.every((d, i, a) => i === 0 || a[i - 1] < d), days.join(','));
+  ok('默认档位标在第一个按钮上', /data-days="\d+" class="active"/.test(pane));
+
+  const opts = [...pane.matchAll(/<option value="([a-z]+)"[^>]*>([^<]+)</g)].map(m => m[1]);
+  ok('指标下拉由指标表生成', opts.length >= 2 && opts[0] === 'hits', opts.join(','));
+  ok('指标表也以数据形式注入了脚本', /var STATS_METRICS=\[/.test(STATS_JS));
+  // 页面上的选项与注入脚本里的表必须是同一份，否则会出现「能选但画不出来」
+  const injected = JSON.parse((STATS_JS.match(/var STATS_METRICS=(\[[\s\S]*?\]);/) || [])[1] || '[]');
+  ok('页面下拉与注入的指标表一致',
+    injected.length === opts.length && injected.every(m => opts.includes(m.key) && !!m.fmt),
+    JSON.stringify(injected.map(m => m.key + ':' + m.fmt)));
 }
 
 console.log(`\n=== ${fail === 0 ? '全部通过' : '存在失败'} ===`);

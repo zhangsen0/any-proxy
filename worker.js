@@ -15,6 +15,7 @@
  *   src/auth.js    登录 / 登出 / 登录页
  *   src/dns.js     优选 IP 与 DNS 自动更新
  *   src/stats.js   访问统计（内存聚合 + 批量落盘）
+ *   src/scopes.js  访问通道登记表（路径 → 通道 / 中文名 / 是否管理通道）
  *   src/util.js    无依赖小工具
  *   vendor/vless.js  第三方 edgetunnel 代理引擎（VLESS / Trojan / SS）
  */
@@ -23,25 +24,10 @@ import { handleRequest } from './src/router.js';
 import { scheduledDnsCheck } from './src/dns.js';
 import { readConfig, isActive, renderNotFound } from './src/disguise.js';
 import { record as recordVisit, recordBytes } from './src/stats.js';
+import { matchVisitScope } from './src/scopes.js';
 
-/**
- * 请求路径 -> 统计通道。放在入口而不是路由内部：路由里分支太多，
- * 每加一个出口就要记得补一次统计，漏一个就是「某个通道的数据永远为空」。
- * 返回空字符串表示不计入（伪装页、favicon、robots 这类噪声）。
- */
-function visitScope(pathname) {
-  const p = String(pathname || '');
-  let m = /^\/p\/([^/]+)/.exec(p);
-  if (m) return 'p:' + decodeURIComponent(m[1]);
-  if (/^\/s\/[^/]+/.test(p)) return 'share';
-  if (p === '/tsub' || p.startsWith('/tsub/')) return 'tsub';
-  if (p === '/sub' || p.startsWith('/sub/')) return 'sub';
-  if (p === '/edt' || p.startsWith('/edt/')) return 'edt';
-  if (p === '/admin' || p.startsWith('/admin/')) return 'edt-admin';
-  if (p === '/__admin' || p === '/__tsub' || p.startsWith('/__api')) return 'admin';
-  if (p === '/__login' || p === '/login') return 'login';
-  return '';
-}
+/** WebSocket 升级响应没有正常响应体，不能套流计数 */
+const WS_SWITCHING_PROTOCOLS = 101;
 
 /**
  * 响应没有 Content-Length 时（上游 chunked 很常见）边发边数真实字节数。
@@ -50,18 +36,32 @@ function visitScope(pathname) {
  */
 function countResponseBytes(response, scope, env, ctx) {
   if (!response || !response.body) return response;
+  if (response.status === WS_SWITCHING_PROTOCOLS) return response;
+  // 有 Content-Length 的：record() 已经照响应头记过字节数，这里直接放行（省掉一层流）
   if (response.headers.get('content-length')) return response;
+
   let total = 0;
+  let settle = null;
+  const finished = new Promise(resolve => { settle = resolve; });
+
+  // ⚠️ waitUntil 必须在**请求还活着的时候**登记。字节数要等流发完才有，而那时请求
+  // 上下文早已结束，再调 ctx.waitUntil() 会被运行时丢掉、异常又被下面吞掉，症状就是
+  // 「请求数一切正常、流量永远是 0 B」——旧实现就是在 flush() 里才调，线上正是这个病。
+  // 所以先用一个 Promise 占位登记（此刻 ctx 还在），流结束时再把它 resolve 掉。
+  if (ctx && typeof ctx.waitUntil === 'function') {
+    try {
+      ctx.waitUntil(finished.then(n => recordBytes({ scope, bytes: n, env })));
+    } catch { /* 统计永不阻塞请求 */ }
+  }
+
   const counter = new TransformStream({
     transform(chunk, ctrl) {
       total += chunk && chunk.byteLength ? chunk.byteLength : 0;
       ctrl.enqueue(chunk);
     },
-    flush() {
-      // 202 等状态码、以及 101（WebSocket）没有正常响应体，这里自然被上面的判断挡掉
-      try { recordBytes({ scope, bytes: total, env, ctx }); } catch {}
-    },
+    flush() { if (settle) settle(total); },
   });
+
   return new Response(response.body.pipeThrough(counter), {
     status: response.status,
     statusText: response.statusText,
@@ -76,7 +76,7 @@ export default {
       let response = await handleRequest(request, env, ctx);
       // 统计永不阻塞、永不抛：record 内部把落盘挂到 waitUntil，异常就地吞掉
       try {
-        const scope = visitScope(new URL(request.url).pathname);
+        const scope = matchVisitScope(new URL(request.url).pathname);
         if (scope) {
           recordVisit({
             scope,

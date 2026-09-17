@@ -13,16 +13,60 @@
  *
  * 前端脚本与 config-ui.js 同一个套路：写成真实函数再 toString() 注入，
  * 因此同样需要 prefix __name 兜底（--keep-names 会把内部箭头函数改写成 __name(...)）。
+ *
+ * 第 3 条纪律（踩过坑）：**注入出去的那个函数必须自给自足**。它只能引用自己内部声明的
+ * 变量和浏览器全局（document / window / api 等），引用本模块 import 进来的任何东西
+ * （哪怕是 esc 这种小工具）在浏览器里都会是 ReferenceError —— 而且渲染期才炸，
+ * 静态断言「HTML 里含某字符串」完全抓不到。
  */
-
-import { esc } from './util.js';
 import { settingFormById, renderToolItem, KEEP_NAMES_SHIM } from './config-ui.js';
 import { flatCatalog } from './api-catalog.js';
+import { scopeLabels } from './scopes.js';
+
+/**
+ * 可回看的天数档位。**单一来源**：按钮由它生成，脚本的默认档位也从渲染出来的
+ * `.active` 按钮上读回来，所以「加一档 90 天」只在这里加一个数字，不用同步改两处。
+ */
+const STATS_RANGES = [7, 14, 30];
+const STATS_DEFAULT_RANGE = STATS_RANGES[0];
+
+/**
+ * 每日趋势图可切换的指标。同样是**单一来源**：下拉选项由它生成，每个指标用哪种
+ * 格式化（`int` 千分位 / `bytes` 自动单位）也由它给出，脚本只按 key 查表。
+ * 想加一个维度（例如「独立访客」）就在这里加一行，前后端都不用改分支。
+ */
+const STATS_METRICS = [
+  { key: 'hits', label: '请求数', fmt: 'int' },
+  { key: 'bytes', label: '流量', fmt: 'bytes' },
+  { key: 'errors', label: '错误数', fmt: 'int' },
+];
+
+/**
+ * 两份纯数据表，序列化后注入前端脚本。
+ * 必须是数据而不是函数：脚本是 toString() 过去的，闭包里没有本模块的任何东西
+ * （详见文件头第 3 条纪律），所以映射关系只能以数据形式带过去。
+ */
+const SCOPE_LABELS_JSON = JSON.stringify(scopeLabels());
+const STATS_METRICS_JSON = JSON.stringify(STATS_METRICS);
 
 /** 目录项渲染（原始 JSON 与清空数据）——路径与文案只在目录里写一次 */
 function toolById(id) {
   const item = flatCatalog().find(i => i.id === id);
   return item ? renderToolItem(item) : '';
+}
+
+/** 天数档位按钮：档位表改了这里自动跟着变 */
+function rangeButtons() {
+  return STATS_RANGES.map(days =>
+    `<button type="button" data-days="${days}"${days === STATS_DEFAULT_RANGE ? ' class="active"' : ''}>近 ${days} 天</button>`
+  ).join('');
+}
+
+/** 指标下拉：选项来自 STATS_METRICS，默认取第一项 */
+function metricOptions() {
+  return STATS_METRICS.map((m, i) =>
+    `<option value="${m.key}"${i === 0 ? ' selected' : ''}>${m.label}</option>`
+  ).join('');
 }
 
 /**
@@ -35,11 +79,7 @@ function dashboardCard() {
     <div class="hint" style="margin:-8px 0 var(--sp-3);">按天汇总全站访问：请求数、流量、来访者与错误。数据只存在你自己的存储里，来访者以「IP + 安装级盐值」的哈希记录，原始 IP 不落盘。</div>
 
     <div class="st-bar">
-      <div class="st-seg" id="stDays">
-        <button type="button" data-days="7" class="active">近 7 天</button>
-        <button type="button" data-days="14">近 14 天</button>
-        <button type="button" data-days="30">近 30 天</button>
-      </div>
+      <div class="st-seg" id="stDays">${rangeButtons()}</div>
       <div class="st-bar-right">
         <span class="st-stamp" id="stUpdated"></span>
         <button type="button" class="mini" id="stRefresh">刷新</button>
@@ -53,11 +93,7 @@ function dashboardCard() {
     <div class="st-block">
       <div class="st-block-head">
         <b>每日趋势</b>
-        <select id="stMetric" class="st-metric">
-          <option value="hits">请求数</option>
-          <option value="bytes">流量</option>
-          <option value="errors">错误数</option>
-        </select>
+        <select id="stMetric" class="st-metric">${metricOptions()}</select>
       </div>
       <div class="st-chart" id="stChart"></div>
       <div class="st-axis" id="stAxis"></div>
@@ -97,11 +133,18 @@ function statsInit() {
   if (!card) return;
 
   var $ = function (sel) { return document.querySelector(sel); };
-  var days = 7;
-  var metric = 'hits';
+  // 默认档位不在脚本里写死：从服务端渲染出来的 .active 按钮上读回来，
+  // 这样「默认看几天」只有 STATS_RANGES 一处真源
+  var defaultBtn = $('#stDays button.active');
+  var days = (defaultBtn && Number(defaultBtn.getAttribute('data-days'))) || 7;
+  // 指标与格式化方式同样来自注入的数据表，脚本里不写死任何一项
+  var metric = STATS_METRICS[0].key;
+  var metricFmts = {};
+  STATS_METRICS.forEach(function (m) { metricFmts[m.key] = m.fmt; });
   var loaded = false;
   var loading = false;
   var sites = {};
+  var last = null;   // 最近一次拿到的聚合结果，站点名回来后就地重画，不必再打一次接口
 
   function fmtInt(n) {
     n = Number(n) || 0;
@@ -115,22 +158,26 @@ function statsInit() {
     do { n = n / 1024; i++; } while (n >= 1024 && i < u.length - 1);
     return (n >= 100 ? n.toFixed(0) : n.toFixed(1)) + ' ' + u[i];
   }
-  function fmtMetric(v, m) { return m === 'bytes' ? fmtBytes(v) : fmtInt(v); }
+  // 按数据表声明的 fmt 挑格式化函数：加指标不用动这里
+  function fmtMetric(v, m) { return metricFmts[m] === 'bytes' ? fmtBytes(v) : fmtInt(v); }
+  // ⚠️ esc 必须定义在 statsInit **内部**：这个函数会被 toString() 注入浏览器，
+  // 闭包里只有它自己声明的变量。从 util.js import 的模块级 esc 在浏览器里根本不存在，
+  // 一用就是 ReferenceError，整块排行渲染不出来（面板上表现为一条红色报错 + 空列表）。
+  function esc(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
+  }
+  // 通道 -> 人话。名字表来自 scopes.js 的登记表（SCOPE_LABELS 是注入进来的纯数据），
+  // 动态通道（p:<站点id>）额外补上站点名，比光看 id 有用
   function scopeName(scope) {
-    if (scope.indexOf('p:') === 0) {
-      var id = scope.slice(2);
-      return '站点 · ' + (sites[id] || id);
-    }
-    var map = {
-      edt: '代理节点（VLESS）',
-      'edt-admin': '代理面板',
-      sub: '主订阅',
-      tsub: '临时订阅',
-      admin: '管理面板',
-      login: '登录页',
-      share: '站点临时链接',
-    };
-    return map[scope] || scope;
+    var s = String(scope || '');
+    var sep = s.indexOf(':');
+    var base = sep < 0 ? s : s.slice(0, sep);
+    var suffix = sep < 0 ? '' : s.slice(sep + 1);
+    var label = SCOPE_LABELS[base] || s;
+    if (suffix) label += ' · ' + (sites[suffix] || suffix);
+    return label;
   }
   function setAlert(text, cls) {
     var el = $('#stAlert');
@@ -233,6 +280,7 @@ function statsInit() {
     } else {
       setAlert('');
     }
+    last = d;
     renderKpis(d);
     renderChart(d);
     renderRank(d);
@@ -296,15 +344,19 @@ function statsInit() {
   };
   if (card.style.display !== 'none') load();
 
-  // 站点 id -> 名称，仅用于把「p:xxx」显示成人话；失败就退回显示 id
+  // 站点 id -> 名称，仅用于把「p:xxx」显示成人话；失败就退回显示 id。
+  // 拿到后**就地重画排行**即可，别在这里 load()：首屏那次请求多半还在飞，
+  // 会被 loading 守卫挡掉，结果是站点名要等用户手动点「刷新」才出现。
   api('/__api/sites').then(function (r) {
     var list = (r && r.data && r.data.sites) || [];
     list.forEach(function (s) { sites[s.id] = s.name || s.id; });
-    if (loaded) load();
+    if (last) renderRank(last);
   }).catch(function () {});
 }
 
-const STATS_JS = `${KEEP_NAMES_SHIM}(${statsInit.toString()})();`;
+// 两张纯数据表以 var 形式注入，排在构造器之前：它们落在同一个 script 作用域里，
+// statsInit 直接当全局读。顺序不能反 —— 脚本一执行就会读它们。
+const STATS_JS = `${KEEP_NAMES_SHIM}var SCOPE_LABELS=${SCOPE_LABELS_JSON};var STATS_METRICS=${STATS_METRICS_JSON};(${statsInit.toString()})();`;
 
 // ===================== 样式 =====================
 

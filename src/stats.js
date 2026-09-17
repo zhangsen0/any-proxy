@@ -12,6 +12,7 @@
 
 import { runtime } from './runtime.js';
 import { readSection, writeSection } from './config.js';
+import { isAdminScope } from './scopes.js';
 
 const SECTION = 'stats';
 const KEY_PREFIX = 'stat:';
@@ -69,15 +70,13 @@ export { SPEC as STATS_SPEC };
 // ===================== 对外：记录一次访问 =====================
 
 /**
- * 管理类通道：面板与登录页自己的访问。它们只有开 record_admin 时才计入 ——
+ * 管理侧通道：面板与登录页自己的访问。它们只有开 record_admin 时才计入 ——
  * 否则「我自己看面板」会把访客统计搅浑（统计的用来看谁来用站点，不是用来看自己）。
+ *
+ * 判定口径不在这里：哪些通道算管理侧由 src/scopes.js 的登记表统一给出，
+ * 免得这里再抄一份、加通道时两边不一致。
  */
-const ADMIN_SCOPES = ['admin', 'login', 'edt-admin'];
-
-/** 通道识别：路由层按路径判定 scope，判定口径集中在这里，避免两处各写一份 */
-export function isAdminScope(scope) {
-  return ADMIN_SCOPES.indexOf(String(scope)) >= 0;
-}
+export { isAdminScope };
 
 /** 桶里的累加动作集中在这里：hits / bytes / errors / 来访者都只有这一个入口 */
 function bump(scope, delta) {
@@ -142,16 +141,26 @@ export function record({ scope, response, ip, env, ctx, failed }) {
  * 只累加流量。用于响应没有 Content-Length 的情况（上游 chunked 很常见）——
  * 那种响应只有在流发完才知道有多少字节，所以由调用方在流结束时回填，
  * 与 hits 分开记：万一流没结束，丢的只是字节数，请求数不会跟着丢。
+ *
+ * ⚠️ 这里刻意**不**接 ctx：字节数是在响应流发完之后才拿到的，那时请求已经结束，
+ * 再调 ctx.waitUntil() 会被运行时直接丢掉（异常还被下面的 catch 吞掉），
+ * 表现就是「请求数有、流量永远是 0」。所以调用方必须在请求还活着的时候就把
+ * 「等流结束 → 记账」这条链登记进 waitUntil，这里只负责 await 完成。
+ * 返回的 Promise 必须被调用方 await（否则 isolate 可能提前回收，落盘丢失）。
  */
-export function recordBytes({ scope, bytes, env, ctx }) {
+export async function recordBytes({ scope, bytes, env }) {
   const n = Number(bytes) || 0;
-  if (!scope || n <= 0) return;
-  schedulePersist(env, ctx, async () => {
+  if (!scope || n <= 0) return false;
+  try {
     const cfg = await readStatsConfig(env);
     if (!allowed(scope, cfg)) return false;
     bump(scope, { bytes: n });
+    const due = Date.now() - lastFlush >= (cfg.flush_ms || SPEC.flush_ms.default);
+    if (due) await flush(env);
     return true;
-  });
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -329,7 +338,21 @@ export async function summarize(env, days) {
     daily.set(date, day);
   }
 
-  const series = [...perScope.values()]
+  const allScopes = [...perScope.values()];
+
+  // 总量必须按「全部通道」求和，绝不能拿 top_limit 截断后的 series 去加：
+  // 否则榜外通道的请求/流量/错误会被悄悄扣掉，出现「总流量 0 B 但趋势图里有柱子」
+  // 这种自相矛盾的画面（趋势图读的是 daily，它不截断）。uv 同理，只是它本来就是上界。
+  const totals = allScopes.reduce((a, s) => ({
+    hits: a.hits + s.hits,
+    bytes: a.bytes + s.bytes,
+    errors: a.errors + s.errors,
+    // 跨通道去重做不到（不同通道的哈希集合互不相干），这里给出的是各通道 uv 之和的上界
+    uv: a.uv + s.uv,
+  }), { hits: 0, bytes: 0, errors: 0, uv: 0 });
+
+  const series = allScopes
+    .slice()
     .sort((a, b) => b.hits - a.hits)
     .slice(0, Number(cfg.top_limit || SPEC.top_limit.default))
     .map(s => {
@@ -351,13 +374,7 @@ export async function summarize(env, days) {
     dates: sortedDates,
     daily: sortedDates.map(d => daily.get(d) || { date: d, hits: 0, bytes: 0, errors: 0 }),
     series,
-    totals: {
-      hits: series.reduce((a, s) => a + s.hits, 0),
-      bytes: series.reduce((a, s) => a + s.bytes, 0),
-      errors: series.reduce((a, s) => a + s.errors, 0),
-      // 跨通道去重做不到（不同通道的哈希集合互不相干），这里给出的是各通道 uv 之和的上界
-      uv: series.reduce((a, s) => a + s.uv, 0),
-    },
+    totals,
   };
 }
 
