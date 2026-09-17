@@ -222,6 +222,16 @@ async function proxyRequest(request, site, crossHost, ctx, env) {
     });
   } catch {}
 
+  // Emby 系媒体服务同时认 URL 的 api_key 与 X-Emby-Token 请求头两种鉴权；
+  // 播放器的媒体栈（AVPlayer / ExoPlayer 等）发起的子请求经常只带 URL 上的
+  // api_key 而丢掉了请求头，部分源站（尤其魔改 Emby）只认请求头。
+  // URL 里已有 api_key 而客户端没带 X-Emby-Token 时补成请求头，两套鉴权
+  // 都满足，不针对任何站点。
+  const embyApiKey = url.searchParams.get('api_key');
+  if (embyApiKey && !headers.has('X-Emby-Token')) {
+    headers.set('X-Emby-Token', embyApiKey);
+  }
+
   // 强制上游返回未压缩明文：避免 br/deflate 等编码在读取 body 后与响应头不一致。
   // 内容若被改写，body 已解压，头上的 content-encoding 会变成谎言（浏览器按压缩去解明文 → 全部资源解析失败）。
   headers.set('Accept-Encoding', 'identity');
@@ -289,6 +299,22 @@ async function proxyRequest(request, site, crossHost, ctx, env) {
           newLoc = mapAbsoluteUrl(lu.toString(), site, sitePrefix, base);
         }
       } catch {}
+      // 源站把请求重定向到站内路径时经常丢弃原请求的鉴权参数
+      // （Emby 的图片重定向 /Items/{id}/Images/Primary -> /img/i/poster/{id}.jpg
+      // 就不带 api_key），客户端跟进时若不带鉴权头，资源就 404 ——
+      // 首页海报全裂、体感「加载缓慢」。把 api_key 保留到同一站点内的重定向
+      // 目标上（绝不带到 __x 跨域目标，避免令牌泄漏给第三方域名）。
+      try {
+        const nlu = new URL(newLoc, url.origin);
+        if (
+          !nlu.searchParams.has('api_key') &&
+          url.searchParams.has('api_key') &&
+          newLoc.startsWith(sitePrefix + '/') &&
+          !newLoc.startsWith(sitePrefix + CROSS_PREFIX)
+        ) {
+          newLoc += (nlu.search ? '&' : '?') + 'api_key=' + encodeURIComponent(url.searchParams.get('api_key'));
+        }
+      } catch {}
       const h = new Headers(upstream.headers);
       rewriteSetCookies(h, upstream, base.prefix);
       h.set('Location', newLoc);
@@ -336,6 +362,12 @@ async function proxyRequest(request, site, crossHost, ctx, env) {
     // 内容寻址资源（文件名里带 hash 指纹）：内容一变文件名必变，可放长缓存。
     // 命中即用浏览器缓存，重复访问不再回源、不再走一遍 Worker 重写。
     headersOut.set('Cache-Control', 'public, max-age=31536000, immutable');
+  } else if (upstream.status === 206 || /^(?:video|audio)\//.test(ct)) {
+    // 分片响应与音视频流：保持源站缓存头，不叠加客户端缓存。
+    //   - 206 是部分字节，缓存语义必须由源站的 Content-Range 决定；强加 1 小时
+    //     缓存会让部分播放器 seek 时把新旧分片拼错（画面花/卡、流量正常却播不好）；
+    //   - 音视频多为鉴权内容（URL 带 api_key/token），标 public 等于把私有内容
+    //     宣称为可公开缓存，既不安全也会让校验鉴权的 CDN 拒绝后续分片。
   } else if (upstream.status >= 200 && upstream.status < 300) {
     // 静态资源允许缓存，但覆盖源站的 immutable/超长 max-age：
     // 一旦改写结果有问题，坏内容会被浏览器锁死一年无法恢复，短缓存 + SWR 兼顾速度与安全

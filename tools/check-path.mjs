@@ -92,5 +92,122 @@ console.log('\n[4] 跨域通道同样归一');
   check('跨域通道双斜杠归一', seen === 'https://cdn.example/play/video/abc', seen);
 }
 
+/**
+ * 跑一次 proxyRequest，捕获发送给上游的 URL 与请求头（X-Emby-Token 兜底断言用）。
+ */
+async function captureUpstream(pathname, extraHeaders = {}) {
+  let seen = null;
+  globalThis.fetch = async (u, init) => {
+    seen = { url: String(u), headers: new Headers((init && init.headers) || {}) };
+    return new Response('body', {
+      status: 200,
+      headers: { 'content-type': 'application/octet-stream', 'content-length': '4' },
+    });
+  };
+  const req = new Request(`https://proxy.example${pathname}`, { method: 'GET', headers: extraHeaders });
+  try { await proxyRequest(req, site, null, null, {}); } catch {}
+  return seen;
+}
+
+/**
+ * 跑一次 proxyRequest，让上游返回 301 重定向，返回代理改写后的 Location。
+ */
+async function captureRedirect(pathname, location, extraHeaders = {}) {
+  let out = null;
+  globalThis.fetch = async () => {
+    return new Response(null, {
+      status: 301,
+      headers: { 'content-type': 'application/octet-stream', location },
+    });
+  };
+  const req = new Request(`https://proxy.example${pathname}`, { method: 'GET', headers: extraHeaders });
+  try {
+    const res = await proxyRequest(req, site, null, null, {});
+    out = res ? res.headers.get('Location') : null;
+  } catch {}
+  return out;
+}
+
+console.log('\n[5] Emby 鉴权兜底：URL 带 api_key 时补 X-Emby-Token 请求头');
+{
+  const s = await captureUpstream('/p/demo/play/video/abc?api_key=token123');
+  check('上游请求带 X-Emby-Token', s && s.headers.get('X-Emby-Token') === 'token123',
+    s ? s.headers.get('X-Emby-Token') : 'no-request');
+}
+{
+  const s = await captureUpstream('/p/demo/play/video/abc?api_key=token123',
+    { 'X-Emby-Token': 'client-token' });
+  check('客户端已带请求头时不覆盖', s && s.headers.get('X-Emby-Token') === 'client-token',
+    s ? s.headers.get('X-Emby-Token') : 'no-request');
+}
+{
+  const s = await captureUpstream('/p/demo/play/video/abc');
+  check('无 api_key 时不添加请求头', s && !s.headers.has('X-Emby-Token'));
+}
+
+console.log('\n[6] 站内重定向保留 api_key（Emby 图片 301 丢参现场）');
+{
+  const loc = await captureRedirect('/p/demo/Items/m1/Images/Primary?api_key=token123', '/img/i/poster/m1.jpg');
+  check('站内重定向补回 api_key', loc === '/p/demo/img/i/poster/m1.jpg?api_key=token123', loc);
+}
+{
+  const loc = await captureRedirect('/p/demo/Items/m1/Images/Primary?api_key=token123', '/img/i/poster/m1.jpg?w=300');
+  check('目标已带查询串时用 & 拼接', loc === '/p/demo/img/i/poster/m1.jpg?w=300&api_key=token123', loc);
+}
+{
+  const loc = await captureRedirect('/p/demo/Items/m1/Images/Primary', '/img/i/poster/m1.jpg');
+  check('原请求无 api_key 时不添加', loc === '/p/demo/img/i/poster/m1.jpg', loc);
+}
+{
+  // 跨域重定向（__x）绝不携带令牌，避免泄漏给第三方域名
+  const loc = await captureRedirect('/p/demo/Items/m1/Images/Primary?api_key=token123',
+    'https://cdn.example/img/i/poster/m1.jpg');
+  check('跨域目标不携带 api_key', loc === '/p/demo/__x/cdn.example/img/i/poster/m1.jpg', loc);
+}
+
+console.log('\n[7] 媒体流不叠加客户端缓存（206 分片 / 音视频 200）');
+{
+  // 206 分片：源站无缓存头 -> 代理不得强加 public（否则播放器 seek 可能拼错字节）
+  let out = null;
+  globalThis.fetch = async () => new Response('bytes', {
+    status: 206,
+    headers: { 'content-type': 'video/mp4', 'content-range': 'bytes 0-1023/999999' },
+  });
+  const req = new Request('https://proxy.example/p/demo/videos/a/stream?api_key=t', { method: 'GET', headers: { range: 'bytes=0-1023' } });
+  try {
+    const res = await proxyRequest(req, site, null, null, {});
+    out = res ? res.headers.get('Cache-Control') : 'ERR';
+  } catch {}
+  check('206 分片不加 public 缓存头', out === null, String(out));
+}
+{
+  // 200 视频：源站标 private（鉴权内容）-> 不得被覆盖成 public
+  let out = null;
+  globalThis.fetch = async () => new Response('x', {
+    status: 200,
+    headers: { 'content-type': 'video/mp4', 'cache-control': 'private' },
+  });
+  const req = new Request('https://proxy.example/p/demo/videos/a/stream?api_key=t', { method: 'GET' });
+  try {
+    const res = await proxyRequest(req, site, null, null, {});
+    out = res ? res.headers.get('Cache-Control') : 'ERR';
+  } catch {}
+  check('鉴权视频保持源站 private', out === 'private', String(out));
+}
+{
+  // 普通静态资源（JS）仍可缓存 —— 原有行为不回归
+  let out = null;
+  globalThis.fetch = async () => new Response('x', {
+    status: 200,
+    headers: { 'content-type': 'application/javascript' },
+  });
+  const req = new Request('https://proxy.example/p/demo/app.js', { method: 'GET' });
+  try {
+    const res = await proxyRequest(req, site, null, null, {});
+    out = res ? res.headers.get('Cache-Control') : 'ERR';
+  } catch {}
+  check('JS 静态资源仍给短缓存', out === 'public, max-age=3600, stale-while-revalidate=86400', String(out));
+}
+
 console.log(`\n路径归一化自检：通过 ${pass}，失败 ${fail}\n`);
 if (fail) process.exit(1);
