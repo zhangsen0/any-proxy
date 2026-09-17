@@ -5,7 +5,13 @@ import { autoUpdatePreferredDns, filterUsableIps, applyDnsWithSelfCheck, proxyHo
 import { subscriptionUrl, fetchSubscriptionCandidates } from './subs.js';
 import * as tempsubs from './tempsubs.js';
 import { readConfig, saveConfig, sanitize, isActive, renderHome } from './disguise.js';
-import { readTagSettings, saveTagSettings } from './geoip.js';
+import {
+  readThemeConfig, saveThemeConfig, listThemes, upsertCustom, removeCustom,
+  themeCss, baseVarsCss, applyScript, THEME_STORAGE_KEY, DEFAULT_PRESET_ID,
+  rotatingTheme, rotatePool,
+} from './themes.js';
+import { readStatsConfig, saveStatsConfig, summarize, STATS_SPEC } from './stats.js';
+import { renderConfigPanels, CONFIG_JS } from './config-ui.js';
 
 // 站点管理：REST API + 服务端渲染的管理页
 
@@ -206,6 +212,67 @@ async function handleAdmin(request, url, env) {
       if (r && r.error) return json({ error: r.error }, 400);
       return json({ ok: true, config: r, active: isActive(r) });
     }
+  }
+
+  // ---- 主题：外观同产菲律宾统一由 src/themes.js 管理 ----
+  // 列表 + 默认主题（读写都需登录）：actors note 面板上有 10 套预设，也可自定义第 11 套。
+  if (path === '/__api/themes') {
+    if (request.method === 'GET') return json(await listThemes(env));
+    if (request.method === 'POST') {
+      let body;
+      try { body = await request.json(); } catch { return json({ error: 'invalid json' }, 400); }
+      const patch = {};
+      // 只接受认识的配置项：前端多传一个字段不该静默写进存储
+      for (const k of ['default_theme', 'rotate_mode', 'rotate_pool', 'rotate_ignore_choice']) {
+        if (body[k] !== undefined) patch[k] = String(body[k]).trim();
+      }
+      if (body.rotate_interval_minutes !== undefined) patch.rotate_interval_minutes = body.rotate_interval_minutes;
+      const r = await saveThemeConfig(env, patch);
+      if (r && r.error) return json({ error: r.error }, 400);
+      return json(await listThemes(env));
+    }
+  }
+
+  // ---- 自定义主题：新增 / 更新 / 删除（单独的 key，避免与整体配置互相覆盖） ----
+  if (path.startsWith('/__api/themes')) {
+    const sub = path.replace('/__api/themes', '');
+    if (sub === '/custom' && request.method === 'POST') {
+      let body;
+      try { body = await request.json(); } catch { return json({ error: 'invalid json' }, 400); }
+      const r = await upsertCustom(env, { id: body.id, name: body.name, vars: body.vars, extra: body.extra });
+      if (r && r.error) return json({ error: r.error }, 400);
+      return json({ ok: true, themes: (await listThemes(env)).themes });
+    }
+    if (sub.startsWith('/custom/') && request.method === 'DELETE') {
+      const id = decodeURIComponent(sub.slice('/custom/'.length));
+      const r = await removeCustom(env, id);
+      if (r && r.error) return json({ error: 'not found' }, 404);
+      return json({ ok: true, themes: (await listThemes(env)).themes });
+    }
+  }
+
+  // ---- 访问统计：开关与保留策略（开关注定影响所有请求的 Shirtidi Launch dimensions） ----
+  if (path === '/__api/stats-config') {
+    if (request.method === 'GET') {
+      return json({ ok: true, config: await readStatsConfig(env) });
+    }
+    if (request.method === 'POST') {
+      let body;
+      try { body = await request.json(); } catch { return json({ error: 'invalid json' }, 400); }
+      const patch = {};
+      // 只挑 SPEC 里认识的字段：前端多传一个字段不该写进存储，也不该默默改到别的配置
+      for (const k of Object.keys(STATS_SPEC)) {
+        if (body[k] !== undefined) patch[k] = body[k];
+      }
+      const r = await saveStatsConfig(env, patch);
+      if (r && r.error) return json({ error: r.error }, 400);
+      return json({ ok: true, config: r.values });
+    }
+  }
+
+  // ---- 访问统计数据：?days=N 指定天数（默认 7，上限为配置的保留天数） ----
+  if (request.method === 'GET' && path === '/__api/stats') {
+    return json(await summarize(env, url.searchParams.get('days')));
   }
 
   // GET / POST /__api/node-tag -> 节点备注的国家标注开关与样式
@@ -467,16 +534,53 @@ async function adminPage(authed, origin, env) {
     </div>`).join('')
       : `<div class="empty">${authed ? '还没有站点，先在上方添加一个。' : '还没有代理站点。'}</div>`;
   } catch {}
+  // 外观主题：可用清单、默认主题、配套 CSS 与「首屏防闪」脚本全部由 src/themes.js 给出，
+  // 这里只把色卡渲染成页面上的选择项。以后增删主题不需要改这个文件。
+  const themeView = await listThemes(env).catch(() => ({
+    themes: [],
+    default_theme: DEFAULT_PRESET_ID,
+    allow_switch: true,
+    allow_custom: true,
+    remember_user: true,
+    auto_dark_theme: '',
+  }));
+  const themeIds = themeView.themes.map(t => t.id);
+  // 轮换：interval 模式由服务端按时间片算出「这一刻该用哪套」（与地域无关，全球一致）；
+  // visit 模式服务端先随机一套，客户端脚本在每次加载时再抽一次（不写进存储，纯新鲜感）。
+  const rotateId = rotatingTheme(themeView, themeIds);
+  const effectiveTheme = rotateId || themeView.default_theme;
+  const themeScript = applyScript(
+    { ...themeView, default_theme: effectiveTheme },
+    themeIds,
+    rotatePool(themeView, themeIds)
+  );
+  // 「跟随系统」要落到具体主题 id 上：浅色用当前生效主题，深色用配置的夜间主题
+  const themePreview = {
+    lightId: effectiveTheme,
+    darkId: themeView.auto_dark_theme
+      || (themeView.themes.find(t => t.scheme === 'dark') || themeView.themes[0] || {}).id
+      || effectiveTheme,
+  };
+  const themeCards = themeView.themes.length
+    ? themeView.themes.map(t => `
+      <button type="button" class="theme-card${t.id === themeView.default_theme ? ' active' : ''}" data-theme-id="${esc(t.id)}" data-custom="${t.custom ? '1' : '0'}">
+        <span class="swatch" style="background:${esc(t.swatch.card)}">
+          <i style="background:${esc(t.swatch.bg)}"></i>
+          <i style="background:${esc(t.swatch.accent)}"></i>
+          <i style="background:${esc(t.swatch.txt)}"></i>
+        </span>
+        <span class="meta"><b>${esc(t.name)}</b><em>${esc(t.desc)}</em></span>
+      </button>`).join('')
+    : '<div class="empty">没有可用主题</div>';
   const html = `<!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="zh-CN" data-theme="${esc(effectiveTheme)}">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Any-Proxy · 统一代理管理</title>
   <style>
-  :root { --bg:#f4f6fb; --card:#ffffff; --line:#e2e8f0; --txt:#0f172a; --muted:#64748b; --accent:#2563eb; --accent-hover:#1d4ed8; --ok:#16a34a; --err:#dc2626; --input:#f1f5f9; --on-accent:#ffffff; --radius:14px; --radius-sm:10px; --radius-xs:8px; --shadow:0 1px 2px rgba(15,23,42,.04), 0 6px 18px rgba(15,23,42,.06); --ring:0 0 0 3px rgba(37,99,235,.18); --ok-bg:rgba(22,163,74,.10); --err-bg:rgba(220,38,38,.10); --hover:rgba(100,116,139,.06); --sp-1:8px; --sp-2:12px; --sp-3:16px; --sp-4:24px; }
-  :root[data-theme="dark"] { --bg:#0f172a; --card:#1e293b; --line:#334155; --txt:#e2e8f0; --muted:#94a3b8; --accent:#38bdf8; --accent-hover:#7dd3fc; --ok:#4ade80; --err:#f87171; --input:#0b1220; --on-accent:#06283d; --shadow:0 1px 2px rgba(0,0,0,.30), 0 8px 24px rgba(0,0,0,.35); --ring:0 0 0 3px rgba(56,189,248,.25); --ok-bg:rgba(74,222,128,.12); --err-bg:rgba(248,113,113,.12); --hover:rgba(148,163,184,.08); }
-  @media (prefers-color-scheme: dark) { :root[data-theme="auto"] { --bg:#0f172a; --card:#1e293b; --line:#334155; --txt:#e2e8f0; --muted:#94a3b8; --accent:#38bdf8; --accent-hover:#7dd3fc; --ok:#4ade80; --err:#f87171; --input:#0b1220; --on-accent:#06283d; --shadow:0 1px 2px rgba(0,0,0,.30), 0 8px 24px rgba(0,0,0,.35); --ring:0 0 0 3px rgba(56,189,248,.25); --ok-bg:rgba(74,222,128,.12); --err-bg:rgba(248,113,113,.12); --hover:rgba(148,163,184,.08); } }
+  ${baseVarsCss()}
+  ${await themeCss(env)}
   * { box-sizing:border-box; }
   html, body { -webkit-text-size-adjust:100%; }
   body { margin:0; font-family:-apple-system,"PingFang SC","Microsoft YaHei",system-ui,sans-serif; background:var(--bg); color:var(--txt); min-height:100vh; font-size:14px; line-height:1.6; -webkit-font-smoothing:antialiased; }
@@ -542,7 +646,25 @@ async function adminPage(authed, origin, env) {
 .tab:hover { background:transparent; color:var(--txt); transform:none; }
 .tab:active { transform:none; }
 .tab.active { background:var(--card); color:var(--txt); box-shadow:var(--shadow); }
+  /* 主题卡片：色卡 + 名称。间距沿用 --sp-*，跟着主题一起变密/变松 */
+  .theme-grid { display:grid; grid-template-columns:repeat(auto-fill, minmax(180px, 1fr)); gap:var(--sp-2); margin-top:var(--sp-3); }
+  .theme-card { display:flex; align-items:center; gap:10px; text-align:left; padding:10px 12px; background:var(--input); color:var(--txt); border:1px solid var(--line); border-radius:var(--radius-sm); cursor:pointer; font-weight:500; transition:border-color .15s, box-shadow .15s; }
+  .theme-card:hover { background:var(--hover); border-color:var(--muted); }
+  .theme-card.active { border-color:var(--accent); box-shadow:var(--ring); }
+  .theme-card .swatch { flex:none; display:flex; width:44px; height:26px; border-radius:6px; overflow:hidden; border:1px solid var(--line); }
+  .theme-card .swatch i { flex:1; }
+  .theme-card .meta { min-width:0; }
+  .theme-card .meta b { display:block; font-size:13px; font-weight:600; }
+  .theme-card .meta em { display:block; font-style:normal; font-size:11px; color:var(--muted); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .theme-rows { display:grid; grid-template-columns:1fr; gap:0; }
+  /* 配置分区：目录驱动的通用表单。每条接口一个块，参数即目录里声明的字段 */
+  .endpoint { border:1px solid var(--line); border-radius:var(--radius-sm); padding:var(--sp-2) var(--sp-3); margin-bottom:var(--sp-2); background:var(--card-2, var(--card)); }
+  .endpoint-head { display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin-bottom:4px; }
+  .endpoint-head b { font-size:14px; font-weight:600; }
+  .endpoint .row { margin-top:var(--sp-2); }
+  hr.sep { border:none; border-top:1px solid var(--line); margin:var(--sp-3) 0; }
 </style>
+${themeScript}
 </head>
 <body>
 <div class="wrap">
@@ -565,6 +687,8 @@ async function adminPage(authed, origin, env) {
     <button type="button" class="tab" data-tab="proxy">代理节点</button>
     <button type="button" class="tab" data-tab="preferred">优选 IP</button>
     <button type="button" class="tab" data-tab="security">伪装与安全</button>
+    <button type="button" class="tab" data-tab="theme">外观主题</button>
+    <button type="button" class="tab" data-tab="config">配置</button>
   </nav>` : ''}
 
   ${authed ? `
@@ -727,6 +851,56 @@ async function adminPage(authed, origin, env) {
     <div class="hint" style="margin-top:4px;">保存后 <b>当前浏览器</b> 会记住进门状态，所以根路径仍显示管理面板；用无痕窗口或清掉 Cookie 才能看到访客视角。</div>
   </div>
 
+  ${authed ? `
+  <div class="card" id="themeCard" data-pane="theme">
+    <h2>外观主题</h2>
+    <div class="hint" style="margin:-8px 0 0;">每套主题会整体替换配色、字体、圆角与阴影强度。当前选择只存在这台浏览器；要给别人也用这套，点「设为全站默认」。</div>
+    <div class="theme-grid" id="themeGrid">${themeCards}</div>
+    <div class="row">
+      <button type="button" id="themeAutoBtn" class="ghost">跟随系统</button>
+      <button type="button" id="themeDefaultBtn" class="ghost">设为全站默认</button>
+      <span class="hint" id="themeHint" style="margin:0;">全站默认：<span class="tag">${esc(themeView.default_theme)}</span>${themeView.rotating_theme ? `　轮换中：<span class="tag">${esc(themeView.rotating_theme)}</span>` : ''}</span>
+    </div>
+
+    <h2 style="margin:18px 0 0;">自动轮换</h2>
+    <div class="hint" style="margin:0 0 4px;">长期不换会审美疲劳：可以每次访问随机，或每隔一段时间整体换一套（同一时刻所有人看到的是同一套）。</div>
+    <label for="rtMode" style="margin-top:12px;">轮换方式</label>
+    <select id="rtMode">
+      ${(themeView.rotate_modes || []).map(m => `<option value="${esc(m.id)}"${m.id === themeView.rotate_mode ? ' selected' : ''}>${esc(m.label)} — ${esc(m.desc)}</option>`).join('')}
+    </select>
+    <label for="rtMinutes" style="margin-top:12px;">轮换间隔（分钟，「按时轮换」时生效）</label>
+    <input type="number" id="rtMinutes" min="1" max="10080" value="${esc(String(themeView.rotate_interval_minutes || 60))}" style="max-width:220px;">
+    <label for="rtPool" style="margin-top:12px;">参与轮换的主题（留空 = 全部）</label>
+    <input id="rtPool" placeholder="aurora nord terminal" value="${esc(String(themeView.rotate_pool || ''))}">
+    <div class="row">
+      <button type="button" id="rtSaveBtn">保存轮换设置</button>
+      <button type="button" id="rtRollBtn" class="ghost">立刻换一套</button>
+    </div>
+    <div class="msg" id="rtMsg"></div>
+    <div class="msg" id="themeMsg"></div>
+
+    <h2 style="margin:18px 0 0;">自定义主题</h2>
+    <div class="hint" style="margin:0 0 4px;">只填要覆盖的变量，其余自动继承（常用：主色 <span class="tag">--accent</span>、背景 <span class="tag">--bg</span>、卡片 <span class="tag">--card</span>、字体 <span class="tag">--font</span>、圆角 <span class="tag">--radius</span>）。</div>
+    <div class="grid2">
+      <div>
+        <label for="ctId" style="margin-top:12px;">标识（英文小写 / 数字 / 短横线）</label>
+        <input id="ctId" placeholder="mytheme">
+      </div>
+      <div>
+        <label for="ctName" style="margin-top:12px;">显示名称</label>
+        <input id="ctName" placeholder="我的主题">
+      </div>
+    </div>
+    <label for="ctVars" style="margin-top:12px;">CSS 变量（JSON 对象）</label>
+    <textarea id="ctVars" rows="5" placeholder='{"--accent":"#ff6600","--radius":"18px"}' style="font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;"></textarea>
+    <div class="row">
+      <button type="button" id="ctSaveBtn">保存为主题</button>
+    </div>
+    <div class="msg" id="ctMsg"></div>
+    ${themeView.themes.filter(t => t.custom).length ? `
+    <div class="hint" style="margin-top:6px;">已保存的自定义主题：${themeView.themes.filter(t => t.custom).map(t => `<span style="display:inline-flex;gap:6px;align-items:center;margin-right:10px;"><span class="tag">${esc(t.id)}</span><button type="button" class="danger mini" data-del-theme="${esc(t.id)}">删除</button></span>`).join('')}</div>` : ''}
+  </div>` : ''}
+
   <div class="card" id="nodeTagCard" data-pane="proxy">
     <h2>节点备注国家标注</h2>
     <div class="hint" style="margin:-8px 0 4px;">给订阅里的节点备注补上 IP 归属国家，例如 <span class="tag">CF 电信优选 | 美国【US】</span>。主订阅 <span class="tag">/sub</span> 与临时订阅 <span class="tag">/tsub/&lt;id&gt;</span> 都生效。</div>
@@ -777,20 +951,14 @@ ${authed ? `
   </div>
 </div>` : ''}
 
+  ${authed ? renderConfigPanels() : ''}
+
 <script>
-const THEMES = ['auto', 'light', 'dark'];
-const THEME_LABEL = { auto: '跟随系统', light: '亮色', dark: '暗色' };
-const savedTheme = localStorage.getItem('ap_theme') || 'auto';
-document.documentElement.dataset.theme = savedTheme;
+// 顶栏「外观」按钮：跳到主题分区，选主题在那一屏里做（不再三档循环 —— 主题多了循环点不过来）
 const themeBtn = document.getElementById('themeBtn');
 if (themeBtn) {
-  themeBtn.textContent = THEME_LABEL[savedTheme];
-  themeBtn.onclick = () => {
-    const next = THEMES[(THEMES.indexOf(document.documentElement.dataset.theme) + 1) % 3];
-    document.documentElement.dataset.theme = next;
-    localStorage.setItem('ap_theme', next);
-    themeBtn.textContent = THEME_LABEL[next];
-  };
+  themeBtn.textContent = '外观';
+  themeBtn.onclick = () => { if (typeof switchPane === 'function') switchPane('theme'); };
 }
 const AUTHED = ${authed ? 'true' : 'false'};
 const $ = s => document.querySelector(s);
@@ -1314,6 +1482,92 @@ if (addBtn) addBtn.addEventListener('click', async (e) => {
   }
   addBtn.disabled = false;
 });
+
+// ---- 外观主题：选主题 / 跟随系统 / 设为全站默认 / 自定义 ----
+const THEME_KEY = '${THEME_STORAGE_KEY}';
+function setTheme(id) {
+  document.documentElement.dataset.theme = id;
+  try { localStorage.setItem(THEME_KEY, id); } catch (e) {}
+  document.querySelectorAll('.theme-card').forEach(function (el) {
+    el.classList.toggle('active', el.getAttribute('data-theme-id') === id);
+  });
+}
+const themeGrid = document.getElementById('themeGrid');
+if (themeGrid) themeGrid.addEventListener('click', function (e) {
+  const card = e.target.closest('.theme-card');
+  if (!card) return;
+  setTheme(card.getAttribute('data-theme-id'));
+  setMsg('themeMsg', '已切换到「' + card.querySelector('.meta b').textContent + '」（仅本机生效）', false);
+});
+const themeAutoBtn = document.getElementById('themeAutoBtn');
+if (themeAutoBtn) themeAutoBtn.onclick = function () {
+  try { localStorage.setItem(THEME_KEY, 'auto'); } catch (e) {}
+  const dark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+  document.documentElement.dataset.theme = dark ? '${esc(themePreview.darkId)}' : '${esc(themePreview.lightId)}';
+  document.querySelectorAll('.theme-card').forEach(function (el) { el.classList.remove('active'); });
+  setMsg('themeMsg', '已跟随系统（深色用 ${esc(themePreview.darkId)}，浅色用 ${esc(themePreview.lightId)}）', false);
+};
+const themeDefaultBtn = document.getElementById('themeDefaultBtn');
+if (themeDefaultBtn) themeDefaultBtn.onclick = async function () {
+  const cur = document.documentElement.dataset.theme;
+  themeDefaultBtn.disabled = true;
+  try {
+    const r = await api('/__api/themes', { method: 'POST', body: JSON.stringify({ default_theme: cur }) });
+    setMsg('themeMsg', r.ok ? '已设为全站默认：' + cur : (r.data && r.data.error ? r.data.error : '保存失败'), !r.ok);
+  } catch (e) { setMsg('themeMsg', '请求失败：' + (e && e.message ? e.message : e), true); }
+  themeDefaultBtn.disabled = false;
+};
+const ctSaveBtn = document.getElementById('ctSaveBtn');
+if (ctSaveBtn) ctSaveBtn.onclick = async function () {
+  const id = document.getElementById('ctId').value.trim();
+  const name = document.getElementById('ctName').value.trim();
+  const raw = document.getElementById('ctVars').value.trim();
+  let vars = null;
+  try { vars = JSON.parse(raw); } catch (e) { setMsg('ctMsg', 'JSON 格式不对：' + (e && e.message ? e.message : e), true); return; }
+  if (!/^[a-z0-9][a-z0-9-]{0,23}$/.test(id)) { setMsg('ctMsg', '标识只能是小写字母 / 数字 / 短横线，最长 24 位', true); return; }
+  ctSaveBtn.disabled = true;
+  try {
+    const r = await api('/__api/themes/custom', { method: 'POST', body: JSON.stringify({ id: id, name: name, vars: vars }) });
+    if (r.ok) { setMsg('ctMsg', '已保存，正在刷新…', false); setTimeout(function () { location.reload(); }, 400); }
+    else setMsg('ctMsg', (r.data && r.data.error) ? r.data.error : '保存失败', true);
+  } catch (e) { setMsg('ctMsg', '请求失败：' + (e && e.message ? e.message : e), true); }
+  ctSaveBtn.disabled = false;
+};
+// ---- 自动轮换：设置保存 + 立刻换一套 ----
+const rtSaveBtn = document.getElementById('rtSaveBtn');
+if (rtSaveBtn) rtSaveBtn.onclick = async function () {
+  rtSaveBtn.disabled = true;
+  try {
+    const r = await api('/__api/themes', { method: 'POST', body: JSON.stringify({
+      rotate_mode: document.getElementById('rtMode').value,
+      rotate_interval_minutes: Number(document.getElementById('rtMinutes').value) || 60,
+      rotate_pool: document.getElementById('rtPool').value.trim(),
+    }) });
+    setMsg('rtMsg', r.ok ? '轮换设置已保存' : ((r.data && r.data.error) || '保存失败'), !r.ok);
+  } catch (e) { setMsg('rtMsg', '请求失败：' + (e && e.message ? e.message : e), true); }
+  rtSaveBtn.disabled = false;
+};
+const rtRollBtn = document.getElementById('rtRollBtn');
+if (rtRollBtn) rtRollBtn.onclick = function () {
+  const raw = document.getElementById('rtPool').value.trim().toLowerCase();
+  const want = raw ? raw.split(/[\s,;]+/).filter(Boolean) : [];
+  const all = [].map.call(document.querySelectorAll('.theme-card'), function (el) { return el.getAttribute('data-theme-id'); });
+  let pool = want.filter(function (id) { return all.indexOf(id) >= 0; });
+  if (!pool.length) pool = all;
+  if (!pool.length) { setMsg('rtMsg', '没有可用主题', true); return; }
+  setTheme(pool[Math.floor(Math.random() * pool.length)]);
+  setMsg('rtMsg', '已随机换一套（仅本机，刷新还会再换）', false);
+};
+document.querySelectorAll('[data-del-theme]').forEach(function (btn) {
+  btn.onclick = async function () {
+    const id = btn.getAttribute('data-del-theme');
+    btn.disabled = true;
+    try {
+      const r = await api('/__api/themes/custom/' + encodeURIComponent(id), { method: 'DELETE' });
+      if (r.ok) location.reload(); else setMsg('ctMsg', (r.data && r.data.error) ? r.data.error : '删除失败', true);
+    } catch (e) { setMsg('ctMsg', '请求失败', true); }
+  };
+});
 } catch (e) { console.error('admin init:', e); }
 ` : ''}
 
@@ -1369,6 +1623,7 @@ if (ntEnabled) {
     ntSaveBtn.disabled = false;
   };
 }
+${CONFIG_JS}
 </script>
 </body>
 </html>`;

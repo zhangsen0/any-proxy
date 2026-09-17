@@ -221,9 +221,14 @@ console.log('\n=== 7. 管理页渲染：配置卡片与绑定逻辑必须在同�
   const js = blocks.join('\n');
   ok('主页脚本含分区切换逻辑', js.includes('switchPane') && js.includes('paneTabs'));
   ok('主页脚本含标注保存逻辑', js.includes('/__api/node-tag'));
+  // 分区数量会随功能增加（外观主题 / 配置都是后来加的），所以这里不写死个数，
+  // 而是校验「标签与卡片一一对应」：每个标签都有卡片，且没有卡片挂在不存在标签上。
+  // 这样加分区不用改测试，加错了（漏放卡片 / 标签拼错）依然会被抓出来。
   const panes = [...html.matchAll(/data-pane="([a-z]+)"/g)].map(m => m[1]);
+  const tabs = [...html.matchAll(/data-tab="([a-z]+)"/g)].map(m => m[1]);
   const tally = panes.reduce((a, x) => (a[x] = (a[x] || 0) + 1, a), {});
-  ok('四个分区都有归属卡片', Object.keys(tally).length === 4, JSON.stringify(tally));
+  const tabSet = [...new Set(tabs)];
+  ok('标签与卡片一一对应', tabSet.length > 0 && tabSet.every(t => tally[t] >= 1) && Object.keys(tally).every(p => tabSet.includes(p)), `标签 ${JSON.stringify(tabSet)} / 卡片 ${JSON.stringify(tally)}`);
   ok('每屏都有卡片（无空标签）', Object.values(tally).every(n => n >= 1));
 }
 
