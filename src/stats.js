@@ -28,6 +28,15 @@ const SPEC = {
   record_admin: { type: 'bool', default: false, env: 'STATS_RECORD_ADMIN' },
 };
 
+/**
+ * 可回看的天数档位。**单一来源**：面板的天数按钮、驾驶舱脚本的默认档位、
+ * 服务端没拿到 days 参数时的回看天数，三处都从这里取。
+ * 加一档「90 天」只在这里加一个数字，前后端都不用跟着改。
+ */
+export const STATS_RANGES = [7, 14, 30];
+/** 默认档位：取第一档，避免「档位表改了、默认值还停在 7」 */
+export const DEFAULT_RANGE_DAYS = STATS_RANGES[0];
+
 async function visitorHash(ip, salt) { return await digest(`${salt}|${ip}`); }
 
 /** 安装级盐值的存储键：用于区分来访者，同时保证原始 IP 无法被反查 */
@@ -296,7 +305,7 @@ async function digest(text) {
  */
 export async function summarize(env, days) {
   const cfg = await readStatsConfig(env);
-  const wanted = Math.min(Math.max(Number(days) || 7, 1), Number(cfg.retention_days || 30));
+  const wanted = Math.min(Math.max(Number(days) || DEFAULT_RANGE_DAYS, 1), Number(cfg.retention_days || SPEC.retention_days.default));
   const since = bucketDate(Date.now() - (wanted - 1) * 86400000);
 
   let keys = [];

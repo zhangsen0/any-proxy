@@ -320,6 +320,26 @@ const SPEC = {
   rotate_ignore_choice: { type: 'bool', default: false, env: 'THEME_ROTATE_IGNORE_CHOICE' },
 };
 
+/**
+ * 取某个主题字段的约束（默认值 / 上下限）。**单一来源**：面板表单的
+ * `min` `max` `value` 与运行期的兜底值都从这里取，避免面板另抄一份
+ * 「1 ~ 10080、默认 60」——抄漏的那份不会报错，只会静默与 SCHEMA 走偏。
+ */
+export function themeFieldBounds(name) {
+  const s = SPEC[name] || {};
+  return { default: s.default, min: s.min, max: s.max };
+}
+
+/** 把任意输入夹到字段约束内；取不到值时用默认值 */
+export function clampThemeField(name, value) {
+  const b = themeFieldBounds(name);
+  const n = Number(value);
+  const v = Number.isFinite(n) && n !== 0 ? n : Number(b.default);
+  const lo = Number.isFinite(Number(b.min)) ? Number(b.min) : v;
+  const hi = Number.isFinite(Number(b.max)) ? Number(b.max) : v;
+  return Math.min(Math.max(v, lo), hi);
+}
+
 /** 轮换方式 -> 面板里的中文标签。UI 与服务端都从这里取，避免两处各写一份 */
 const ROTATE_MODES = [
   { id: 'off', label: '不轮换', desc: '固定使用默认主题' },
@@ -556,7 +576,8 @@ function pickRotate(cfg, availableIds, randomize) {
   const pool = resolvePool(cfg && cfg.rotate_pool, availableIds);
   if (!pool.length) return null;
   if (mode === 'visit' || randomize) return pool[Math.floor(Math.random() * pool.length)];
-  const minutes = Math.max(1, Number(cfg.rotate_interval_minutes) || 60);
+  // 间隔不在这里写死：走 SCHEMA 的默认值与上下限（原先这里还有一份「1 ~ 10080、默认 60」）
+  const minutes = clampThemeField('rotate_interval_minutes', cfg && cfg.rotate_interval_minutes);
   const slot = Math.floor(Date.now() / (minutes * 60000));
   return pool[slot % pool.length];
 }

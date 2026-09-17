@@ -34,13 +34,24 @@ let cachedTs = 0;
 
 // ===================== 取值工具 =====================
 
-/** 布尔：接受 true/false、'1'/'0'、'true'/'false'、'yes'/'no'、'on'/'off' */
+/**
+ * 布尔取值：接受 true/false、'1'/'0'、'true'/'false'、'yes'/'no'、'on'/'off'
+ * 以及 enable/enabled/disable/disabled/none —— 两个词表是**全项目的唯一口径**。
+ *
+ * 为什么把词表放宽到这么全：这段逻辑原先散在三处各写一份
+ * （本文件、geoip.js 的 toggle、admin.js 里对 SUB_STRICT 的判断），
+ * 词表还不一致 —— 于是 `off` 在面板里能关掉、写 `none` 却被当成没配。
+ * 现在统一走这里，模块只允许调用它，不许再自己写一份 includes 判断。
+ */
+const ON_WORDS = ['1', 'true', 'yes', 'on', 'enable', 'enabled'];
+const OFF_WORDS = ['0', 'false', 'no', 'off', 'none', 'disable', 'disabled'];
+
 function toBool(v, fallback = false) {
   if (v === undefined || v === null || v === '') return fallback;
   if (typeof v === 'boolean') return v;
   const s = String(v).trim().toLowerCase();
-  if (['1', 'true', 'yes', 'on'].includes(s)) return true;
-  if (['0', 'false', 'no', 'off'].includes(s)) return false;
+  if (ON_WORDS.includes(s)) return true;
+  if (OFF_WORDS.includes(s)) return false;
   return fallback;
 }
 

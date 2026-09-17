@@ -240,7 +240,7 @@ export const API_CATALOG = [
     items: [
       {
         id: 'dns-config', name: '自动优选频率', kind: 'setting', method: 'GET', path: '/__api/dns-config', writeMethod: 'POST',
-        desc: '定时任务的间隔（5 ~ 1440 分钟）', auth: true,
+        desc: '定时任务的间隔（分钟，允许区间由接口返回）', auth: true,
       },
       {
         id: 'dns-run', name: '立即执行一次优选', kind: 'action', method: 'POST', path: '/__api/dns-run',

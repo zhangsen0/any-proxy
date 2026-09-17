@@ -1,14 +1,18 @@
-import { json, esc, kvKey, validTarget } from './util.js';
+import { json, esc, kvKey, validTarget, parseIpv4List, parseDomainList } from './util.js';
+import { toBool } from './config.js';
 import { runtime } from './runtime.js';
 import { listSites, getSite, autoSlug, validSlug, buildTarget, addSite } from './sites.js';
-import { autoUpdatePreferredDns, filterUsableIps, applyDnsWithSelfCheck, proxyHost, targetHost } from './dns.js';
-import { subscriptionUrl, fetchSubscriptionCandidates } from './subs.js';
+import {
+  autoUpdatePreferredDns, filterUsableIps, applyDnsWithSelfCheck, proxyHost, targetHost,
+  DNS_INTERVAL, POOL_LIMIT, DOMAIN_POOL_LIMIT,
+} from './dns.js';
+import { subscriptionUrl, fetchSubscriptionCandidates, CANDIDATE_LIMIT } from './subs.js';
 import * as tempsubs from './tempsubs.js';
 import { readConfig, saveConfig, sanitize, isActive, renderHome } from './disguise.js';
 import {
   readThemeConfig, saveThemeConfig, listThemes, upsertCustom, removeCustom,
   themeCss, baseVarsCss, applyScript, THEME_STORAGE_KEY, DEFAULT_PRESET_ID,
-  rotatingTheme, rotatePool,
+  rotatingTheme, rotatePool, themeFieldBounds,
 } from './themes.js';
 import { readStatsConfig, saveStatsConfig, summarize, clearAll, STATS_SPEC } from './stats.js';
 import {
@@ -25,6 +29,17 @@ import {
 import { renderConfigPanels, settingFormById, CONFIG_JS, CONFIG_CSS } from './config-ui.js';
 import { renderStatsPane, STATS_JS, STATS_CSS } from './stats-ui.js';
 import { readTagSettings, saveTagSettings } from './nodetag.js';
+
+/**
+ * 分钟数说成人话（720 → 12 小时），供面板文案使用。
+ * 文案里的「12 小时 = 720」原先也是写死的，现在跟着 DNS_INTERVAL 走。
+ */
+function minutesLabel(minutes) {
+  const m = Number(minutes) || 0;
+  if (m && m % 1440 === 0) return `${m / 1440} 天`;
+  if (m && m % 60 === 0) return `${m / 60} 小时`;
+  return `${m} 分钟`;
+}
 
 // 站点管理：REST API + 服务端渲染的管理页
 
@@ -60,14 +75,16 @@ async function handleAdmin(request, url, env) {
   }
 
   // DNS 自动优选更新频率（分钟）：GET 读取（未登录可读）
+  // 默认值与允许区间都取 dns.js 的 DNS_INTERVAL —— 调度器用的是同一份，
+  // 不再在这里另写一个 720 / 5~1440（写两处就会有一天两边对不上）
   if (path === '/__api/dns-config') {
     if (request.method === 'GET') {
-      let interval = 720;
+      let interval = DNS_INTERVAL.default;
       try {
         const c = await runtime.KV.get('DNS_CONFIG');
-        if (c) interval = parseInt(c, 10) || 720;
+        if (c) interval = parseInt(c, 10) || DNS_INTERVAL.default;
       } catch {}
-      return json({ ok: true, interval_minutes: interval });
+      return json({ ok: true, interval_minutes: interval, min: DNS_INTERVAL.min, max: DNS_INTERVAL.max });
     }
     if (request.method === 'POST') {
       // 登录校验已由 router.js 统一拦截，此处不再重复判断
@@ -78,8 +95,8 @@ async function handleAdmin(request, url, env) {
         return json({ error: 'invalid json' }, 400);
       }
       const interval = parseInt(body.interval_minutes, 10);
-      if (!interval || interval < 5 || interval > 1440) {
-        return json({ error: '更新频率需在 5 ~ 1440 分钟之间' }, 400);
+      if (!interval || interval < DNS_INTERVAL.min || interval > DNS_INTERVAL.max) {
+        return json({ error: `更新频率需在 ${DNS_INTERVAL.min} ~ ${DNS_INTERVAL.max} 分钟之间` }, 400);
       }
       await runtime.KV.put('DNS_CONFIG', String(interval));
       return json({ ok: true, interval_minutes: interval });
@@ -104,14 +121,16 @@ async function handleAdmin(request, url, env) {
   }
 
   // 优选 IP 池（PREF_IPS，仅 DNS 自动优选用，与 edgetunnel 的 ADD.txt 解耦）：GET 读取 / POST 保存（apply=true 时先测通再更新 DNS A 记录）
+  // 解析与条数上限都走 util.js / POOL_LIMIT：面板存进去的必须是运行时认得的，
+  // 否则会出现「提示保存成功、池子其实被过滤成空」（旧版校验只验段数，999.999.999.999 也能存）
   if (path === '/__api/preferred-ips') {
     if (request.method === 'GET') {
       let ips = [];
       try {
         const add = await runtime.KV.get('PREF_IPS');
-        if (add) ips = add.split(/\r?\n/).map(s => s.trim()).filter(s => /^\d{1,3}(\.\d{1,3}){3}$/.test(s));
+        if (add) ips = parseIpv4List(add, POOL_LIMIT);
       } catch {}
-      return json({ ok: true, ips });
+      return json({ ok: true, ips, limit: POOL_LIMIT });
     }
     if (request.method === 'POST') {
       let body;
@@ -120,9 +139,8 @@ async function handleAdmin(request, url, env) {
       } catch {
         return json({ error: 'invalid json' }, 400);
       }
-      const ips = String(body.ips || '').split(/\r?\n|,|;|\s+/).map(s => s.trim()).filter(s => /^\d{1,3}(\.\d{1,3}){3}$/.test(s));
-      if (!ips.length) return json({ error: '没有有效的 IP（每行一个 IPv4 地址）' }, 400);
-      const uniq = [...new Set(ips)].slice(0, 30);
+      const uniq = parseIpv4List(body.ips, POOL_LIMIT);
+      if (!uniq.length) return json({ error: '没有有效的 IP（每行一个 IPv4 地址，每段需在 0~255）' }, 400);
       await runtime.KV.put('PREF_IPS', uniq.join('\n'));
       let updated = null;
       if (body.apply && uniq.length) {
@@ -145,9 +163,10 @@ async function handleAdmin(request, url, env) {
   // 默认只返回归属边缘网络的 IP：订阅里常混入第三方节点，不筛会让优选池被无用 IP 占满、
   // 并让「立即更新优选 IP」逐个探测这些不可达地址直到超时。可用 SUB_STRICT=0 关闭筛选。
   if (request.method === 'GET' && path === '/__api/preferred-candidates') {
-    const strictCfg = String((env && env.SUB_STRICT) || '').trim().toLowerCase();
-    const strict = strictCfg === '0' || strictCfg === 'false' ? false : true;
-    const limit = Number(env && env.SUB_CANDIDATE_LIMIT) || 40;
+    // SUB_STRICT 走 config.js 的 toBool：与面板其它开关同一套词表（原来这里只认 '0'/'false'，
+    // 写 'off'/'no' 会被当成没配，于是「关了筛选却又在生效」）
+    const strict = toBool(env && env.SUB_STRICT, true);
+    const limit = Number(env && env.SUB_CANDIDATE_LIMIT) || CANDIDATE_LIMIT;
     let res;
     try {
       res = await fetchSubscriptionCandidates(env, {
@@ -416,19 +435,19 @@ async function handleAdmin(request, url, env) {
 
   // GET /__api/pool-config -> 优选池 & 健康检查配置（GOOD_IPS / 候选域名池 / 上次健康检查时间），需登录
   // POST /__api/pool-config -> 保存候选域名池（PREF_DOMAINS）或写回 GOOD_IPS（healthcheck 自愈结果），需登录
+  // 解析器与条数上限统一来自 util.js / dns.js：面板读到的、运行时用的必须是同一口径
   if (path === '/__api/pool-config') {
     if (request.method === 'GET') {
       const good = []; let domains = [];
-      try { const g = await runtime.KV.get('GOOD_IPS'); if (g) good.push(...g.split(/\r?\n/).map(s => s.trim()).filter(Boolean)); } catch {}
+      try { good.push(...parseIpv4List(await runtime.KV.get('GOOD_IPS'), POOL_LIMIT)); } catch {}
       try {
         const d = await runtime.KV.get('PREF_DOMAINS');
-        if (d) domains.push(...d.split(/\r?\n/).map(s => s.trim()).filter(Boolean));
-        else {
+        if (d) {
+          domains.push(...parseDomainList(d, DOMAIN_POOL_LIMIT));
+        } else {
           // KV 无配置时用环境变量做种子（wrangler.toml / Actions 变量可配），而不是在代码里写死一份域名清单。
           // 都没配就返回空数组并带提示，由面板引导用户填写，保证 fork 后不会出现「改不到却又悄悄生效」的兜底行为。
-          const seed = String((env && (env.PREF_DOMAINS || env.pref_domains)) || '')
-            .split(/\r?\n|,|;|\s+/).map(s => s.trim().toLowerCase())
-            .filter(s => /^[a-z0-9]([a-z0-9.-]*[a-z0-9])?\.[a-z]{2,}$/.test(s));
+          const seed = parseDomainList(env && (env.PREF_DOMAINS || env.pref_domains), DOMAIN_POOL_LIMIT);
           domains.push(...seed);
           if (seed.length) {
             try { await runtime.KV.put('PREF_DOMAINS', seed.join('\n')); } catch {}
@@ -437,7 +456,7 @@ async function handleAdmin(request, url, env) {
       } catch {}
       let last = 0;
       try { const l = await runtime.KV.get('HC_LAST_RUN'); if (l) last = parseInt(l, 10) || 0; } catch {}
-      return json({ ok: true, good_ips: good, pref_domains: domains, last_run: last });
+      return json({ ok: true, good_ips: good, pref_domains: domains, last_run: last, limits: { ips: POOL_LIMIT, domains: DOMAIN_POOL_LIMIT } });
     }
     if (request.method === 'POST') {
       let body;
@@ -445,13 +464,13 @@ async function handleAdmin(request, url, env) {
       const out = { ok: true };
       // 写回已验证可用集 GOOD_IPS（healthcheck 自愈结果，存后端由 runtime.KV 统一决定）；与 PREF_DOMAINS 可独立更新
       if (body.good_ips !== undefined) {
-        const ips = String(body.good_ips).split(/\r?\n|,|;|\s+/).map(s => s.trim()).filter(s => /^\d{1,3}(\.\d{1,3}){3}$/.test(s));
-        if (!ips.length) return json({ error: '没有有效的 IP（每行一个 IPv4 地址）' }, 400);
-        await runtime.KV.put('GOOD_IPS', [...new Set(ips)].slice(0, 30).join('\n'));
+        const ips = parseIpv4List(body.good_ips, POOL_LIMIT);
+        if (!ips.length) return json({ error: '没有有效的 IP（每行一个 IPv4 地址，每段需在 0~255）' }, 400);
+        await runtime.KV.put('GOOD_IPS', ips.join('\n'));
         out.good_ips = ips;
       }
       if (body.pref_domains !== undefined) {
-        const domains = String(body.pref_domains || '').split(/\r?\n|,|;|\s+/).map(s => s.trim().toLowerCase()).filter(s => /^[a-z0-9]([a-z0-9.-]*[a-z0-9])?\.[a-z]{2,}$/.test(s));
+        const domains = parseDomainList(body.pref_domains, DOMAIN_POOL_LIMIT);
         if (!domains.length) return json({ error: '请输入有效域名（每行一个）' }, 400);
         await runtime.KV.put('PREF_DOMAINS', domains.join('\n'));
         out.pref_domains = domains;
@@ -663,6 +682,8 @@ async function adminPage(authed, origin, env) {
     auto_dark_theme: '',
   }));
   const themeIds = themeView.themes.map(t => t.id);
+  // 轮换间隔的默认值与区间不在这里写死：从 themes.js 的字段声明取，面板与运行期共用一份
+  const rtBounds = themeFieldBounds('rotate_interval_minutes');
   // 轮换：interval 模式由服务端按时间片算出「这一刻该用哪套」（与地域无关，全球一致）；
   // visit 模式服务端先随机一套，客户端脚本在每次加载时再抽一次（不写进存储，纯新鲜感）。
   const rotateId = rotatingTheme(themeView, themeIds);
@@ -864,11 +885,11 @@ ${themeScript}
     <div class="hint" style="margin:-8px 0 8px;">定时从 <span class="tag">sub 订阅节点</span> + 优选池测速排序，HTTP 探测过滤不可达后写入 A 记录，域名始终指向可用的 CF 泛播边缘。反代链接自动走优选 IP，浏览器直连、客户端零配置。</div>
     <label for="dnsInterval">自动更新频率（分钟）</label>
     <div class="row" style="margin-top:6px;">
-      <input id="dnsInterval" type="number" min="5" max="1440" style="max-width:220px;" placeholder="默认 720（12 小时）">
+      <input id="dnsInterval" type="number" min="${DNS_INTERVAL.min}" max="${DNS_INTERVAL.max}" style="max-width:220px;" placeholder="默认 ${DNS_INTERVAL.default}（${minutesLabel(DNS_INTERVAL.default)}）">
       <button type="button" id="dnsBtn">保存频率</button>
       <button type="button" id="dnsRunBtn" class="ghost">立即更新优选 IP</button>
     </div>
-    <div class="hint" style="margin-top:6px;">范围 5 ~ 1440 分钟（12 小时 = 720）；保存后立即生效，下一个检查周期按新频率执行。立即更新不等待周期，马上测通并切换 A 记录。</div>
+    <div class="hint" style="margin-top:6px;">范围 ${DNS_INTERVAL.min} ~ ${DNS_INTERVAL.max} 分钟（${minutesLabel(DNS_INTERVAL.default)} = ${DNS_INTERVAL.default}）；保存后立即生效，下一个检查周期按新频率执行。立即更新不等待周期，马上测通并切换 A 记录。</div>
     <label for="subUrl" style="margin-top:14px;">订阅链接（浏览器优选从这里拉取候选 IP）</label>
     <input id="subUrl" placeholder="粘贴完整订阅链接，或以 / 开头的路径如 /tsub/xxxx">
     <div class="row" style="margin-top:6px;">
@@ -993,7 +1014,7 @@ ${themeScript}
       ${(themeView.rotate_modes || []).map(m => `<option value="${esc(m.id)}"${m.id === themeView.rotate_mode ? ' selected' : ''}>${esc(m.label)} — ${esc(m.desc)}</option>`).join('')}
     </select>
     <label for="rtMinutes" style="margin-top:12px;">轮换间隔（分钟，「按时轮换」时生效）</label>
-    <input type="number" id="rtMinutes" min="1" max="10080" value="${esc(String(themeView.rotate_interval_minutes || 60))}" style="max-width:220px;">
+    <input type="number" id="rtMinutes" min="${esc(String(rtBounds.min))}" max="${esc(String(rtBounds.max))}" value="${esc(String(themeView.rotate_interval_minutes || rtBounds.default))}" style="max-width:220px;">
     <label for="rtPool" style="margin-top:12px;">参与轮换的主题（留空 = 全部）</label>
     <input id="rtPool" placeholder="aurora nord terminal" value="${esc(String(themeView.rotate_pool || ''))}">
     <div class="row">
@@ -1183,7 +1204,11 @@ if (dnsBtn) {
   dnsBtn.onclick = async () => {
     const inp = document.getElementById('dnsInterval');
     const v = parseInt(inp.value, 10);
-    if (!v || v < 5 || v > 1440) { setMsg('dnsMsg', '请输入 5 ~ 1440 之间的分钟数', true); return; }
+    // 区间从输入框自己身上读（服务端按 DNS_INTERVAL 渲染的 min/max），
+    // 不在浏览器里再抄一份 5/1440 —— 抄一份就会有一天前后端判断不一致
+    const min = Number(inp.min) || 0;
+    const max = Number(inp.max) || 0;
+    if (!v || (min && v < min) || (max && v > max)) { setMsg('dnsMsg', '请输入 ' + min + ' ~ ' + max + ' 之间的分钟数', true); return; }
     const r = await api('/__api/dns-config', { method: 'POST', body: JSON.stringify({ interval_minutes: v }) });
     setMsg('dnsMsg', r.ok ? '已保存：每 ' + v + ' 分钟自动更新一次' : (r.data.error || '保存失败'), !r.ok);
   };
@@ -1681,7 +1706,8 @@ if (rtSaveBtn) rtSaveBtn.onclick = async function () {
   try {
     const r = await api('/__api/themes', { method: 'POST', body: JSON.stringify({
       rotate_mode: document.getElementById('rtMode').value,
-      rotate_interval_minutes: Number(document.getElementById('rtMinutes').value) || 60,
+      // 留空/填 0 时落回的默认值来自 SCHEMA（渲染时注入），脚本里不再写死 60
+      rotate_interval_minutes: Number(document.getElementById('rtMinutes').value) || ${rtBounds.default},
       rotate_pool: document.getElementById('rtPool').value.trim(),
     }) });
     setMsg('rtMsg', r.ok ? '轮换设置已保存' : ((r.data && r.data.error) || '保存失败'), !r.ok);

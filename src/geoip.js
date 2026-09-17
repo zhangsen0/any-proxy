@@ -11,6 +11,8 @@
 // 失败的代价被刻意压到最低：拿不到国家就原样返回，绝不让订阅拉不出来。
 
 import { runtime } from './runtime.js';
+import { toBool } from './config.js';
+import { isIpv4 } from './util.js';
 
 // 默认数据源：HTTPS、免密钥、单次 POST 支持 100 个 IP，数据来自 MaxMind GeoLite2。
 // 任何接受 JSON 数组并返回国家代码的批量端点都能替换，见 GEOIP_BATCH_URL。
@@ -37,16 +39,13 @@ export const ANYCAST = '--';
 export const ANYCAST_LABEL = 'Cloudflare 任播';
 export const ANYCAST_CODE = 'ANYCAST';
 
-const OFF_WORDS = ['0', 'false', 'no', 'off', 'none', 'disable', 'disabled'];
-const ON_WORDS = ['1', 'true', 'yes', 'on', 'enable', 'enabled'];
-
-/** 开关语义：明确写否才算关，其它（含未配置）都按默认值走。 */
+/**
+ * 开关语义统一走 config.js 的 toBool（"明确写否才算关，其它按默认值走"）。
+ * 这里原先自带一份 ON/OFF 词表，和面板那份不一致 —— 于是 `none` 在环境变量里能关掉、
+ * 在面板里却被当成没配。词表只能有一份，所以删掉本地的，改为引用。
+ */
 function toggle(raw, dflt = true) {
-  const s = String(raw === undefined || raw === null ? '' : raw).trim().toLowerCase();
-  if (!s) return dflt;
-  if (OFF_WORDS.includes(s)) return false;
-  if (ON_WORDS.includes(s)) return true;
-  return dflt;
+  return toBool(raw, dflt);
 }
 
 async function kvGet(key) {
@@ -57,10 +56,11 @@ async function kvPut(key, value) {
   try { await runtime.KV.put(key, value); return true; } catch { return false; }
 }
 
-export function isIpv4(s) {
-  if (!/^\d{1,3}(\.\d{1,3}){3}$/.test(String(s))) return false;
-  return String(s).split('.').every(o => Number(o) >= 0 && Number(o) <= 255);
-}
+/**
+ * IPv4 判定改为引用 util.js 的唯一实现（本文件原本自带一份同样的正则）。
+ * 仍然从这里再导出，是因为 nodetag.js 一直从本模块借它，不必为一次收敛改动调用方。
+ */
+export { isIpv4 };
 
 /** IPv4 → 32 位无符号整数。整数比较比逐段字符串处理快得多，也更省 GC。 */
 export function ipToInt(ip) {

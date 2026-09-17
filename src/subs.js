@@ -6,13 +6,20 @@
 // 唯一允许出现的 URL 是远端数据源的默认地址，且随时可用环境变量覆盖。
 
 import { runtime } from './runtime.js';
-import { b64 } from './util.js';
+import { b64, isIpv4, isDomain } from './util.js';
 
 // 远端边缘 IP 段数据源。可用 CF_IP_RANGES_URL 覆盖；返回形如 {"result":{"ipv4_cidrs":[...]}} 的 JSON。
 const DEFAULT_RANGES_URL = 'https://api.cloudflare.com/client/v4/ips';
 // 解析候选域名用的公共 DNS（DoH）。Workers 自身没有 DNS 解析能力，只能借道查询接口。
 const DEFAULT_DOH_URL = 'https://cloudflare-dns.com/dns-query';
 const RANGES_TTL_MS = 12 * 3600 * 1000;
+
+/**
+ * 一次「拉取优选候选」最多返回多少个 IP。
+ * 具名导出：面板侧（admin.js）调用时也要用同一个默认值，免得两处各写一个 40。
+ * 仍可用环境变量 SUB_CANDIDATE_LIMIT 覆盖。
+ */
+const CANDIDATE_LIMIT = 40;
 
 async function kvGet(key) {
   try {
@@ -41,13 +48,9 @@ async function md5md5(s) {
   return (await md5Hex(first.slice(7, 27))).toLowerCase();
 }
 
-const IPV4_RE = /^\d{1,3}(\.\d{1,3}){3}$/;
-
-function isIpv4(s) {
-  if (!IPV4_RE.test(s)) return false;
-  return s.split('.').every(o => Number(o) >= 0 && Number(o) <= 255);
-}
-
+// IPv4 判定与列表解析统一由 util.js 提供（面板与运行时必须同一口径），这里只做转发，
+// 保留历史导出名，避免调用方为了一个工具函数改动 import 路径。
+// 见 util.js「列表型配置的解析」一节。
 function ipv4ToInt(ip) {
   const parts = String(ip).split('.');
   if (parts.length !== 4) return null;
@@ -209,7 +212,8 @@ async function resolveDomains(domains, opts = {}) {
   for (const d of domains) {
     if (deadline && Date.now() > deadline) break;
     const name = String(d || '').trim().toLowerCase();
-    if (!/^[a-z0-9]([a-z0-9.-]*[a-z0-9])?\.[a-z]{2,}$/.test(name)) continue;
+    // 域名判定同样只留 util.js 一份（这里原本抄了同一份正则）
+    if (!isDomain(name)) continue;
     try {
       const r = await fetch(`${base}?name=${encodeURIComponent(name)}&type=A`, {
         headers: { Accept: 'application/dns-json' },
@@ -277,13 +281,13 @@ async function fetchSubscriptionCandidates(env, opts = {}) {
 
   const strict = opts.strict === false ? false : true;
   if (!strict) {
-    return { ips: [...new Set(ipv4)].slice(0, opts.limit || 40), source: 'sub', filtered: 0, addresses: addresses.length };
+    return { ips: [...new Set(ipv4)].slice(0, opts.limit || CANDIDATE_LIMIT), source: 'sub', filtered: 0, addresses: addresses.length };
   }
   const ranges = await cloudflareRanges(env, { signal: opts.signal });
   if (!ranges) {
     // 拿不到边缘段就不过滤（比用写死的常量安全），但要如实标注，便于面板/日志排障
     return {
-      ips: [...new Set(ipv4)].slice(0, opts.limit || 40),
+      ips: [...new Set(ipv4)].slice(0, opts.limit || CANDIDATE_LIMIT),
       source: 'sub',
       filtered: 0,
       addresses: addresses.length,
@@ -292,7 +296,7 @@ async function fetchSubscriptionCandidates(env, opts = {}) {
   }
   const kept = [...new Set(ipv4)].filter(ip => ranges.cidrs.some(c => cidrMatch(ip, c)));
   return {
-    ips: kept.slice(0, opts.limit || 40),
+    ips: kept.slice(0, opts.limit || CANDIDATE_LIMIT),
     source: 'sub',
     filtered: ipv4.length - kept.length,
     addresses: addresses.length,
@@ -301,7 +305,7 @@ async function fetchSubscriptionCandidates(env, opts = {}) {
 }
 
 export {
-  md5Hex, md5md5, isIpv4, cidrMatch, cloudflareRanges,
+  md5Hex, md5md5, isIpv4, cidrMatch, cloudflareRanges, CANDIDATE_LIMIT,
   subscriptionUrl, fallbackSubscription, parseNodeAddresses, resolveDomains,
   fetchSubscriptionCandidates,
 };

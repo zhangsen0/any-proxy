@@ -1,6 +1,6 @@
 import { runtime } from './runtime.js';
-import { b64 } from './util.js';
-import { fetchSubscriptionCandidates, resolveDomains, isIpv4 } from './subs.js';
+import { b64, parseIpv4List, parseDomainList } from './util.js';
+import { fetchSubscriptionCandidates, resolveDomains } from './subs.js';
 
 /**
  * 探活目标：伪装开启后任何 /__api/* 都要求登录，内部 fetch 必须自己带上登录态。
@@ -26,6 +26,21 @@ const PROBE_CONCURRENCY = 12;
 const MAX_TARGETS = 2; // A 记录条数（多 A 记录由浏览器自动负载均衡）
 const DNS_SETTLE_MS = 2500; // 写完 A 记录后等它生效再自检
 const MAX_PROBE_LIMIT = 32; // 单轮最多探测多少个候选，防止池里塞满不可达 IP 时拖垮整次请求
+
+/**
+ * 自动优选频率（分钟）的默认值与允许区间。
+ *
+ * 为什么导出：这个值的「默认 720、区间 5~1440」曾经同时写在 dns.js（调度器）和
+ * admin.js（面板接口）里，两边一旦改成不一致，就会出现「面板显示 12 小时、实际按别的间隔跑」
+ * 这种查不出来的偏差。现在只在这里定义，面板侧引用同一份。
+ */
+const DNS_INTERVAL = { default: 720, min: 5, max: 1440 };
+
+/** 优选池（PREF_IPS）与已验证可用集（GOOD_IPS）各自最多保留多少条 —— 面板写入与运行时读取共用 */
+const POOL_LIMIT = 30;
+
+/** 候选域名池最多用多少个域名（解析成本随条数上升，且 A 记录只留 MAX_TARGETS 条） */
+const DOMAIN_POOL_LIMIT = 12;
 
 /**
  * 优选/自愈的目标域名 —— 不写死。
@@ -69,12 +84,11 @@ async function targetHost(env, hostname) {
   return '';
 }
 
-async function poolFrom(key, limit = 30) {
+async function poolFrom(key, limit = POOL_LIMIT) {
   try {
     const v = await runtime.KV.get(key);
     if (!v) return [];
-    const list = String(v).split(/\r?\n/).map(s => s.trim().split('#')[0].trim()).filter(isIpv4);
-    return [...new Set(list)].slice(0, limit);
+    return parseIpv4List(v, limit);
   } catch {
     return [];
   }
@@ -86,12 +100,12 @@ async function poolFrom(key, limit = 30) {
  */
 async function scheduledDnsCheck(env) {
   try {
-    let interval = 720;
+    let interval = DNS_INTERVAL.default;
     try {
       const c = await runtime.KV.get('DNS_CONFIG');
       if (c) {
         const v = parseInt(c, 10);
-        if (v >= 5 && v <= 1440) interval = v;
+        if (v >= DNS_INTERVAL.min && v <= DNS_INTERVAL.max) interval = v;
       }
     } catch {}
     const now = Date.now();
@@ -192,10 +206,8 @@ async function autoUpdatePreferredDns(env, opts = {}) {
 /** 候选域名池：KV（面板可配）优先，否则取环境变量 PREF_DOMAINS。都没有则返回空 —— 不内置写死列表。 */
 async function domainPool(env) {
   const stored = await runtime.KV.get('PREF_DOMAINS').catch(() => null);
-  const raw = String(stored || (env && (env.PREF_DOMAINS || env.pref_domains)) || '');
-  const list = raw.split(/\r?\n|,|;|\s+/).map(s => s.trim().toLowerCase())
-    .filter(s => /^[a-z0-9]([a-z0-9.-]*[a-z0-9])?\.[a-z]{2,}$/.test(s));
-  return [...new Set(list)].slice(0, 12);
+  const raw = stored || (env && (env.PREF_DOMAINS || env.pref_domains)) || '';
+  return parseDomainList(raw, DOMAIN_POOL_LIMIT);
 }
 
 /**
@@ -383,4 +395,5 @@ async function selfCheck(host, deadlineMs) {
 export {
   scheduledDnsCheck, autoUpdatePreferredDns, filterUsableIps, updateDnsRecords, getARecords,
   applyDnsWithSelfCheck, proxyHost, targetHost, rememberHost, MAX_TARGETS,
+  DNS_INTERVAL, POOL_LIMIT, DOMAIN_POOL_LIMIT,
 };

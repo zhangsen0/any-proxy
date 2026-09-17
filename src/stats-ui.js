@@ -22,13 +22,10 @@
 import { settingFormById, renderToolItem, KEEP_NAMES_SHIM } from './config-ui.js';
 import { flatCatalog } from './api-catalog.js';
 import { scopeLabels } from './scopes.js';
+import { STATS_RANGES, DEFAULT_RANGE_DAYS } from './stats.js';
 
-/**
- * 可回看的天数档位。**单一来源**：按钮由它生成，脚本的默认档位也从渲染出来的
- * `.active` 按钮上读回来，所以「加一档 90 天」只在这里加一个数字，不用同步改两处。
- */
-const STATS_RANGES = [7, 14, 30];
-const STATS_DEFAULT_RANGE = STATS_RANGES[0];
+/* 天数档位与默认档位不在这里写死：导入 src/stats.js 的 STATS_RANGES（服务端同一份），
+   面板按钮、脚本默认档位、服务端默认回看天数因此共用一处定义。 */
 
 /**
  * 每日趋势图可切换的指标。同样是**单一来源**：下拉选项由它生成，每个指标用哪种
@@ -55,10 +52,10 @@ function toolById(id) {
   return item ? renderToolItem(item) : '';
 }
 
-/** 天数档位按钮：档位表改了这里自动跟着变 */
+/** 天数档位按钮：档位表改了这里自动跟着变；默认档位取表的第一项 */
 function rangeButtons() {
   return STATS_RANGES.map(days =>
-    `<button type="button" data-days="${days}"${days === STATS_DEFAULT_RANGE ? ' class="active"' : ''}>近 ${days} 天</button>`
+    `<button type="button" data-days="${days}"${days === DEFAULT_RANGE_DAYS ? ' class="active"' : ''}>近 ${days} 天</button>`
   ).join('');
 }
 
@@ -133,10 +130,10 @@ function statsInit() {
   if (!card) return;
 
   var $ = function (sel) { return document.querySelector(sel); };
-  // 默认档位不在脚本里写死：从服务端渲染出来的 .active 按钮上读回来，
-  // 这样「默认看几天」只有 STATS_RANGES 一处真源
+  // 默认档位不在脚本里写死：优先从服务端渲染出来的 .active 按钮上读回来，
+  // 读不到才落回注入的 STATS_DEFAULT_DAYS（它来自 src/stats.js 的档位表）
   var defaultBtn = $('#stDays button.active');
-  var days = (defaultBtn && Number(defaultBtn.getAttribute('data-days'))) || 7;
+  var days = (defaultBtn && Number(defaultBtn.getAttribute('data-days'))) || STATS_DEFAULT_DAYS;
   // 指标与格式化方式同样来自注入的数据表，脚本里不写死任何一项
   var metric = STATS_METRICS[0].key;
   var metricFmts = {};
@@ -313,7 +310,7 @@ function statsInit() {
     seg.addEventListener('click', function (e) {
       var b = e.target.closest('button[data-days]');
       if (!b) return;
-      days = Number(b.getAttribute('data-days')) || 7;
+      days = Number(b.getAttribute('data-days')) || STATS_DEFAULT_DAYS;
       [].forEach.call(seg.querySelectorAll('button'), function (x) {
         x.classList.toggle('active', x === b);
       });
@@ -356,7 +353,7 @@ function statsInit() {
 
 // 两张纯数据表以 var 形式注入，排在构造器之前：它们落在同一个 script 作用域里，
 // statsInit 直接当全局读。顺序不能反 —— 脚本一执行就会读它们。
-const STATS_JS = `${KEEP_NAMES_SHIM}var SCOPE_LABELS=${SCOPE_LABELS_JSON};var STATS_METRICS=${STATS_METRICS_JSON};(${statsInit.toString()})();`;
+const STATS_JS = `${KEEP_NAMES_SHIM}var SCOPE_LABELS=${SCOPE_LABELS_JSON};var STATS_METRICS=${STATS_METRICS_JSON};var STATS_DEFAULT_DAYS=${DEFAULT_RANGE_DAYS};(${statsInit.toString()})();`;
 
 // ===================== 样式 =====================
 

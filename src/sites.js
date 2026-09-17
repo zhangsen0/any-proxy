@@ -1,4 +1,4 @@
-import { slugify, randomSuffix, kvKey, validTarget } from './util.js';
+import { slugify, randomSuffix, kvKey, validTarget, isIpv4 } from './util.js';
 import { runtime } from './runtime.js';
 
 // 站点配置的持久化层：读写 Cloudflare KV，前缀 site:*
@@ -97,8 +97,9 @@ function buildTarget(rawTarget, rawPort) {
   //  - 带端口（非 443，通常为自建服务）-> http
   //  - 纯域名 -> https
   if (!scheme) {
-    const isIpv4 = /^\d{1,3}(\.\d{1,3}){3}$/.test(host);
-    if (isIpv4 || (port && port !== '443')) {
+    // 判定用 util.js 的唯一实现：这里原先自带一份只验段数的正则，
+    // 与别处口径不一致（`999.999.999.999` 会被当成 IP 而走 http）
+    if (isIpv4(host) || (port && port !== '443')) {
       scheme = 'http';
     } else {
       scheme = 'https';

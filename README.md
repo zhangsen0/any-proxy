@@ -243,6 +243,7 @@ tools/                 本地开发与验证脚本（不参与部署）
   check-themes.mjs     主题系统自检：10 套预设齐全、自定义可增删、CSS 注入写不穿、轮换结果收敛
   check-guard.mjs      防护三件套自检：默认关闭不误伤、封禁与解封、告警脱敏、临时链接双重到期
   check-configui.mjs   配置页与目录自检：字段与 SPEC 双向对齐、每项恰好渲染一次、全页无重复配置、转义完备、各选项卡内容同宽
+  check-single-source.mjs  配置单一真源自检：一个设定只允许一份定义（面板与运行期同口径）
   gen-manual.mjs       操作手册附录生成器：速查表从目录与 SPEC 生成，--check 模式进 CI
   check-smoke.mjs      路由级冒烟：从请求入口走到页面出口，专治「单测全绿但组合起来就炸」
 docs/                  软件生命周期文档（09 是面向使用者的操作手册）
@@ -299,13 +300,16 @@ node tools/check-guard.mjs
 # 12. 配置页与接口目录自检（改配置项 / api-catalog.js 后必跑）
 node tools/check-configui.mjs
 
-# 13. 操作手册的速查表与代码是否同步（改配置项后跑 --write 重新生成）
+# 13. 配置单一真源自检（新增默认值 / 加一个常量前先跑；同一个设定不允许写两份）
+node tools/check-single-source.mjs
+
+# 14. 操作手册的速查表与代码是否同步（改配置项后跑 --write 重新生成）
 node tools/gen-manual.mjs
 
-# 14. 部署后线上冒烟：传目标地址与口令，跑主题、防护与配置接口（结束会自动恢复默认配置）
+# 15. 部署后线上冒烟：传目标地址与口令，跑主题、防护与配置接口（结束会自动恢复默认配置）
 node tools/check-live.mjs https://<你的-worker>.workers.dev <PASSWORD>
 
-# 15. 实测订阅里每个节点是否真的可用（需 Python 3）
+# 16. 实测订阅里每个节点是否真的可用（需 Python 3）
 SUB_URL=https://proxy.example.com/tsub/xxxx python3 - <<'EOF'
 import urllib.request
 open('/tmp/sub.txt','wb').write(urllib.request.urlopen('$SUB_URL').read())
@@ -322,6 +326,28 @@ python3 tools/check-nodes.py /tmp/sub.txt
 > （CF 对自己边缘 IP 发来的明文 HTTP 请求直接回 400，会把健康节点误判成坏的），
 > 以及每个目标必须新开一条连接（同一条 WS 连接上重试第二个目标，服务端已经把它
 > 当作上一个流在收，第一个失败会连累后面全部失败）。
+
+### 一个设定只允许一份定义
+
+这是本项目最容易出隐蔽 bug 的地方，而且**单测抓不到**——因为每份实现自己都是「对」的：
+
+| 曾经的真实故障 | 后果 |
+| --- | --- |
+| 面板用宽松正则校验 IPv4，运行时用严格版 | 面板提示「已保存」，池子却被静默过滤成空 |
+| 优选频率在面板接口与调度器各写一份 | 面板显示 12 小时，实际按另一个间隔跑 |
+| 布尔词表两套词汇（`config.js` 认 `on/off`，`geoip.js` 还认 `enable/none`） | `none` 在环境变量里能关掉，在面板里却被当成没配 |
+| 候选条数常量旁又写了一个裸 `40` | 改常量时漏改裸值，「面板配的上限」与运行时不一致 |
+
+所以约定如下，并由 `check-single-source.mjs` 卡住（70 项，含「把写死点塞回去必须变红」的牙齿验证）：
+
+- **默认值与区间**：写在字段声明里（`config.js` / `themes.js` 等的 `SPEC`），面板表单的
+  `min` `max` `value` 与运行期兜底都从它取，不在 HTML 或注入脚本里再抄一遍。
+- **列表解析**（IP / 域名 / 布尔词表）：只有 `util.js` / `config.js` 里那一份实现。
+- **数据表**（访问通道 `scopes.js`、驾驶舱档位 `stats.js` 的 `STATS_RANGES`、指标表）：
+  加一项只改表，前后端都不动分支。
+- **注入浏览器的脚本**（`toString()` 过去的那类）必须自给自足：只能引用自己的局部变量
+  与浏览器全局，引用模块级 import 在浏览器里是 `ReferenceError`，且渲染期才炸。
+  需要的数据一律以 `JSON.stringify` 的形式注入。
 
 ---
 
