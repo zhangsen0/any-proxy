@@ -211,7 +211,7 @@ export const API_CATALOG = [
         desc: '浏览器优选从这里拉候选 IP；留空则用本机 /sub', auth: true,
       },
       {
-        id: 'node-tag', name: '节点国家标注', kind: 'setting', method: 'GET', path: '/__api/node-tag', writeMethod: 'POST',
+        id: 'country-label', name: '节点国家标注', kind: 'setting', method: 'GET', path: '/__api/country-label', writeMethod: 'POST',
         desc: '给订阅节点备注补 IP 归属国家', auth: true,
       },
       {

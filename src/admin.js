@@ -386,8 +386,8 @@ async function handleAdmin(request, url, env) {
     }
   }
 
-  // GET / POST /__api/node-tag -> 节点备注的国家标注开关与样式
-  if (path === '/__api/node-tag') {
+  // GET / POST /__api/country-label -> 节点备注的国家标注开关与样式
+  if (path === '/__api/country-label') {
     if (request.method === 'GET') return json({ ok: true, config: await readTagSettings(env) });
     if (request.method === 'POST') {
       let body;
@@ -1733,7 +1733,7 @@ if (paneTabs.length) {
 const ntEnabled = document.getElementById('ntEnabled');
 const ntStyle = document.getElementById('ntStyle');
 if (ntEnabled) {
-  api('/__api/node-tag').then(function (r) {
+  api('/__api/country-label').then(function (r) {
     if (!r.ok || !r.data || !r.data.config) return;
     const c = r.data.config;
     ntEnabled.value = c.enabled ? '1' : '0';
@@ -1744,7 +1744,7 @@ if (ntEnabled) {
     ntSaveBtn.disabled = true;
     setMsg('ntMsg', '保存中…', false);
     try {
-      const r = await api('/__api/node-tag', { method: 'POST', body: JSON.stringify({
+      const r = await api('/__api/country-label', { method: 'POST', body: JSON.stringify({
         enabled: ntEnabled.value === '1', style: ntStyle.value,
       }) });
       setMsg('ntMsg', r.ok ? '已保存，订阅下次拉取即生效' : (r.data && r.data.error ? r.data.error : '保存失败'), !r.ok);
