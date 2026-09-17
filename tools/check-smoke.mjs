@@ -335,6 +335,42 @@ console.log('\n[8] OPTIONS 预检：不得 5xx / 伪装 404');
   ok('根路径预检同样 204', r2.status === 204, `status=${r2.status} ${r2.err || ''}`);
 }
 
+// [9] 分片请求（Range）—— 视频播放的关键路径。
+// 真实故障：源站不支持 Range 时，反代把整个文件塞回给只要了一小段的播放器，
+// 却一个 Accept-Ranges 头都不给，播放器无从得知「这里不能分片」，于是每要一段
+// 就重新下载一整个文件 —— 转发流量按分片数翻倍、网速越来越慢、最后还是播不了。
+console.log('\n[9] 分片请求：上游不支持 Range 时必须明确声明，否则流量按分片数翻倍');
+{
+  const realFetch = globalThis.fetch;
+
+  // 场景 A：上游支持 Range —— 206 必须原样透传，Content-Range 一个字都不能动
+  globalThis.fetch = async () => new Response(new Uint8Array(100), {
+    status: 206,
+    headers: { 'content-type': 'video/mp4', 'content-range': 'bytes 0-99/1000', 'accept-ranges': 'bytes' },
+  });
+  const a = await call('/p/demo/ok.mp4', { Range: 'bytes=0-99' });
+  ok('上游支持 Range 时 206 原样透传', a.status === 206, `status=${a.status}`);
+  ok('Content-Range 原样保留', (a.headers.get('content-range') || '').includes('bytes 0-99'),
+    `${a.headers.get('content-range')}`);
+  ok('不谎报成 none', a.headers.get('accept-ranges') !== 'none', `${a.headers.get('accept-ranges')}`);
+
+  // 场景 B：上游不支持 Range（要了分片却回 200 整个文件）—— 必须声明 none
+  globalThis.fetch = async () => new Response(new Uint8Array(1000), {
+    status: 200,
+    headers: { 'content-type': 'video/mp4' },
+  });
+  const b = await call('/p/demo/norange.mp4', { Range: 'bytes=0-99' });
+  ok('上游不支持 Range 时声明 none', b.headers.get('accept-ranges') === 'none',
+    `${b.headers.get('accept-ranges') || '无'}`);
+
+  // 场景 C：没要分片的普通请求不该被误标 none（否则会误伤正常下载）
+  const c = await call('/p/demo/plain.mp4', {});
+  ok('未带 Range 的请求不声明 none', c.headers.get('accept-ranges') !== 'none',
+    `${c.headers.get('accept-ranges') || '无'}`);
+
+  globalThis.fetch = realFetch;
+}
+
 console.log(`\n=== ${fail === 0 ? '全部通过' : '存在失败'} ===`);
 console.log(`代理链路冒烟：${pass} 项，失败 ${fail} 项\n`);
 process.exit(fail ? 1 : 0);

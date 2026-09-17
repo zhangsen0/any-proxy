@@ -304,6 +304,12 @@ async function proxyRequest(request, site, crossHost, ctx, env) {
   headersOut.delete('Permissions-Policy');
   rewriteSetCookies(headersOut, upstream, base.prefix);
 
+  // 客户端要了分片，但上游不支持 Range（回的是 200 整个文件）：
+  // 这时每个 Range 请求都会被塞回一整个文件，播放器发 N 个分片就是 N 倍流量 ——
+  // 对电影这种几个 GB 的文件，每个分片都去下几个 GB，必然超时、必然播不了。
+  // 明确声明 Accept-Ranges: none，播放器就会改回一次性顺序下载（只下一遍，边下边播）。
+  if (wantsRange && upstream.status === 200) headersOut.set('Accept-Ranges', 'none');
+
   const ct = headersOut.get('content-type') || '';
   const isHtml = ct.includes('text/html');
   const isHls = isHlsManifest(ct);
