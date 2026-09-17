@@ -83,7 +83,7 @@ export const API_CATALOG = [
       },
       {
         id: 'stats', name: '查看统计数据', kind: 'query', path: '/__api/stats',
-        desc: '按天聚合的通道排行、流量与来访数（驾驶舱用的就是这份数据）',
+        desc: '按天聚合的通道排行、流量（实际传输字节）、媒体流量、传输中断与来访数（驾驶舱用的就是这份数据）',
         params: [{ key: 'days', label: '统计天数', type: 'number', in: 'query', placeholder: '7' }],
       },
       {

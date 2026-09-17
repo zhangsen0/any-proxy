@@ -44,7 +44,7 @@ const SALT_KEY = 'STATS_SALT';
 
 // ===================== 内存缓冲 =====================
 
-/** @type {Map<string, {hits:number, bytes:number, errors:number, ips:Set<string>|null}>} */
+/** @type {Map<string, {hits:number, bytes:number, errors:number, aborts:number, mbytes:number, ips:Set<string>|null}>} */
 const buffer = new Map();
 let bufferBytesDirtyAt = 0;
 let lastFlush = 0;
@@ -59,9 +59,13 @@ function storageKey(scope, date) {
   return `${KEY_PREFIX}${scope}:${date}`;
 }
 
-/** 存储桶的内容形状 —— 读写都走这里，避免两个分支写成两种格式 */
+/** 存储桶的内容形状 —— 读写都走这里，避免两个分支写成两种格式
+ *  - bytes   实际传输字节（由出口流的计数回填，不信任响应头 Content-Length）
+ *  - aborts  传输中断次数：响应发出后客户端中途断开（播放器放弃 / 弱网断流）
+ *  - mbytes  媒体流字节：视频/音频/分片（206、video/audio、带 Range 的请求）
+ */
 function emptyBucket() {
-  return { hits: 0, bytes: 0, errors: 0, uv: 0, ips: [], truncated: false };
+  return { hits: 0, bytes: 0, errors: 0, aborts: 0, mbytes: 0, uv: 0, ips: [], truncated: false };
 }
 
 // ===================== 对外：读取配置 =====================
@@ -87,17 +91,19 @@ export { SPEC as STATS_SPEC };
  */
 export { isAdminScope };
 
-/** 桶里的累加动作集中在这里：hits / bytes / errors / 来访者都只有这一个入口 */
+/** 桶里的累加动作集中在这里：hits / bytes / errors / aborts / mbytes / 来访者都只有这一个入口 */
 function bump(scope, delta) {
   const key = `${scope}|${bucketDate()}`;
   let item = buffer.get(key);
   if (!item) {
-    item = { hits: 0, bytes: 0, errors: 0, ips: null };
+    item = { hits: 0, bytes: 0, errors: 0, aborts: 0, mbytes: 0, ips: null };
     buffer.set(key, item);
   }
   if (delta.hits) item.hits += delta.hits;
   if (delta.bytes) item.bytes += delta.bytes;
   if (delta.errors) item.errors += delta.errors;
+  if (delta.aborts) item.aborts += delta.aborts;
+  if (delta.mbytes) item.mbytes += delta.mbytes;
   if (delta.ip) {
     if (!item.ips) item.ips = new Set();
     // 上限内才继续收集：超过就不再膨胀，最终 uv 记为「≥上限」
@@ -120,10 +126,15 @@ function allowed(scope, cfg) {
  *
  * @param {object} args
  * @param {string} args.scope   访问通道标识，如 p:<站点id> / edt / sub / admin
- * @param {Response|null} args.response  响应（用于取长度与状态码；可为 null）
+ * @param {Response|null} args.response  响应（用于取状态码；可为 null）
  * @param {string|null} args.ip  来源 IP（会被哈希后才落盘）
  * @param {object} [args.env]
  * @param {object} [args.ctx]
+ *
+ * ⚠️ 流量（bytes）**不在这里记**：响应头 Content-Length 是「声称的大小」，
+ * 大文件请求一旦被客户端中途掐断，头里整片的大小会被当成实际流量（线上实测
+ * 边缘只发了 0.5GB、日志却记了 20GB）。字节一律由调用方套在出口流上
+ * 数**实际传输**的量，再走 recordBytes 回填。
  */
 export function record({ scope, response, ip, env, ctx, failed }) {
   if (!scope) return;
@@ -133,10 +144,8 @@ export function record({ scope, response, ip, env, ctx, failed }) {
     if (!allowed(scope, cfg)) return false;
 
     const status = response ? response.status : 0;
-    const len = response ? Number(response.headers.get('content-length') || 0) : 0;
     bump(scope, {
       hits: 1,
-      bytes: Number.isFinite(len) && len > 0 ? len : 0,
       errors: failed || status >= 500 ? 1 : 0,
       ip: cfg.track_visitors && ip ? ip : '',
       uvLimit: cfg.uv_limit,
@@ -147,23 +156,33 @@ export function record({ scope, response, ip, env, ctx, failed }) {
 }
 
 /**
- * 只累加流量。用于响应没有 Content-Length 的情况（上游 chunked 很常见）——
- * 那种响应只有在流发完才知道有多少字节，所以由调用方在流结束时回填，
- * 与 hits 分开记：万一流没结束，丢的只是字节数，请求数不会跟着丢。
+ * 只累加流量（含媒体分类与传输中断）。响应实际发了多少字节只有流发完才知道，
+ * 所以由调用方在流结束时（或客户端中途断开时）回填，与 hits 分开记：
+ * 万一流没结束，丢的只是字节数，请求数不会跟着丢。
  *
  * ⚠️ 这里刻意**不**接 ctx：字节数是在响应流发完之后才拿到的，那时请求已经结束，
  * 再调 ctx.waitUntil() 会被运行时直接丢掉（异常还被下面的 catch 吞掉），
  * 表现就是「请求数有、流量永远是 0」。所以调用方必须在请求还活着的时候就把
  * 「等流结束 → 记账」这条链登记进 waitUntil，这里只负责 await 完成。
  * 返回的 Promise 必须被调用方 await（否则 isolate 可能提前回收，落盘丢失）。
+ *
+ * @param {object} args
+ * @param {string} args.scope
+ * @param {number} args.bytes     实际传输字节（>0 才计）
+ * @param {boolean} [args.media]  是否媒体流（video/audio/分片/Range）→ 计入 mbytes
+ * @param {boolean} [args.aborted] 流未完整发完（客户端中途断开）→ 计入 aborts
  */
-export async function recordBytes({ scope, bytes, env }) {
+export async function recordBytes({ scope, bytes, env, media, aborted }) {
   const n = Number(bytes) || 0;
-  if (!scope || n <= 0) return false;
+  if (!scope || (n <= 0 && !aborted)) return false;
   try {
     const cfg = await readStatsConfig(env);
     if (!allowed(scope, cfg)) return false;
-    bump(scope, { bytes: n });
+    bump(scope, {
+      bytes: n,
+      mbytes: media ? n : 0,
+      aborts: aborted ? 1 : 0,
+    });
     const due = Date.now() - lastFlush >= (cfg.flush_ms || SPEC.flush_ms.default);
     if (due) await flush(env);
     return true;
@@ -220,6 +239,8 @@ export async function flush(env) {
     bucket.hits = Number(bucket.hits || 0) + item.hits;
     bucket.bytes = Number(bucket.bytes || 0) + item.bytes;
     bucket.errors = Number(bucket.errors || 0) + item.errors;
+    bucket.aborts = Number(bucket.aborts || 0) + item.aborts;
+    bucket.mbytes = Number(bucket.mbytes || 0) + item.mbytes;
 
     if (item.ips && item.ips.size) {
       const previous = Array.isArray(bucket.ips) ? bucket.ips : [];
@@ -235,7 +256,22 @@ export async function flush(env) {
     try {
       await runtime.KV.put(key, JSON.stringify(bucket));
       written++;
-    } catch {}
+    } catch {
+      // 写失败不能丢：把这条放回内存缓冲等下一次 flush 再试。原先 snapshot 已 clear，
+      // 存储一抖动整段计数就静默蒸发 —— 线上表现为「日志的请求数 / 流量与边缘日志
+      // 对不上」（并发一高，KV 批量写入偶发失败，丢的全是账）。
+      const cur = buffer.get(composite) || { hits: 0, bytes: 0, errors: 0, aborts: 0, mbytes: 0, ips: null };
+      cur.hits += item.hits;
+      cur.bytes += item.bytes;
+      cur.errors += item.errors;
+      cur.aborts += item.aborts;
+      cur.mbytes += item.mbytes;
+      if (item.ips && item.ips.size) {
+        if (!cur.ips) cur.ips = new Set();
+        for (const raw of item.ips) cur.ips.add(raw);
+      }
+      buffer.set(composite, cur);
+    }
   }
 
   await prune(env, cfg);
@@ -335,15 +371,17 @@ export async function summarize(env, days) {
     const hits = Number(bucket.hits || 0);
     const bytes = Number(bucket.bytes || 0);
     const errors = Number(bucket.errors || 0);
+    const aborts = Number(bucket.aborts || 0);
+    const mbytes = Number(bucket.mbytes || 0);
     const uv = Number(bucket.uv || 0);
 
-    const agg = perScope.get(scope) || { scope, hits: 0, bytes: 0, errors: 0, uv: 0, days: [] };
-    agg.hits += hits; agg.bytes += bytes; agg.errors += errors; agg.uv += uv;
-    agg.days.push({ date, hits, bytes, errors, uv });
+    const agg = perScope.get(scope) || { scope, hits: 0, bytes: 0, errors: 0, aborts: 0, mbytes: 0, uv: 0, days: [] };
+    agg.hits += hits; agg.bytes += bytes; agg.errors += errors; agg.aborts += aborts; agg.mbytes += mbytes; agg.uv += uv;
+    agg.days.push({ date, hits, bytes, errors, aborts, mbytes, uv });
     perScope.set(scope, agg);
 
-    const day = daily.get(date) || { date, hits: 0, bytes: 0, errors: 0 };
-    day.hits += hits; day.bytes += bytes; day.errors += errors;
+    const day = daily.get(date) || { date, hits: 0, bytes: 0, errors: 0, aborts: 0, mbytes: 0 };
+    day.hits += hits; day.bytes += bytes; day.errors += errors; day.aborts += aborts; day.mbytes += mbytes;
     daily.set(date, day);
   }
 
@@ -356,9 +394,11 @@ export async function summarize(env, days) {
     hits: a.hits + s.hits,
     bytes: a.bytes + s.bytes,
     errors: a.errors + s.errors,
+    aborts: a.aborts + s.aborts,
+    mbytes: a.mbytes + s.mbytes,
     // 跨通道去重做不到（不同通道的哈希集合互不相干），这里给出的是各通道 uv 之和的上界
     uv: a.uv + s.uv,
-  }), { hits: 0, bytes: 0, errors: 0, uv: 0 });
+  }), { hits: 0, bytes: 0, errors: 0, aborts: 0, mbytes: 0, uv: 0 });
 
   const series = allScopes
     .slice()
@@ -368,7 +408,7 @@ export async function summarize(env, days) {
       // 每天的点必须补齐：没有记录的日期要显式是 0，否则折线图会把日期拉直
       s.days = [...dates].sort().map(d => {
         const found = s.days.find(x => x.date === d);
-        return found || { date: d, hits: 0, bytes: 0, errors: 0, uv: 0 };
+        return found || { date: d, hits: 0, bytes: 0, errors: 0, aborts: 0, mbytes: 0, uv: 0 };
       });
       return s;
     });
@@ -381,7 +421,7 @@ export async function summarize(env, days) {
     retention_days: cfg.retention_days,
     top_limit: Number(cfg.top_limit || SPEC.top_limit.default),
     dates: sortedDates,
-    daily: sortedDates.map(d => daily.get(d) || { date: d, hits: 0, bytes: 0, errors: 0 }),
+    daily: sortedDates.map(d => daily.get(d) || { date: d, hits: 0, bytes: 0, errors: 0, aborts: 0, mbytes: 0 }),
     series,
     totals,
   };

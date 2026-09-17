@@ -30,17 +30,21 @@ import { matchVisitScope } from './src/scopes.js';
 const WS_SWITCHING_PROTOCOLS = 101;
 
 /**
- * 响应没有 Content-Length 时（上游 chunked 很常见）边发边数真实字节数。
+ * 响应一律由 TransformStream 边发边数**实际传输字节**，不信任响应头 Content-Length ——
+ * 后者是「声称的大小」：大文件请求一旦被客户端中途掐断（播放器放弃、弱网断流），
+ * 头里整片的大小会被当成实际流量，日志里出现几十 GB 的虚高
+ * （线上实测：边缘只发了 0.5GB，日志记了 20GB）。
  * 用 TransformStream 只做累加，不缓存内容，所以大文件也不会多占内存。
- * 数完回填给统计：这一步失败只影响「流量」，不影响请求数。
+ * 顺带记两个维度（回答「流量都去哪了 / 是不是播不了」）：
+ *   - aborted：流没发完就断开（客户端放弃）→ 计入 aborts；
+ *   - media：206 / video|audio / 带 Range 的请求 → 计入 mbytes。
  */
-function countResponseBytes(response, scope, env, ctx) {
+function countResponseBytes(response, scope, env, ctx, media) {
   if (!response || !response.body) return response;
   if (response.status === WS_SWITCHING_PROTOCOLS) return response;
-  // 有 Content-Length 的：record() 已经照响应头记过字节数，这里直接放行（省掉一层流）
-  if (response.headers.get('content-length')) return response;
 
   let total = 0;
+  let aborted = false;
   let settle = null;
   const finished = new Promise(resolve => { settle = resolve; });
 
@@ -50,7 +54,7 @@ function countResponseBytes(response, scope, env, ctx) {
   // 所以先用一个 Promise 占位登记（此刻 ctx 还在），流结束时再把它 resolve 掉。
   if (ctx && typeof ctx.waitUntil === 'function') {
     try {
-      ctx.waitUntil(finished.then(n => recordBytes({ scope, bytes: n, env })));
+      ctx.waitUntil(finished.then(r => recordBytes({ scope, bytes: r.bytes, aborted: r.aborted, media, env })));
     } catch { /* 统计永不阻塞请求 */ }
   }
 
@@ -59,7 +63,9 @@ function countResponseBytes(response, scope, env, ctx) {
       total += chunk && chunk.byteLength ? chunk.byteLength : 0;
       ctrl.enqueue(chunk);
     },
-    flush() { if (settle) settle(total); },
+    flush() { if (settle) settle({ bytes: total, aborted: false }); },
+    // 客户端中途断开（弱网断流 / 播放器放弃）→ 把已传输的字节与「中断」标记一起交账
+    cancel() { aborted = true; if (settle) settle({ bytes: total, aborted: true }); },
   });
 
   return new Response(response.body.pipeThrough(counter), {
@@ -86,7 +92,10 @@ export default {
             ctx,
             failed: response.status >= 500,
           });
-          response = countResponseBytes(response, scope, env, ctx);
+          // 媒体流分类：206 分片 / video|audio 内容 / 带 Range 的请求 —— 播放链路专用维度
+          const ct = response.headers.get('content-type') || '';
+          const media = response.status === 206 || /^(?:video|audio)\//.test(ct) || !!request.headers.get('range');
+          response = countResponseBytes(response, scope, env, ctx, media);
         }
       } catch {}
       return response;

@@ -35,6 +35,9 @@ import { STATS_RANGES, DEFAULT_RANGE_DAYS } from './stats.js';
 const STATS_METRICS = [
   { key: 'hits', label: '请求数', fmt: 'int' },
   { key: 'bytes', label: '流量', fmt: 'bytes' },
+  { key: 'hits', label: '请求数', fmt: 'int' },
+  { key: 'bytes', label: '流量', fmt: 'bytes' },
+  { key: 'mbytes', label: '媒体流量', fmt: 'bytes' },
   { key: 'errors', label: '错误数', fmt: 'int' },
 ];
 
@@ -73,7 +76,7 @@ function metricOptions() {
 function dashboardCard() {
   return `<div class="card" id="statsCard" data-pane="stats">
     <h2>数据驾驶舱</h2>
-    <div class="hint" style="margin:-8px 0 var(--sp-3);">按天汇总全站访问：请求数、流量、来访者与错误。数据只存在你自己的存储里，来访者以「IP + 安装级盐值」的哈希记录，原始 IP 不落盘。</div>
+    <div class="hint" style="margin:-8px 0 var(--sp-3);">按天汇总全站访问：请求数、实际传输流量、媒体流量（视频/音频/分片）、传输中断与来访者。流量按边缘实际发出的字节计，不信任响应头；「中断」是客户端在流中途放弃（播放器卡死/弱网断流），大量出现就是「流量大但播不了」的日志侧信号。数据只存在你自己的存储里，来访者以「IP + 安装级盐值」的哈希记录，原始 IP 不落盘。</div>
 
     <div class="st-bar">
       <div class="st-seg" id="stDays">${rangeButtons()}</div>
@@ -195,14 +198,22 @@ function statsInit() {
     var activeDays = daily.filter(function (x) { return x.hits > 0; }).length;
     var peak = daily.reduce(function (a, x) { return (!a || x.hits > a.hits) ? x : a; }, null);
     var errRate = t.hits ? (t.errors / t.hits * 100) : 0;
+    var abortRate = t.hits ? (t.aborts / t.hits * 100) : 0;
     var items = [
       { label: '总请求数', value: fmtInt(t.hits), sub: '日均 ' + fmtInt(daily.length ? t.hits / daily.length : 0) + ' 次' },
-      { label: '总流量', value: fmtBytes(t.bytes), sub: '响应体大小合计' },
+      { label: '总流量', value: fmtBytes(t.bytes), sub: '实际传输字节' },
+      { label: '媒体流量', value: fmtBytes(t.mbytes), sub: '视频 / 音频 / 分片' },
+      { label: '传输中断', value: fmtInt(t.aborts), sub: '客户端中途断开', err: t.aborts > 0 },
       { label: '独立访客', value: fmtInt(t.uv), sub: '各通道之和（去重上限）' },
       { label: '错误数', value: fmtInt(t.errors), sub: '占比 ' + errRate.toFixed(errRate < 10 ? 1 : 0) + '%', err: t.errors > 0 },
       { label: '有数据的天数', value: activeDays + ' / ' + daily.length, sub: '统计保留 ' + (d.retention_days || '-') + ' 天' },
       { label: '峰值日', value: peak && peak.hits ? fmtInt(peak.hits) : '—', sub: peak && peak.hits ? peak.date : '暂无访问' },
     ];
+    // 中断占比超过 1% 就提一嘴：大量 499 = 客户端在流中间放弃（播放器卡死 / 弱网），
+    // 这是「流量大但播不了」最直接的日志侧信号
+    if (t.aborts && abortRate >= 1) {
+      items.splice(3, 0, { label: '中断占比', value: abortRate.toFixed(1) + '%', sub: '占总请求数', err: true });
+    }
     $('#stKpis').innerHTML = items.map(function (x) {
       return '<div class="st-kpi"><span class="st-kpi-label">' + x.label + '</span>'
         + '<span class="st-kpi-value' + (x.err ? ' err' : '') + '">' + x.value + '</span>'
@@ -225,7 +236,9 @@ function statsInit() {
     chart.innerHTML = daily.map(function (x, i) {
       var v = values[i];
       var pct = Math.max(v > 0 ? 4 : 1.5, Math.round(v / max * 100));
-      var tip = x.date + '：请求 ' + fmtInt(x.hits) + ' 次 · 流量 ' + fmtBytes(x.bytes) + ' · 错误 ' + fmtInt(x.errors) + ' 次';
+      var tip = x.date + '：请求 ' + fmtInt(x.hits) + ' 次 · 流量 ' + fmtBytes(x.bytes)
+        + ' · 媒体 ' + fmtBytes(x.mbytes) + ' · 错误 ' + fmtInt(x.errors) + ' 次'
+        + (x.aborts ? ' · 中断 ' + fmtInt(x.aborts) + ' 次' : '');
       return '<i class="st-col' + (v > 0 ? '' : ' zero') + '" style="height:' + pct + '%" title="' + tip + '"></i>';
     }).join('');
     // 日期标签按需稀疏：柱数多于 8 根时隔几根标一个，避免手机上糊成一片
@@ -251,7 +264,8 @@ function statsInit() {
       return '<div class="st-row">'
         + '<div class="st-row-head">'
         + '<span class="st-row-name">' + esc(scopeName(s.scope)) + '</span>'
-        + '<span class="st-row-nums">' + fmtInt(s.hits) + ' 次 · ' + fmtBytes(s.bytes) + ' · ' + fmtInt(s.uv) + ' 访客'
+        + '<span class="st-row-nums">' + fmtInt(s.hits) + ' 次 · ' + fmtBytes(s.bytes) + ' · 媒体 ' + fmtBytes(s.mbytes) + ' · ' + fmtInt(s.uv) + ' 访客'
+        + (s.aborts ? ' · <em class="st-err">' + fmtInt(s.aborts) + ' 中断</em>' : '')
         + (s.errors ? ' · <em class="st-err">' + fmtInt(s.errors) + ' 错误</em>' : '') + '</span>'
         + '</div>'
         + '<div class="st-track"><i style="width:' + pct + '%"></i></div>'

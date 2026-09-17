@@ -13,7 +13,7 @@
 import worker from '../worker.js';
 import { bindRuntime } from '../src/runtime.js';
 import { adminPage } from '../src/admin.js';
-import { flush } from '../src/stats.js';
+import { flush, recordBytes } from '../src/stats.js';
 import { STATS_JS, renderStatsPane } from '../src/stats-ui.js';
 import { CONFIG_JS } from '../src/config-ui.js';
 import { VISIT_SCOPES, matchVisitScope, isAdminScope, scopeLabels } from '../src/scopes.js';
@@ -131,8 +131,9 @@ section('1. 请求出口的采集（曾经 record() 没有任何调用方）');
 // ===================== 2. 流量口径 =====================
 section('2. 流量口径（Content-Length 与 chunked 两条路都要记上）');
 {
-  // 2a. 上游给了 Content-Length → record() 照响应头记，不必套流。
-  //     （反代文本响应会主动删掉 content-length，所以这条主要覆盖 JSON 与直通大文件。）
+  // 2a. 上游给了 Content-Length → 字节由出口流的**实际传输计数**回填。
+  //     （旧实现是 record() 照响应头记——头是「声称的大小」，客户端中途掐断时
+  //       整片大小被当成实际流量，线上实测边缘只发了 0.5GB、日志记了 20GB。）
   const d0 = (await apiGet('/__api/stats?days=7', { Cookie: COOKIE })).data || {};
   const before = ((d0.series || []).find(s => s.scope === 'p:demo') || {}).bytes || 0;
   await visit('/p/demo/d', { headers: VISITOR });
@@ -200,6 +201,83 @@ section('2. 流量口径（Content-Length 与 chunked 两条路都要记上）')
   const demo2 = (d3.series || []).find(s => s.scope === 'p:demo2');
   ok('「响应后才登记」的约束下 chunked 流量仍然记上了', !!demo2 && demo2.bytes === 250,
     demo2 ? `bytes=${demo2.bytes}（期望 250）` : '未找到 p:demo2');
+
+  // 恢复成常规假源站
+  globalThis.fetch = async () => new Response(UP_BODY, {
+    status: 200,
+    headers: { 'content-type': 'text/html; charset=utf-8', 'content-length': String(Buffer.byteLength(UP_BODY)) },
+  });
+}
+
+// ===================== 2.5 落盘健壮性：写失败不能丢账 =====================
+section('2.5 落盘失败自动重试（KV 抖动不再蒸发计数）');
+{
+  // 旧实现 flush() 先清内存再写，写失败被 catch 吞掉 → 整段计数静默蒸发，
+  // 线上表现为「日志的请求数/流量与边缘日志对不上」。这里把写失败变成红灯。
+  const before = (await apiGet('/__api/stats?days=7', { Cookie: COOKIE })).data || {};
+  const b0 = ((before.series || []).find(s => s.scope === 'p:demo') || {}).bytes || 0;
+
+  await recordBytes({ scope: 'p:demo', bytes: 777, env });
+  const realPut = kv.put;
+  let putFail = 0;
+  kv.put = async () => { putFail++; throw new Error('KV 抖动'); };
+  await flush(env);
+  kv.put = realPut;
+  ok('模拟存储抖动并观察到写失败', putFail >= 1, `${putFail} 次失败`);
+
+  await flush(env);   // 恢复后再落盘
+  const d = (await apiGet('/__api/stats?days=7', { Cookie: COOKIE })).data || {};
+  const b1 = ((d.series || []).find(s => s.scope === 'p:demo') || {}).bytes || 0;
+  ok('写失败的那笔在恢复后补上了（数据不丢）', b1 - b0 >= 777, `bytes ${b0} -> ${b1}`);
+}
+
+// ===================== 2.6 媒体分类与传输中断（播放链路诊断维度） =====================
+section('2.6 媒体流量 mbytes 与传输中断 aborts');
+{
+  // 2e. 媒体流分类：video/mp4 直通 → 流量单独进 mbytes，回答「流量都去哪了」
+  mem.set('site:demo4', JSON.stringify({
+    id: 'demo4', name: '四号片场', host: '127.0.0.1', target: 'http://127.0.0.1', scheme: 'http',
+  }));
+  const MOV = 'M'.repeat(1200);
+  globalThis.fetch = async () => new Response(new ReadableStream({
+    start(c) { c.enqueue(new TextEncoder().encode(MOV)); c.close(); },
+  }), { status: 200, headers: { 'content-type': 'video/mp4' } });
+
+  await visit('/p/demo4/film.mp4', { headers: VISITOR });
+  await flush(env);
+  const d5 = (await apiGet('/__api/stats?days=7', { Cookie: COOKIE })).data || {};
+  const demo4 = (d5.series || []).find(s => s.scope === 'p:demo4');
+  ok('视频响应计入媒体流量', !!demo4 && demo4.mbytes === MOV.length,
+    demo4 ? `mbytes=${demo4.mbytes}（期望 ${MOV.length}）` : '未找到 p:demo4');
+  ok('这条只有媒体：总流量 == 媒体流量', !!demo4 && demo4.bytes === demo4.mbytes,
+    demo4 ? `bytes=${demo4.bytes} mbytes=${demo4.mbytes}` : '');
+
+  // 2f. ⭐ 传输中断：客户端读一半就 cancel（播放器放弃 / 弱网断流）→ aborts +1，
+  //     已传输的字节照记（既不是整片、也不是 0）。头部谎报 80000 也不能多记。
+  mem.set('site:demo5', JSON.stringify({
+    id: 'demo5', name: '五号基站', host: '127.0.0.1', target: 'http://127.0.0.1', scheme: 'http',
+  }));
+  globalThis.fetch = async () => new Response(new ReadableStream({
+    start(c) { c.enqueue(new TextEncoder().encode('P'.repeat(8000))); /* 故意不 close：等客户端放弃 */ },
+  }), { status: 200, headers: { 'content-type': 'video/mp4', 'content-length': '80000' } });
+
+  const pending2 = [];
+  const ctx2 = { waitUntil: (p) => { pending2.push(p); } };
+  const res5 = await worker.fetch(new Request(ORIGIN + '/p/demo5/live', { headers: VISITOR }), env, ctx2);
+  const reader = res5.body.getReader();
+  await reader.read();          // 先消费一部分
+  await reader.cancel();        // 客户端中途放弃
+  await Promise.all(pending2.map(p => Promise.resolve(p).catch(() => {})));
+  await new Promise(r => setTimeout(r, 10));
+  await flush(env);
+
+  const d6 = (await apiGet('/__api/stats?days=7', { Cookie: COOKIE })).data || {};
+  const demo5 = (d6.series || []).find(s => s.scope === 'p:demo5');
+  ok('中断被计入（aborts=1）', !!demo5 && demo5.aborts === 1, demo5 ? `aborts=${demo5.aborts}` : '未找到 p:demo5');
+  ok('中断时已传输的字节照记（且远小于头部声称的 80000）', !!demo5 && demo5.bytes > 0 && demo5.bytes < 80000,
+    demo5 ? `bytes=${demo5.bytes}` : '');
+  ok('中断的媒体字节同样进 mbytes', !!demo5 && demo5.mbytes === demo5.bytes,
+    demo5 ? `mbytes=${demo5.mbytes}` : '');
 
   // 恢复成常规假源站
   globalThis.fetch = async () => new Response(UP_BODY, {
@@ -276,6 +354,8 @@ section('6. 汇总口径（日期补齐 / 保留天数上限）');
   ok('daily 与 dates 一一对应', (d.daily || []).length === dates.length, `daily=${(d.daily || []).length}`);
   ok('错误数被计入', !!other && other.errors === 1, other ? `errors=${other.errors}` : '');
   ok('流量被计入', !!other && other.bytes === 500, other ? `bytes=${other.bytes}` : '');
+  ok('旧格式桶（无新字段）聚合不报错，新字段为 0', !!other && other.aborts === 0 && other.mbytes === 0,
+    other ? `aborts=${other.aborts} mbytes=${other.mbytes}` : '');
 
   const clamped = (await apiGet('/__api/stats?days=9999', { Cookie: COOKIE })).data || {};
   ok('请求天数被保留天数上限夹住', clamped.days === clamped.retention_days, `days=${clamped.days} retention=${clamped.retention_days}`);
@@ -351,11 +431,11 @@ section('8. 驾驶舱页面与注入脚本');
   const payload = {
     ok: true, enabled: true, days: 7, retention_days: 30, top_limit: 10,
     dates: [today],
-    daily: [{ date: today, hits: 9, bytes: 1536, errors: 1 }],
-    totals: { hits: 9, bytes: 1536, errors: 1, uv: 3 },
+    daily: [{ date: today, hits: 9, bytes: 1536, errors: 1, aborts: 2, mbytes: 1024 }],
+    totals: { hits: 9, bytes: 1536, errors: 1, aborts: 2, mbytes: 1024, uv: 3 },
     series: [{
-      scope: 'p:demo', hits: 9, bytes: 1536, errors: 1, uv: 3,
-      days: [{ date: today, hits: 9, bytes: 1536, errors: 1, uv: 0 }],
+      scope: 'p:demo', hits: 9, bytes: 1536, errors: 1, aborts: 2, mbytes: 1024, uv: 3,
+      days: [{ date: today, hits: 9, bytes: 1536, errors: 1, aborts: 2, mbytes: 1024, uv: 0 }],
     }],
   };
   const fakeApi = (path) => Promise.resolve(
@@ -369,6 +449,8 @@ section('8. 驾驶舱页面与注入脚本');
   // 数据是异步来的，放一拍再断言
   await new Promise(r => setTimeout(r, 30));
   ok('KPI 区渲染出了数字', /\d/.test(nodeOf('#stKpis').innerHTML), nodeOf('#stKpis').innerHTML.slice(0, 60) || '(空)');
+  ok('KPI 渲染出媒体流量与传输中断维度', nodeOf('#stKpis').innerHTML.includes('媒体流量') && nodeOf('#stKpis').innerHTML.includes('传输中断'),
+    nodeOf('#stKpis').innerHTML.slice(0, 120) || '(空)');
   ok('通道排行渲染出了内容（esc 之类闭包变量缺失会整块空白）',
     /st-row-name/.test(nodeOf('#stRank').innerHTML) && nodeOf('#stRank').innerHTML.includes('演示站'),
     nodeOf('#stRank').innerHTML.slice(0, 90) || '(空)');
