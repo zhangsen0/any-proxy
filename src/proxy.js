@@ -323,7 +323,13 @@ async function proxyRequest(request, site, crossHost, ctx, env) {
 
   // 编码检测：上游非 utf-8（gb2312/GBK 等老站）必须按实际编码解码，否则全文乱码。
   // 顺序：Content-Type charset -> HTML <meta> charset -> utf-8 兜底。
-  const raw = await upstream.arrayBuffer();
+  const { raw } = await plaintextBuffer(upstream);
+  if (raw === null) {
+    // 上游发了一种本环境解不了的压缩格式（如运行时不支持 br）：整响应原样透传，
+    // 头里的 content-encoding 保留——头体一致，浏览器自己能解。绝不能把压缩字节
+    // 当文本改写（那正是整站乱码的来源），也不能删头（删了浏览器更解不了）。
+    return new Response(upstream.body, { status: upstream.status, headers: headersOut });
+  }
   let enc = 'utf-8';
   const ctCharset = ct.match(/charset=([^\s;]+)/i);
   if (ctCharset) enc = ctCharset[1];
@@ -416,6 +422,32 @@ function rewriteSetCookies(out, upstream, cookiePath) {
  *      既救不了过载的源站（真退避应该是秒级指数），又实打实让用户多等 300ms。
  *   3. HTTPS 完全不可用时降级 HTTP（自签证书或纯 HTTP 源站）。
  */
+/**
+ * 把上游响应体读成明文 Buffer。
+ *
+ * Workers 运行时只自动解 gzip/deflate；br / zstd 会**原样透传**。上游若无视
+ * 上面发出去的 `Accept-Encoding: identity` 强行返回 br（真实事故：uhdnow 整站乱码），
+ * 压缩字节按文本解码就是整页乱码，且后面还会删掉 content-encoding 头，体头彻底对不上。
+ * 所以这里识别「运行时不自动解」的格式，能用 DecompressionStream 就地解成明文；
+ * 解不了（运行时不认识该格式）就返回 null，由调用方整响应透传（头体一致）。
+ *
+ * @returns {{ raw: ArrayBuffer|null, compressed: boolean }}
+ *          raw=null 表示无法解压，调用方必须连头带体原样透传
+ */
+async function plaintextBuffer(upstream) {
+  const enc = String(upstream.headers.get('content-encoding') || '').trim().toLowerCase();
+  if (!enc || enc === 'identity' || enc === 'gzip' || enc === 'deflate' || enc === 'x-gzip') {
+    // 这些情况拿到的已是明文：gzip/deflate 由运行时透明解压，其余本就未压缩
+    return { raw: await upstream.arrayBuffer(), compressed: false };
+  }
+  try {
+    const stream = upstream.body.pipeThrough(new DecompressionStream(enc));
+    return { raw: await new Response(stream).arrayBuffer(), compressed: true };
+  } catch {
+    return { raw: null, compressed: true };
+  }
+}
+
 async function fetchUpstream(targetUrl, reqInit, hedgeMs = 0) {
   const method = String(reqInit.method || 'GET').toUpperCase();
   const idempotent = (method === 'GET' || method === 'HEAD') && !reqInit.body;

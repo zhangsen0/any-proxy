@@ -15,6 +15,7 @@
 import { handleRequest } from '../src/router.js';
 import { bindRuntime } from '../src/runtime.js';
 import { kvKey } from '../src/util.js';
+import zlib from 'node:zlib';
 
 const ORIGIN = 'https://proxy.example.com';
 const PASSWORD = 'dev';
@@ -179,6 +180,69 @@ console.log('\n[5] 优选候选的同源自拉必须带凭据（否则被自家�
   } finally {
     mem.delete('SUB_URL');
     globalThis.fetch = realFetch;
+  }
+}
+
+console.log('\n[6] 上游无视 Accept-Encoding: identity 强发 br（整站乱码事故回归）');
+// 背景：proxyRequest 向上游发的是 Accept-Encoding: identity，但真实世界有源站无视它
+// 强行返回 br。Workers 运行时只自动解 gzip/deflate，br 会原样透传——压缩字节按文本
+// 解码就是整页乱码，且后续还会删掉 content-encoding 头，体头彻底对不上。
+// 回归口径：br 必须被解成明文再改写；运行时不支持的格式则连头带体原样透传。
+{
+  const realFetch = globalThis.fetch;
+  const realDS = globalThis.DecompressionStream;
+  const brBody = zlib.brotliCompressSync(Buffer.from(ORIGIN_BODY, 'utf8'));
+  // 本地 Node 的 DecompressionStream 不认识 br：用 zlib 桩一个，专门验证解压路径
+  class BrDecompressionStream {
+    constructor(format) {
+      if (String(format).toLowerCase() !== 'br') throw new TypeError('unsupported: ' + format);
+      const d = zlib.createBrotliDecompress();
+      this.readable = new ReadableStream({
+        start(c) { d.on('data', x => c.enqueue(new Uint8Array(x))); d.on('end', () => c.close()); d.on('error', e => c.error(e)); },
+        cancel() { d.destroy(); },
+      });
+      this.writable = new WritableStream({
+        write(x) { return new Promise((res, rej) => d.write(x, err => (err ? rej(err) : res()))); },
+        close() { return new Promise(res => d.end(() => res())); },
+        abort(e) { d.destroy(e); },
+      });
+    }
+  }
+  let sawAcceptEncoding = '';
+  const brUpstream = async () => new Response(brBody, {
+    status: 200,
+    headers: { 'content-type': 'text/html; charset=utf-8', 'content-encoding': 'br' },
+  });
+  try {
+    // 场景 A：运行时支持 br（有 DecompressionStream）→ 必须解成明文再改写输出
+    globalThis.fetch = async (url, init) => {
+      sawAcceptEncoding = String((init && init.headers instanceof Headers
+        ? init.headers.get('accept-encoding') : (init && init.headers && init.headers['accept-encoding'])) || '');
+      return brUpstream();
+    };
+    globalThis.DecompressionStream = BrDecompressionStream;
+    const a = await call('/p/demo/', { 'Accept-Encoding': 'br' });
+    ok('上游响应 200', a.status === 200, `status=${a.status}`);
+    ok('发给上游的仍是 identity（省一次解压是优化，不是依赖）', sawAcceptEncoding === 'identity',
+      `accept-encoding=${sawAcceptEncoding}`);
+    const textA = new TextDecoder().decode(a.buf);
+    ok('br 被解成明文（正文可读、无乱码）', textA.includes('演示站') && !textA.includes('\uFFFD'),
+      `len=${a.buf.length}`);
+    ok('输出不带 content-encoding（已解压，头必须同步）', !a.headers.get('content-encoding'),
+      `enc=${a.headers.get('content-encoding') || '无'}`);
+
+    // 场景 B：运行时不认识这种格式（构造即抛）→ 连头带体原样透传，浏览器自己解
+    globalThis.DecompressionStream = class { constructor() { throw new TypeError('unsupported'); } };
+    const b = await call('/p/demo/', { 'Accept-Encoding': 'br' });
+    ok('解不开时返回 200（降级透传而不是 5xx）', b.status === 200, `status=${b.status}`);
+    ok('透传保留 content-encoding（头体一致，浏览器可自行解码）',
+      (b.headers.get('content-encoding') || '').toLowerCase() === 'br',
+      `enc=${b.headers.get('content-encoding')}`);
+    ok('透传体就是上游原始压缩字节（未被当文本改写）',
+      Buffer.compare(Buffer.from(b.buf), brBody) === 0, `len=${b.buf.length} vs ${brBody.length}`);
+  } finally {
+    globalThis.fetch = realFetch;
+    globalThis.DecompressionStream = realDS;
   }
 }
 
