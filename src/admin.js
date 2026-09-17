@@ -10,7 +10,7 @@ import {
   themeCss, baseVarsCss, applyScript, THEME_STORAGE_KEY, DEFAULT_PRESET_ID,
   rotatingTheme, rotatePool,
 } from './themes.js';
-import { readStatsConfig, saveStatsConfig, summarize, STATS_SPEC } from './stats.js';
+import { readStatsConfig, saveStatsConfig, summarize, clearAll, STATS_SPEC } from './stats.js';
 import {
   readLimitConfig, saveLimitConfig, listBans, clearBans, RATELIMIT_SPEC,
 } from './ratelimit.js';
@@ -23,6 +23,7 @@ import {
   revokeShare, enableShare, deleteShare, linkPath, SHARE_SPEC,
 } from './share.js';
 import { renderConfigPanels, settingFormById, CONFIG_JS, CONFIG_CSS } from './config-ui.js';
+import { renderStatsPane, STATS_JS, STATS_CSS } from './stats-ui.js';
 import { readTagSettings, saveTagSettings } from './nodetag.js';
 
 // 站点管理：REST API + 服务端渲染的管理页
@@ -285,6 +286,11 @@ async function handleAdmin(request, url, env) {
   // ---- 访问统计数据：?days=N 指定天数（默认 7，上限为配置的保留天数） ----
   if (request.method === 'GET' && path === '/__api/stats') {
     return json(await summarize(env, url.searchParams.get('days')));
+  }
+  // ---- 清空统计数据（保留配置）：驾驶舱上的「清空数据」按钮 ----
+  if (request.method === 'POST' && path === '/__api/stats/clear') {
+    const r = await clearAll();
+    return json({ ok: true, removed: r.removed });
   }
 
   // ---- 限流与防滥用 ----
@@ -775,6 +781,8 @@ async function adminPage(authed, origin, env) {
   /* 配置页：设置表单 / 工具 / 跳转行。样式与渲染同源于 src/config-ui.js，
      布局细节随主题变量走，换主题时这一屏跟着一起变 */
 ${CONFIG_CSS}
+  /* 数据驾驶舱（KPI / 趋势图 / 通道排行），同样只走主题变量 */
+${STATS_CSS}
 </style>
 ${themeScript}
 </head>
@@ -796,6 +804,7 @@ ${themeScript}
   ${authed ? `
   <nav class="tabs" id="paneTabs">
     <button type="button" class="tab" data-tab="sites">站点</button>
+    <button type="button" class="tab" data-tab="stats">数据驾驶舱</button>
     <button type="button" class="tab" data-tab="proxy">代理节点</button>
     <button type="button" class="tab" data-tab="preferred">优选 IP</button>
     <button type="button" class="tab" data-tab="security">伪装与安全</button>
@@ -803,6 +812,8 @@ ${themeScript}
     <button type="button" class="tab" data-tab="share">临时链接</button>
     <button type="button" class="tab" data-tab="config">配置</button>
   </nav>` : ''}
+
+  ${authed ? renderStatsPane() : ''}
 
   ${authed ? `
   <div class="card" data-pane="proxy" style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;">
@@ -1715,6 +1726,8 @@ function switchPane(name) {
   paneTabs.forEach(function (b) {
     b.classList.toggle('active', b.getAttribute('data-tab') === name);
   });
+  // 驾驶舱要给全部历史做聚合，切到它才取数（脚本未就绪时它是空函数，直接跳过）
+  if (name === 'stats' && typeof window.__statsEnsure === 'function') window.__statsEnsure();
   try { history.replaceState(null, '', '#' + name); } catch (e) {}
 }
 if (paneTabs.length) {
@@ -1754,6 +1767,7 @@ if (ntEnabled) {
   };
 }
 ${authed ? CONFIG_JS : ''}
+${authed ? STATS_JS : ''}
 
 /* ===== 站点临时访问链接：列表 + 生成 + 停用 / 启用 + 删除 ===== */
 (function () {

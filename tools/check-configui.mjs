@@ -160,6 +160,8 @@ section('4. 同一份配置只有一处可改');
     share: ['shSite', 'shCreate', 'shList'],
     sites: ['addCard', 'editModal'],
     proxy: ['nodeTagCard', 'subUrl', 'ntEnabled'],
+    // 驾驶舱：图表容器 + 设置表单都得在「数据驾驶舱」选项卡里，别在搬家时丢件
+    stats: ['statsCard', 'stDays', 'stKpis', 'stChart', 'stRank'],
   };
   for (const [tab, ids] of Object.entries(anchors)) {
     const missing = ids.filter(id => !pageHtml.includes(id));

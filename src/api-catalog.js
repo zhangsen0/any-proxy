@@ -38,6 +38,7 @@ import { SHARE_SPEC } from './share.js';
 /** 选项卡 id -> 显示名。跳转行与手册按它出文案，避免多处各写一遍中文 */
 export const TAB_LABELS = {
   sites: '站点',
+  stats: '数据驾驶舱',
   proxy: '代理节点',
   preferred: '优选 IP',
   security: '伪装与安全',
@@ -58,10 +59,12 @@ const SELECT = {
 
 export const API_CATALOG = [
   // ===================== 配置页自己的设置（没有专门选项卡的功能） =====================
+  // ===================== 归属「数据驾驶舱」：图表在那边看，设置也在那边改 =====================
   {
     id: 'stats',
     name: '访问统计',
     desc: '按天记录各通道的请求数与流量，用来回答「最近谁在用什么」。',
+    tab: 'stats',
     items: [
       {
         id: 'stats-config', name: '统计设置', kind: 'setting',
@@ -80,8 +83,13 @@ export const API_CATALOG = [
       },
       {
         id: 'stats', name: '查看统计数据', kind: 'query', path: '/__api/stats',
-        desc: '按天聚合的通道排行、流量与来访数',
+        desc: '按天聚合的通道排行、流量与来访数（驾驶舱用的就是这份数据）',
         params: [{ key: 'days', label: '统计天数', type: 'number', in: 'query', placeholder: '7' }],
+      },
+      {
+        id: 'stats-clear', name: '清空统计数据', kind: 'action', method: 'POST', path: '/__api/stats/clear',
+        desc: '删掉已落盘的全部访问记录，保留统计设置本身',
+        danger: true,
       },
     ],
   },

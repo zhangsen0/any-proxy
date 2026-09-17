@@ -14,6 +14,7 @@
  *   src/admin.js   管理 REST API 与管理页
  *   src/auth.js    登录 / 登出 / 登录页
  *   src/dns.js     优选 IP 与 DNS 自动更新
+ *   src/stats.js   访问统计（内存聚合 + 批量落盘）
  *   src/util.js    无依赖小工具
  *   vendor/vless.js  第三方 edgetunnel 代理引擎（VLESS / Trojan / SS）
  */
@@ -21,12 +22,47 @@ import { bindRuntime } from './src/runtime.js';
 import { handleRequest } from './src/router.js';
 import { scheduledDnsCheck } from './src/dns.js';
 import { readConfig, isActive, renderNotFound } from './src/disguise.js';
+import { record as recordVisit } from './src/stats.js';
+
+/**
+ * 请求路径 -> 统计通道。放在入口而不是路由内部：路由里分支太多，
+ * 每加一个出口就要记得补一次统计，漏一个就是「某个通道的数据永远为空」。
+ * 返回空字符串表示不计入（伪装页、favicon、robots 这类噪声）。
+ */
+function visitScope(pathname) {
+  const p = String(pathname || '');
+  let m = /^\/p\/([^/]+)/.exec(p);
+  if (m) return 'p:' + decodeURIComponent(m[1]);
+  if (/^\/s\/[^/]+/.test(p)) return 'share';
+  if (p === '/tsub' || p.startsWith('/tsub/')) return 'tsub';
+  if (p === '/sub' || p.startsWith('/sub/')) return 'sub';
+  if (p === '/edt' || p.startsWith('/edt/')) return 'edt';
+  if (p === '/admin' || p.startsWith('/admin/')) return 'edt-admin';
+  if (p === '/__admin' || p === '/__tsub' || p.startsWith('/__api')) return 'admin';
+  if (p === '/__login' || p === '/login') return 'login';
+  return '';
+}
 
 export default {
   async fetch(request, env, ctx) {
     try {
       bindRuntime(env);
-      return await handleRequest(request, env, ctx);
+      const response = await handleRequest(request, env, ctx);
+      // 统计永不阻塞、永不抛：record 内部把落盘挂到 waitUntil，异常就地吞掉
+      try {
+        const scope = visitScope(new URL(request.url).pathname);
+        if (scope) {
+          recordVisit({
+            scope,
+            response,
+            ip: request.headers.get('CF-Connecting-IP'),
+            env,
+            ctx,
+            failed: response.status >= 500,
+          });
+        }
+      } catch {}
+      return response;
     } catch (e) {
       // 全局兜底：任何未捕获异常返回 500 + 错误信息，避免 CF 层 530（并发突发时曾集体 530）。
       // 但伪装开启时不能把内部异常原文吐给陌生人 —— 那等于替攻击者解释了一次失败原因，

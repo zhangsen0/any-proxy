@@ -174,7 +174,7 @@ function renderConfigPanels() {
   const parts = [];
 
   parts.push('<div class="cfg-lead" data-pane="config">这里只放没有独立选项卡的设置项。'
-    + '其余功能（站点、优选 IP、伪装、主题、临时链接）各自有专属选项卡，用顶部标签切换即可。</div>');
+    + '其余功能（站点、数据驾驶舱、优选 IP、伪装、主题、临时链接）各自有专属选项卡，用顶部标签切换即可。</div>');
 
   for (const { group, items } of cards) {
     const settings = items.filter(i => kindOf(i) === 'setting');
@@ -405,7 +405,12 @@ function configInit() {
 // 浏览器侧没有它，于是注入脚本一执行就抛 ReferenceError，整段脚本中断 —— 表现为
 // 「一直加载中」+ 配置页/临时链接页按钮失灵。这里在注入脚本顶部自备一个 __name，
 // 没有 keep-names 时它只是个不会被调用的空函数，完全无害。
-const CONFIG_JS = `var __name=function(t,v){try{Object.defineProperty(t,"name",{value:v,configurable:true});}catch(e){}return t;};(${configInit.toString()})();`;
+//
+// 任何「把函数 toString() 注入浏览器」的模块都必须带上它（见 src/stats-ui.js），
+// 所以它被导出复用，而不是各文件各抄一份。
+const KEEP_NAMES_SHIM = 'var __name=function(t,v){try{Object.defineProperty(t,"name",{value:v,configurable:true});}catch(e){}return t;};';
+
+const CONFIG_JS = `${KEEP_NAMES_SHIM}(${configInit.toString()})();`;
 
 // ===================== 样式 =====================
 //
@@ -475,4 +480,4 @@ const CONFIG_CSS = `
   .cfg-result pre { margin:0; max-height:260px; overflow:auto; background:var(--input); border:1px solid var(--line); border-radius:var(--radius-xs); padding:10px; font-family:var(--font-mono); font-size:11.5px; line-height:1.7; color:var(--txt); white-space:pre-wrap; word-break:break-all; }
 `;
 
-export { renderConfigPanels, CONFIG_JS, CONFIG_CSS, ADMIN_PATHS, AUTHED_PATHS, TAB_LABELS };
+export { renderConfigPanels, CONFIG_JS, CONFIG_CSS, KEEP_NAMES_SHIM, ADMIN_PATHS, AUTHED_PATHS, TAB_LABELS };

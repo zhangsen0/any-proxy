@@ -69,6 +69,17 @@ export { SPEC as STATS_SPEC };
 // ===================== 对外：记录一次访问 =====================
 
 /**
+ * 管理类通道：面板与登录页自己的访问。它们只有开 record_admin 时才计入 ——
+ * 否则「我自己看面板」会把访客统计搅浑（统计的用来看谁来用站点，不是用来看自己）。
+ */
+const ADMIN_SCOPES = ['admin', 'login', 'edt-admin'];
+
+/** 通道识别：路由层按路径判定 scope，判定口径集中在这里，避免两处各写一份 */
+export function isAdminScope(scope) {
+  return ADMIN_SCOPES.indexOf(String(scope)) >= 0;
+}
+
+/**
  * 记录一次访问。设计约定：
  *   - 同步部分只做加法，绝不 await 存储 —— 调用方可以有 ctx 也可以没有（websocket 等场景）
  *   - ctx 存在时用 waitUntil 落盘；不存在（本地脚本 / 定时任务）就直接累计，等待下次机会
@@ -86,6 +97,7 @@ export function record({ scope, response, ip, env, ctx, failed }) {
   schedulePersist(env, ctx, async () => {
     const cfg = await readStatsConfig(env);
     if (!cfg.enabled) return false;
+    if (isAdminScope(scope) && !cfg.record_admin) return false;
 
     const status = response ? response.status : 0;
     const len = response ? Number(response.headers.get('content-length') || 0) : 0;
@@ -301,6 +313,7 @@ export async function summarize(env, days) {
     enabled: cfg.enabled,
     days: wanted,
     retention_days: cfg.retention_days,
+    top_limit: Number(cfg.top_limit || SPEC.top_limit.default),
     dates: sortedDates,
     daily: sortedDates.map(d => daily.get(d) || { date: d, hits: 0, bytes: 0, errors: 0 }),
     series,
