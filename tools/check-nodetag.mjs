@@ -220,7 +220,7 @@ console.log('\n=== 7. 管理页渲染：配置卡片与绑定逻辑必须在同�
   const blocks = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)].map(m => m[1]);
   const js = blocks.join('\n');
   ok('主页脚本含分区切换逻辑', js.includes('switchPane') && js.includes('paneTabs'));
-  ok('主页脚本含标注保存逻辑', js.includes('/__api/ip-country'));
+  ok('主页脚本含标注保存逻辑', js.includes('/__api/node-tag'));
   // 分区数量会随功能增加（外观主题 / 配置都是后来加的），所以这里不写死个数，
   // 而是校验「标签与卡片一一对应」：每个标签都有卡片，且没有卡片挂在不存在标签上。
   // 这样加分区不用改测试，加错了（漏放卡片 / 标签拼错）依然会被抓出来。
@@ -230,6 +230,50 @@ console.log('\n=== 7. 管理页渲染：配置卡片与绑定逻辑必须在同�
   const tabSet = [...new Set(tabs)];
   ok('标签与卡片一一对应', tabSet.length > 0 && tabSet.every(t => tally[t] >= 1) && Object.keys(tally).every(p => tabSet.includes(p)), `标签 ${JSON.stringify(tabSet)} / 卡片 ${JSON.stringify(tally)}`);
   ok('每屏都有卡片（无空标签）', Object.values(tally).every(n => n >= 1));
+}
+
+console.log('\n=== 8. 管理接口：/__api/node-tag 必须真的能调通 ===');
+{
+  // 真人踩过的坑：admin.js 调用了 readTagSettings / saveTagSettings，却没把这两个
+  // 名字 import 进来。ESM 下这是运行时才炸的 ReferenceError，而 worker.js 的全局兜底
+  // 在伪装开启时会把任何未捕获异常渲染成「伪装 404」——前端表现就是「保存标注设置」
+  // 点了完全没反应，控制台只看到一个 404。
+  //
+  // 只断言 HTML 里出现这个路径字符串的测试抓不到这类问题（字符串本来就在），
+  // 所以这里必须从路由入口真打一次接口。
+  const { handleRequest } = await import('../src/router.js');
+  const ORIGIN = 'https://proxy.example.com';
+  const cookie = 'ap_auth=' + Buffer.from(env.PASSWORD).toString('base64');
+  const call = async (method, body) => {
+    try {
+      const res = await handleRequest(new Request(ORIGIN + '/__api/node-tag', {
+        method,
+        headers: { Cookie: cookie, ...(body ? { 'Content-Type': 'application/json' } : {}) },
+        body: body ? JSON.stringify(body) : undefined,
+      }), env, {});
+      return { status: res.status, ct: res.headers.get('content-type') || '', text: await res.text() };
+    } catch (e) {
+      // 抛出来就说明接口真的炸了（worker.js 线上会把它兜成伪装 404），当成失败上报
+      return { status: 0, ct: '', text: '', err: String((e && e.message) || e) };
+    }
+  };
+
+  const g = await call('GET');
+  ok('GET 返回 200（不是异常、不是伪装 404）', g.status === 200, `status=${g.status} ct=${g.ct}${g.err ? ' err=' + g.err : ''}`);
+  ok('返回 JSON 而不是 HTML 兜底页', /json/i.test(g.ct) && !g.text.includes('<html'), g.text.slice(0, 60));
+  let cfg = null;
+  try { cfg = JSON.parse(g.text).config; } catch {}
+  ok('带回开关与样式字段', !!cfg && typeof cfg.enabled === 'boolean' && !!cfg.style, JSON.stringify(cfg));
+
+  const p = await call('POST', { enabled: false, style: 'flag-name' });
+  ok('POST 保存返回 200', p.status === 200, `status=${p.status} ${/json/i.test(p.ct) ? '' : p.text.slice(0, 40)}${p.err ? ' err=' + p.err : ''}`);
+  let saved = null;
+  try { saved = JSON.parse(p.text).config; } catch {}
+  ok('保存后开关与样式真的写回', !!saved && saved.enabled === false && saved.style === 'flag-name', JSON.stringify(saved));
+  ok('来源变成面板配置（kv）', !!saved && saved.sourceOn === 'kv' && saved.sourceStyle === 'kv');
+
+  // 复原，避免影响其它用例对默认值的判断
+  await call('POST', { enabled: true, style: 'cn-code' });
 }
 
 globalThis.fetch = realFetch;
