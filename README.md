@@ -246,7 +246,13 @@ node tools/check-compress.mjs
 # 9. 代理链路冒烟（改任何一处请求处理链路后必跑）
 node tools/check-smoke.mjs
 
-# 10. 实测订阅里每个节点是否真的可用（需 Python 3）
+# 10. 主题系统自检（改 themes.js / admin.js 主题部分后必跑）
+node tools/check-themes.mjs
+
+# 11. 部署后线上冒烟：传目标地址与口令，跑主题与配置接口（结束会自动恢复默认主题）
+node tools/check-live.mjs https://<你的-worker>.workers.dev <PASSWORD>
+
+# 12. 实测订阅里每个节点是否真的可用（需 Python 3）
 SUB_URL=https://proxy.example.com/tsub/xxxx python3 - <<'EOF'
 import urllib.request
 open('/tmp/sub.txt','wb').write(urllib.request.urlopen('$SUB_URL').read())
