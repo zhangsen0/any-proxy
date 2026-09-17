@@ -400,7 +400,12 @@ function configInit() {
   });
 }
 
-const CONFIG_JS = `(${configInit.toString()})();`;
+// 兜底：构建期若被 esbuild --keep-names 改写，序列化进浏览器脚本的 configInit 内部箭头函数
+// 会变成 __name((...)=>..., "x") 的形式，但 __name 助手只存在于 Worker 包顶层（服务端），
+// 浏览器侧没有它，于是注入脚本一执行就抛 ReferenceError，整段脚本中断 —— 表现为
+// 「一直加载中」+ 配置页/临时链接页按钮失灵。这里在注入脚本顶部自备一个 __name，
+// 没有 keep-names 时它只是个不会被调用的空函数，完全无害。
+const CONFIG_JS = `var __name=function(t,v){try{Object.defineProperty(t,"name",{value:v,configurable:true});}catch(e){}return t;};(${configInit.toString()})();`;
 
 // ===================== 样式 =====================
 //

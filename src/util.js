@@ -1,11 +1,13 @@
 // 无依赖的通用工具：响应构造、编码、合法性判定、缓存指纹判定等
 
 function json(data, status = 200, extra = {}) {
+  // no-store：避免边缘节点把带鉴权的接口响应（含 401/404）缓存后回给其它访客
   return new Response(JSON.stringify(data), {
     status,
     headers: {
       'Content-Type': 'application/json; charset=utf-8',
       'Access-Control-Allow-Origin': '*',
+      'Cache-Control': 'no-store',
       ...extra,
     },
   });
