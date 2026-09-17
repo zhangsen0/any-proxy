@@ -1,13 +1,13 @@
 #!/usr/bin/env node
-// 出口压缩 + 上游请求策略的自检。
+// 出口编码契约 + 上游请求策略的自检。
 //
-// 压缩是「优化」类改动里最危险的一类：做对了只是快一点，
-// 做错了会把浏览器解不开的 body 发出去，整站 JS/CSS 一起挂。
-// 所以这里既验证「压了」，也验证「压完能还原成原文」，以及「不该压的别压」。
+// 出口编码曾经是「优化」类改动里最危险的一类：Worker 自己按入站 Accept-Encoding
+// 决定是否 gzip，结果被 CF 边缘的两个行为合伙搞成整站乱码（详见 src/compress.js
+// 顶部说明）——边缘会改写入站 AE，又会给没要压缩的客户端剥掉 Content-Encoding
+// 却不解压。现在契约收敛为一句话：**Worker 一律发明文，谁都不许在这里压缩**。
+// 本文件就是这条契约的牙齿：谁把 gzip 加回来，这里必须变红。
 
-import {
-  acceptsEncoding, compressible, finalizeResponse,
-} from '../src/compress.js';
+import { finalizeResponse } from '../src/compress.js';
 import { fetchUpstream } from '../src/proxy.js';
 
 let pass = 0;
@@ -17,60 +17,36 @@ function check(name, cond, extra) {
   else { fail++; console.log('  ❌ ' + name + (extra ? '  -> ' + extra : '')); }
 }
 
-async function gunzip(res) {
-  const buf = await res.arrayBuffer();
-  const out = new Blob([buf]).stream().pipeThrough(new DecompressionStream('gzip'));
-  return new Response(out).text();
+const PAGE = '<!DOCTYPE html><html><body>' + '代理内容 proxy content '.repeat(400) + '</body></html>';
+
+async function wireOf(ae) {
+  const res = finalizeResponse(200, PAGE, new Headers({ 'content-type': 'text/html; charset=utf-8' }), ae);
+  const buf = new Uint8Array(await res.arrayBuffer());
+  const text = new TextDecoder().decode(buf);
+  return { buf, text, res };
 }
 
-console.log('\n[1] Accept-Encoding 解析');
-check('普通 gzip', acceptsEncoding('gzip, deflate, br', 'gzip') === true);
-check('q=0 视为不接受', acceptsEncoding('gzip;q=0', 'gzip') === false);
-check('q=0.5 视为接受', acceptsEncoding('gzip;q=0.5', 'gzip') === true);
-check('通配符接受', acceptsEncoding('*', 'gzip') === true);
-check('只有 br 时 gzip 不算接受', acceptsEncoding('br', 'gzip') === false);
-check('只有 identity 不算接受', acceptsEncoding('identity', 'gzip') === false);
-check('空头不接受', acceptsEncoding('', 'gzip') === false);
+console.log('\n[1] 出口编码契约：任何 Accept-Encoding 都必须发明文');
+for (const ae of ['gzip', 'gzip, deflate, br', 'identity', 'xyz', '*', '', undefined]) {
+  const { buf, text, res } = await wireOf(ae);
+  const label = 'AE=' + JSON.stringify(ae ?? '(未传)');
+  const isGzip = buf.length >= 2 && buf[0] === 0x1f && buf[1] === 0x8b;
+  check(label + ' 明文输出（不是 gzip 字节）', !isGzip && text.includes('<!DOCTYPE'), `len=${buf.length}`);
+  check(label + ' 不带 Content-Encoding', res.headers.get('content-encoding') === null,
+    String(res.headers.get('content-encoding')));
+}
 
-console.log('\n[2] 哪些响应不该压');
-check('普通 HTML 可压', compressible(new Headers({ 'content-type': 'text/html; charset=utf-8' })) === true);
-check('已压缩的不再压', compressible(new Headers({ 'content-encoding': 'gzip' })) === false);
-check('SSE 不压（会被缓冲）', compressible(new Headers({ 'content-type': 'text/event-stream' })) === false);
-check('图片不压', compressible(new Headers({ 'content-type': 'image/png' })) === false);
-
-console.log('\n[3] 压缩输出：解压后必须逐字节还原');
+console.log('\n[2] 状态码与头透传不受影响');
 {
-  const big = ('<!DOCTYPE html><html><body>' + '代理内容 proxy content '.repeat(400) + '</body></html>');
-  const h = new Headers({ 'content-type': 'text/html; charset=utf-8', 'content-length': '9999' });
-  const res = finalizeResponse(200, big, h, 'gzip, deflate, br');
-  const enc = res.headers.get('content-encoding');
-  check('带上 Content-Encoding: gzip', enc === 'gzip', String(enc));
-  check('清掉了过期的 Content-Length', res.headers.get('content-length') === null);
-  check('带 Vary: Accept-Encoding', /accept-encoding/i.test(res.headers.get('vary') || ''));
-  const gzRes = res.clone();
-  const back = await gunzip(res);
-  check('解压后与原文完全一致', back === big, `${big.length} 字符`);
-  const rawLen = new TextEncoder().encode(big).byteLength;
-  const gzLen = (await gzRes.arrayBuffer()).byteLength;
-  check('确实变小了', gzLen < rawLen, `${rawLen}B -> ${gzLen}B`);
+  const h = new Headers({ 'content-type': 'text/html', 'cache-control': 'no-store' });
+  const res = finalizeResponse(404, PAGE, h, 'gzip, br');
+  check('上游状态码原样保留', res.status === 404);
+  check('业务头原样保留', res.headers.get('cache-control') === 'no-store');
+  const text = await res.text();
+  check('正文逐字节还原', text === PAGE, `${PAGE.length} 字符`);
 }
 
-console.log('\n[4] 不该压的场景保持明文');
-{
-  const small = 'hi';
-  const r1 = finalizeResponse(200, small, new Headers({ 'content-type': 'text/html' }), 'gzip');
-  check('小于阈值不压缩', r1.headers.get('content-encoding') === null);
-  const r2 = finalizeResponse(200, 'x'.repeat(3000), new Headers({ 'content-type': 'text/html' }), 'identity');
-  check('浏览器不接受 gzip 时发明文', r2.headers.get('content-encoding') === null);
-  const r3 = finalizeResponse(200, 'x'.repeat(3000),
-    new Headers({ 'content-type': 'text/event-stream' }), 'gzip');
-  check('SSE 保持明文', r3.headers.get('content-encoding') === null);
-  const r4 = finalizeResponse(200, 'x'.repeat(3000),
-    new Headers({ 'content-type': 'text/html', 'content-encoding': 'br' }), 'gzip');
-  check('已压缩的不再二次压缩', r4.headers.get('content-encoding') === 'br');
-}
-
-console.log('\n[5] 上游请求：重试不再空等，且行为可控');
+console.log('\n[3] 上游请求：重试不再空等，且行为可控');
 {
   const real = globalThis.fetch;
   const calls = [];
@@ -120,5 +96,5 @@ console.log('\n[5] 上游请求：重试不再空等，且行为可控');
 }
 
 console.log(`\n=== ${fail === 0 ? '全部通过' : '存在失败'} ===`);
-console.log(`出口压缩与请求策略：${pass} 项，失败 ${fail} 项\n`);
+console.log(`出口编码契约与请求策略：${pass} 项，失败 ${fail} 项\n`);
 process.exit(fail ? 1 : 0);

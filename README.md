@@ -217,7 +217,7 @@ src/
   ratelimit.js         限流与防滥用：令牌桶 + 临时封禁 + 一键解封 + 白名单 / 登录豁免
   alert.js             告警通知：事件总线 + Webhook 模板（通用 / 企业微信 / 钉钉 / 飞书）+ 冷却去重
   share.js             站点临时访问链接：限时 / 限次签发、到期自动失效、可随时吊销
-  compress.js          出口压缩与上游请求策略（gzip、SSE / 二进制不压、幂等请求才对冲）
+  compress.js          出口响应定稿：一律明文，压缩协商交给 CF 边缘（原因见模块内说明）
   nodetag.js           订阅节点备注的国家标注
   geoip.js             IP 归属判定与任播兜底（拿不到官方段时不编造国名）
   tempsubs.js          临时订阅（`/tsub/<id>`）
@@ -240,7 +240,7 @@ tools/                 本地开发与验证脚本（不参与部署）
   check-nodetag.mjs    节点国家标注自检：编码形态不被改坏、中文不乱码、数据源挂了不拖垮订阅
   check-nodes.py       实测订阅里每个节点的可用性（TCP→TLS→WebSocket→真实转发出网）
   check-anycast.mjs    CDN 任播兜底自检：CIDR 判定、数据源降级、绝不编造国名
-  check-compress.mjs   出口压缩与上游请求策略自检：压完必须能还原、SSE/二进制不压、幂等请求才允许对冲
+  check-compress.mjs   出口编码契约自检：任何 Accept-Encoding 下都不许输出压缩字节；上游重试/对冲策略
   check-themes.mjs     主题系统自检：10 套预设齐全、自定义可增删、CSS 注入写不穿、轮换结果收敛
   check-guard.mjs      防护三件套自检：默认关闭不误伤、封禁与解封、告警脱敏、临时链接双重到期
   check-configui.mjs   配置页与目录自检：字段与 SPEC 双向对齐、每项恰好渲染一次、全页无重复配置、转义完备、各选项卡内容同宽
@@ -286,7 +286,7 @@ node tools/check-nodetag.mjs
 # 7. CDN 任播兜底自检（改 geoip.js 的任播逻辑后必跑）
 node tools/check-anycast.mjs
 
-# 8. 出口压缩与请求策略自检（改 compress.js / proxy.js 后必跑）
+# 8. 出口编码契约与请求策略自检（改 compress.js / proxy.js 后必跑）
 node tools/check-compress.mjs
 
 # 9. 代理链路冒烟（改任何一处请求处理链路后必跑）

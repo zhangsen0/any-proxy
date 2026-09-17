@@ -177,7 +177,6 @@ async function proxyRequest(request, site, crossHost, ctx, env) {
   const headers = new Headers(request.headers);
   // 发给上游时必须先记下浏览器真实支持的压缩方式：下面会把请求头的 Accept-Encoding
   // 改成 identity，等信息到这一刻已经拿不到了。
-  const acceptEnc = request.headers.get('accept-encoding');
   headers.set('Host', targetHost);
   headers.set('Origin', targetBase);
   if (headers.has('Referer')) {
@@ -375,7 +374,7 @@ async function proxyRequest(request, site, crossHost, ctx, env) {
     rewritten = isJsFile ? rewriteLocations(text) : rewriteContent(text, site, sitePrefix, base, kind);
   }
   if (isNavHtml) {
-    return finalizeResponse(upstream.status, rewritten, headersOut, acceptEnc);
+    return finalizeResponse(upstream.status, rewritten, headersOut);
   }
   // 文本资源（JS/CSS/JSON）：fingerprinted 资源加长缓存头（浏览器/CDN 层缓存），
   // 二次访问零回源、零 Cache API 开销——并发突发时不再因每次请求的 Cache API
@@ -384,7 +383,7 @@ async function proxyRequest(request, site, crossHost, ctx, env) {
     headersOut.set('Cache-Control', 'public, max-age=604800, immutable');
     headersOut.set('CDN-Cache-Control', 'public, max-age=604800, immutable');
   }
-  return finalizeResponse(upstream.status, rewritten, headersOut, acceptEnc);
+  return finalizeResponse(upstream.status, rewritten, headersOut);
 }
 
 /**

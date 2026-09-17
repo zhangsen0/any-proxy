@@ -103,17 +103,22 @@ console.log('\n[1] 代理页面能正常出来（守住ReferenceError 这类调�
   ok('服务端重写路径能拿到源站正文', fragText.includes('上游正文'), `${fragText.length} 字符`);
 }
 
-console.log('\n[2] 浏览器支持 gzip 时，页面压着发');
+console.log('\n[2] 出口编码契约：Worker 一律发明文，压缩协商交给边缘（见 src/compress.js）');
 {
-  const r = await call('/p/demo/', { ...NAV, 'Accept-Encoding': 'gzip, deflate, br' });
-  ok('HTTP 200', r.status === 200, `status=${r.status}`);
-  ok('带 Content-Encoding: gzip', r.headers.get('content-encoding') === 'gzip');
-  ok('带 Vary: Accept-Encoding', /accept-encoding/i.test(r.headers.get('vary') || ''));
-  const back = await gunzip(r.buf);
-  ok('解压后仍是完整的主文档包裹', back.includes('127.0.0.1') && back.includes('<script'), `${back.length} 字符`);
-  const plain = await call('/p/demo/', { ...NAV, 'Accept-Encoding': 'identity' });
-  ok('压缩版显著小于明文版', r.buf.byteLength < plain.buf.byteLength,
-    `${plain.buf.byteLength}B -> ${r.buf.byteLength}B`);
+  // 曾经的实现按入站 AE 决定是否 gzip，被 CF 边缘「改写入站 AE + 对未要求压缩的
+  // 客户端剥 CE 不解压」合伙搞成整站乱码。这条用例守住：不管 AE 是什么，出口必须明文。
+  for (const ae of ['gzip, deflate, br', 'identity', 'xyz']) {
+    const r = await call('/p/demo/', { ...NAV, 'Accept-Encoding': ae });
+    ok(`AE=${JSON.stringify(ae)} HTTP 200`, r.status === 200, `status=${r.status}`);
+    const head = new Uint8Array(r.buf.slice(0, 2));
+    const isGzip = head[0] === 0x1f && head[1] === 0x8b;
+    ok(`AE=${JSON.stringify(ae)} 出口是明文（不是 gzip 字节）`, !isGzip, `len=${r.buf.byteLength}`);
+    ok(`AE=${JSON.stringify(ae)} 不带 Content-Encoding`, r.headers.get('content-encoding') === null,
+      String(r.headers.get('content-encoding')));
+    const text = new TextDecoder().decode(r.buf);
+    ok(`AE=${JSON.stringify(ae)} 主文档包裹完整`, text.includes('127.0.0.1') && text.includes('<script'),
+      `${r.buf.byteLength} 字符`);
+  }
 }
 
 console.log('\n[3] 不支持压缩的浏览器照常拿到明文');
