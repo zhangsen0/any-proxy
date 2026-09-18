@@ -534,8 +534,10 @@ section('9. 通道登记表（路径 / 中文名 / 是否管理通道只有一�
   ok('中文名表是注入的纯数据（前端没有另抄一份映射）',
     VISIT_SCOPES.every(s => STATS_JS.includes(`"${s.id}":"${s.label}"`)),
     JSON.stringify(labels).slice(0, 120));
-  // 前端拿到的是数据，所以「改名」只改 scopes.js，不用碰脚本里的分支
-  ok('注入的标签表可直接被脚本读取', /var SCOPE_LABELS=\{/.test(STATS_JS));
+  // 前端拿到的是数据，所以「改名」只改 scopes.js，不用碰脚本里的分支。
+  // 判据落在「数据作为实参出现在脚本里」，而不是「脚本里有 var SCOPE_LABELS=」：
+  // 后者是旧写法，部署压缩后那个硬编码的全局名会和函数体里的引用对不上。
+  ok('标签表由实参注入（不依赖全局 var 名）', /,\s*\d+\s*\)\s*;?\s*$/.test(STATS_JS.trim()));
 }
 
 // ===================== 10. 驾驶舱的可配置项 =====================
@@ -548,9 +550,10 @@ section('10. 驾驶舱可配置项（天数档位 / 指标都是数据表驱动�
 
   const opts = [...pane.matchAll(/<option value="([a-z]+)"[^>]*>([^<]+)</g)].map(m => m[1]);
   ok('指标下拉由指标表生成', opts.length >= 2 && opts[0] === 'hits', opts.join(','));
-  ok('指标表也以数据形式注入了脚本', /var STATS_METRICS=\[/.test(STATS_JS));
-  // 页面上的选项与注入脚本里的表必须是同一份，否则会出现「能选但画不出来」
-  const injected = JSON.parse((STATS_JS.match(/var STATS_METRICS=(\[[\s\S]*?\]);/) || [])[1] || '[]');
+  ok('指标表也以数据形式注入了脚本', /\[\{"key":/.test(STATS_JS));
+  // 页面上的选项与注入脚本里的表必须是同一份，否则会出现「能选但画不出来」。
+  // 指标表是第二个实参（第一个是标签表对象、第三个是默认档位数字）。
+  const injected = JSON.parse((STATS_JS.match(/,\s*(\[\{[\s\S]*?\}\])\s*,\s*\d+\s*\)/) || [])[1] || '[]');
   ok('页面下拉与注入的指标表一致',
     injected.length === opts.length && injected.every(m => opts.includes(m.key) && !!m.fmt),
     JSON.stringify(injected.map(m => m.key + ':' + m.fmt)));

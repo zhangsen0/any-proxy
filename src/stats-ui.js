@@ -128,7 +128,7 @@ export function renderStatsPane() {
 
 // ===================== 前端脚本 =====================
 
-function statsInit() {
+function statsInit(SCOPE_LABELS, STATS_METRICS, STATS_DEFAULT_DAYS) {
   var card = document.getElementById('statsCard');
   if (!card) return;
 
@@ -367,7 +367,8 @@ function statsInit() {
 
 // 两张纯数据表以 var 形式注入，排在构造器之前：它们落在同一个 script 作用域里，
 // statsInit 直接当全局读。顺序不能反 —— 脚本一执行就会读它们。
-const STATS_JS = `${KEEP_NAMES_SHIM}var SCOPE_LABELS=${SCOPE_LABELS_JSON};var STATS_METRICS=${STATS_METRICS_JSON};var STATS_DEFAULT_DAYS=${DEFAULT_RANGE_DAYS};(${statsInit.toString()})();`;
+// 同 cf-panel.js：数据走实参而非注入全局 var，否则 minify 重命名后名字对不上。
+const STATS_JS = `${KEEP_NAMES_SHIM}(${statsInit.toString()})(${SCOPE_LABELS_JSON}, ${STATS_METRICS_JSON}, ${DEFAULT_RANGE_DAYS});`;
 
 // ===================== 样式 =====================
 

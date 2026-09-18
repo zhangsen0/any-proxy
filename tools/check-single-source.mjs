@@ -188,9 +188,11 @@ section('5. 默认值单一真源（主题轮换间隔 / 统计回看档位）')
   ok('档位表非空且都是正整数',
     Array.isArray(STATS_RANGES) && STATS_RANGES.length > 0 && STATS_RANGES.every(n => Number.isInteger(n) && n > 0),
     JSON.stringify(STATS_RANGES));
+  // 档位数据以**实参**形式跟在注入脚本末尾（旧写法是 var STATS_DEFAULT_DAYS=，
+  // 部署压缩后那个名字会和函数体里的引用对不上，见 tools/check-minify.mjs）
   ok('注入脚本带上了默认档位数据（不是自己写死）',
-    new RegExp(`var STATS_DEFAULT_DAYS=${DEFAULT_RANGE_DAYS};`).test(STATS_JS),
-    (STATS_JS.match(/STATS_DEFAULT_DAYS=\d+/) || ['无'])[0]);
+    new RegExp(`,\\s*${DEFAULT_RANGE_DAYS}\\s*\\)`).test(STATS_JS),
+    (STATS_JS.match(/,\s*\d+\s*\)/) || ['无'])[0]);
 
   // ---- 面板真的把这些约束渲染出来了吗（源码改对了、页面没跟上也算错） ----
   const page = await call('/__admin');

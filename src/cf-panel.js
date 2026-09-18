@@ -109,7 +109,7 @@ export function renderCfPane() {
 
 // ===================== 前端脚本 =====================
 
-function cfInit() {
+function cfInit(CF_TREND_METRICS, CF_STATUS_KLASS) {
   var card = document.getElementById('cfCard');
   if (!card) return;
 
@@ -343,7 +343,11 @@ function cfInit() {
 }
 
 // 两张纯数据表以 var 形式注入，排在构造器之前（与 stats-ui 同款顺序纪律）
-const CF_JS = `${KEEP_NAMES_SHIM}var CF_TREND_METRICS=${CF_TREND_METRICS_JSON};var CF_STATUS_KLASS=${CF_STATUS_KLASS_JSON};(${cfInit.toString()})();`;
+// 数据走**实参**而不是「先 var 再让函数体去引用那个全局名」：
+// 部署开启了 minify 后，模块级标识符会被重命名，而 `var CF_TREND_METRICS=...` 是
+// 硬编码的字符串字面量 —— 两者对不上，注入到浏览器的脚本一执行就是 ReferenceError。
+// 改成实参后，函数体与调用处在同一个 bundle 里由同一套命名规则产出，必然自洽。
+const CF_JS = `${KEEP_NAMES_SHIM}(${cfInit.toString()})(${CF_TREND_METRICS_JSON}, ${CF_STATUS_KLASS_JSON});`;
 
 // ===================== 样式（复用 st-* 布局类，新增 cf-* 专属色） =====================
 
