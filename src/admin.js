@@ -3,7 +3,7 @@ import { toBool } from './config.js';
 import { runtime } from './runtime.js';
 import { listSites, getSite, autoSlug, validSlug, buildTarget, addSite } from './sites.js';
 import { DEFAULT_SITE_MODES, getSiteModes, saveSiteModes, resolveEngine, siteBadge, SITE_ENGINES, BADGE_CLASSES } from './site-modes.js';
-import { readR2Config, saveR2Config, R2_CACHE_SPEC } from './media-r2.js';
+import { readR2Config, saveR2Config, R2_CACHE_SPEC, R2_PREFIX } from './media-r2.js';
 import { sweepMediaR2 } from './proxy.js';
 import {
   autoUpdatePreferredDns, filterUsableIps, applyDnsWithSelfCheck, proxyHost, targetHost,
@@ -272,7 +272,20 @@ async function handleAdmin(request, url, env) {
   // ---- R2 媒体缓存策略：保留天数（KV 可编辑）+ 立即清理过期分片 ----
   if (path === '/__api/r2-cache') {
     if (request.method === 'GET') {
-      return json({ ok: true, config: await readR2Config(env), spec: R2_CACHE_SPEC, bound: !!(env && env.MEDIA_R2) });
+      // 顺带统计当前缓存用量（遍历 R2 对象汇总，最多扫 200 页防止面板被拖垮；量大时标注约数）
+      let stat = null;
+      if (env && env.MEDIA_R2) {
+        let bytes = 0, count = 0, cursor, pages = 0;
+        do {
+          const l = await env.MEDIA_R2.list({ prefix: R2_PREFIX, cursor, limit: 1000 }).catch(() => null);
+          if (!l || !l.objects || !l.objects.length) break;
+          for (const o of l.objects) { bytes += o.size; count++; }
+          cursor = l.truncated ? l.cursor : undefined;
+          pages++;
+        } while (cursor && pages < 200);
+        stat = { count, bytesMB: Math.round(bytes / 1048576), truncated: pages >= 200 };
+      }
+      return json({ ok: true, config: await readR2Config(env), spec: R2_CACHE_SPEC, bound: !!(env && env.MEDIA_R2), stat });
     }
     if (request.method === 'POST') {
       let body;
@@ -1233,7 +1246,12 @@ ${themeScript}
         <label for="r2MaxMB">单分片缓存上限 MB（${R2_CACHE_SPEC.maxObjectMB.min}~${R2_CACHE_SPEC.maxObjectMB.max}）</label>
         <input id="r2MaxMB" type="number" min="${R2_CACHE_SPEC.maxObjectMB.min}" max="${R2_CACHE_SPEC.maxObjectMB.max}" style="width:100%;box-sizing:border-box;margin:4px 0 10px;padding:9px 12px;border-radius:8px;border:1px solid var(--line);background:var(--input);color:var(--txt);font-size:14px;" placeholder="默认 ${R2_CACHE_SPEC.maxObjectMB.default} MB" value="${r2Cfg ? r2Cfg.maxObjectMB : ''}">
       </div>
+      <div>
+        <label for="r2MaxTotal">缓存总量上限 MB（0 不限，${R2_CACHE_SPEC.maxTotalMB.min}~${R2_CACHE_SPEC.maxTotalMB.max}）</label>
+        <input id="r2MaxTotal" type="number" min="${R2_CACHE_SPEC.maxTotalMB.min}" max="${R2_CACHE_SPEC.maxTotalMB.max}" style="width:100%;box-sizing:border-box;margin:4px 0 10px;padding:9px 12px;border-radius:8px;border:1px solid var(--line);background:var(--input);color:var(--txt);font-size:14px;" placeholder="默认 ${R2_CACHE_SPEC.maxTotalMB.default} MB（10GB）" value="${r2Cfg ? r2Cfg.maxTotalMB : ''}">
+      </div>
     </div>
+    <div class="hint" id="r2Stat" style="margin:0 0 6px;">${r2Bound ? '正在读取当前用量…' : ''}</div>
     <div class="row">
       <button type="button" id="r2TtlBtn">保存缓存策略</button>
       <button type="button" id="r2CleanBtn" class="ghost">立即清理过期分片</button>
@@ -1534,23 +1552,34 @@ api('/__api/speedtest').then(r => {
     if (inp) inp.value = r.data.interval_minutes;
   }
 })();
-// ===== R2 媒体缓存策略：总开关 / 保留天数 / 单分片上限 + 立即清理 =====
+// ===== R2 媒体缓存策略：总开关 / 保留天数 / 单分片上限 / 总量上限 + 用量展示 + 立即清理 =====
+const r2Stat = document.getElementById('r2Stat');
+if (r2Stat && document.getElementById('r2TtlBtn')) {
+  api('/__api/r2-cache').then(function (r) {
+    if (!r.ok || !r.data || !r.data.stat) return;
+    const s = r.data.stat;
+    r2Stat.textContent = '当前用量：约 ' + s.count + ' 个分片 / ' + s.bytesMB + ' MB' + (s.truncated ? '（对象较多，为约数）' : '');
+  }).catch(function () {});
+}
 const r2TtlBtn = document.getElementById('r2TtlBtn');
 if (r2TtlBtn) {
   r2TtlBtn.onclick = async () => {
     const en = document.getElementById('r2Enabled');
     const ttl = document.getElementById('r2TtlDays');
     const mx = document.getElementById('r2MaxMB');
+    const tot = document.getElementById('r2MaxTotal');
     const v = parseInt(ttl.value, 10);
     const m = parseInt(mx.value, 10);
+    const t = parseInt(tot.value, 10);
     // 区间从输入框自身读（服务端按 R2_CACHE_SPEC 渲染的 min/max），浏览器不重复抄默认值
     if (!v || v < Number(ttl.min) || v > Number(ttl.max)) { setMsg('r2Msg', '保留天数需在 ' + ttl.min + ' ~ ' + ttl.max + ' 之间', true); return; }
     if (!m || m < Number(mx.min) || m > Number(mx.max)) { setMsg('r2Msg', '单分片上限需在 ' + mx.min + ' ~ ' + mx.max + ' MB 之间', true); return; }
+    if (Number.isNaN(t) || t < Number(tot.min) || t > Number(tot.max)) { setMsg('r2Msg', '总量上限需在 ' + tot.min + ' ~ ' + tot.max + ' MB 之间（0 表示不限）', true); return; }
     setMsg('r2Msg', '正在保存…');
     r2TtlBtn.disabled = true;
     try {
-      const r = await api('/__api/r2-cache', { method: 'POST', body: JSON.stringify({ enabled: en.value === 'true', ttlDays: v, maxObjectMB: m }) });
-      setMsg('r2Msg', r.ok ? '已保存：' + (en.value === 'true' ? '开启' : '关闭') + '，保留 ' + v + ' 天，单分片上限 ' + m + ' MB' : (r.data.error || '保存失败'), !r.ok);
+      const r = await api('/__api/r2-cache', { method: 'POST', body: JSON.stringify({ enabled: en.value === 'true', ttlDays: v, maxObjectMB: m, maxTotalMB: t }) });
+      setMsg('r2Msg', r.ok ? '已保存：' + (en.value === 'true' ? '开启' : '关闭') + '，保留 ' + v + ' 天，单分片上限 ' + m + ' MB，总量上限 ' + (t === 0 ? '不限' : t + ' MB') : (r.data.error || '保存失败'), !r.ok);
     } catch (e) {
       setMsg('r2Msg', '请求失败：' + String(e && e.message || e), true);
     }

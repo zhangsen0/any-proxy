@@ -2,7 +2,7 @@ import { cors, isText, esc, isNavigation, isFingerprinted } from './util.js';
 import { CROSS_PREFIX, mapAbsoluteUrl, rewriteContent, contentKind, isHlsManifest } from './url.js';
 import { injectLinkFix, buildDocWritePage, rewriteLocations } from './inject.js';
 import { finalizeResponse } from './compress.js';
-import { readR2Config } from './media-r2.js';
+import { readR2Config, R2_PREFIX } from './media-r2.js';
 
 // 反向代理核心：请求转发、响应重写、WebSocket 透传
 
@@ -130,8 +130,8 @@ const MAX_CACHE_BYTES = 4 * 1024 * 1024;
 //  - miss：回源 206 后 waitUntil 读完整分片写入（单对象 ≤ 配置的单分片上限，避免读大流打爆内存）；
 //  - 过期：对象带 ts 元数据，由 cron 的 sweepMediaR2 定时删除超过保留天数的对象；
 //  - 未绑定（本地测试 / 未配置 R2）时 serveR2Segment 直接返回 null，自动降级为纯 Cache API。
-// 启用开关、保留天数、单分片上限全部在「配置中心 → R2 媒体缓存」可编辑（唯一真源 src/media-r2.js）。
-const R2_PREFIX = 'media/';
+// 启用开关、保留天数、单分片上限、总量上限全部在「配置中心 → R2 媒体缓存」可编辑
+// （唯一真源 src/media-r2.js，R2_PREFIX 为结构键随配置模块导出）。
 
 /** R2 对象 key：URL（含可选鉴权绑定）与 Range 区间的 SHA-256，避免 URL 字符与长度问题 */
 export async function mediaR2Key(targetUrl, request, authBind) {
@@ -176,24 +176,41 @@ export async function serveR2Segment(ctx, env, targetUrl, request, authBind, ups
   return null;
 }
 
-/** 定时清理 R2 媒体分片缓存：删除超过保留天数（配置中心可编辑，默认 7 天）的对象；无绑定则跳过 */
+/** 定时清理 R2 媒体分片缓存：先删超过保留天数的，再按总量上限（>0 时）从最旧删到不超；无绑定则跳过 */
 export async function sweepMediaR2(env) {
   if (!env || !env.MEDIA_R2) return;
-  const ttlMs = (await readR2Config(env)).ttlDays * 24 * 3600 * 1000;
+  const cfg = await readR2Config(env);
+  const ttlMs = cfg.ttlDays * 24 * 3600 * 1000;
+  const maxBytes = cfg.maxTotalMB > 0 ? cfg.maxTotalMB * 1024 * 1024 : Infinity;
   const now = Date.now();
+  const staleKeys = [];
+  const kept = [];
   let cursor;
   do {
     const list = await env.MEDIA_R2.list({ prefix: R2_PREFIX, cursor, limit: 1000 }).catch(() => null);
     if (!list || !list.objects || !list.objects.length) break;
-    const stale = list.objects
-      .filter(o => {
-        const ts = parseInt((o.customMetadata || {}).ts || '0', 10);
-        return ts > 0 && now - ts > ttlMs;
-      })
-      .map(o => o.key);
-    if (stale.length) await env.MEDIA_R2.delete(stale).catch(() => {});
+    for (const o of list.objects) {
+      const ts = parseInt((o.customMetadata || {}).ts || '0', 10);
+      if (ts > 0 && now - ts > ttlMs) { staleKeys.push(o.key); continue; }
+      kept.push({ key: o.key, ts, size: o.size });
+    }
     cursor = list.truncated ? list.cursor : undefined;
   } while (cursor);
+  if (staleKeys.length) await env.MEDIA_R2.delete(staleKeys).catch(() => {});
+  // 总量上限：超限按 ts 最旧优先删，直到总量不超（尽力而为，单对象超限时删到空）
+  if (maxBytes !== Infinity && kept.length) {
+    let total = kept.reduce((s, x) => s + x.size, 0);
+    if (total > maxBytes) {
+      kept.sort((a, b) => (a.ts || 0) - (b.ts || 0));
+      const del = [];
+      for (const x of kept) {
+        if (total <= maxBytes) break;
+        del.push(x.key);
+        total -= x.size;
+      }
+      if (del.length) await env.MEDIA_R2.delete(del).catch(() => {});
+    }
+  }
 }
 
 /** 是否允许写入 Cache API：体积已知且不超过上限。
