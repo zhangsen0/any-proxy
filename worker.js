@@ -22,6 +22,7 @@
 import { bindRuntime } from './src/runtime.js';
 import { handleRequest } from './src/router.js';
 import { scheduledDnsCheck } from './src/dns.js';
+import { sweepMediaR2 } from './src/proxy.js';
 import { readConfig, isActive, renderNotFound } from './src/disguise.js';
 import { record as recordVisit, recordBytes } from './src/stats.js';
 import { matchVisitScope } from './src/scopes.js';
@@ -159,9 +160,9 @@ export default {
       });
     }
   },
-  /** 定时任务：自动优选 IP 并更新 DNS（实际执行间隔由前端可配，默认 12 小时） */
+  /** 定时任务：自动优选 IP 并更新 DNS（实际执行间隔由前端可配，默认 12 小时）+ 清理 R2 媒体分片缓存 */
   async scheduled(event, env, ctx) {
     bindRuntime(env);
-    ctx.waitUntil(scheduledDnsCheck(env));
+    ctx.waitUntil(Promise.all([scheduledDnsCheck(env), sweepMediaR2(env)]));
   },
 };

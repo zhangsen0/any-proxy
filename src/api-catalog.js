@@ -213,8 +213,12 @@ export const API_CATALOG = [
       },
       {
         id: 'site-update', name: '修改站点', kind: 'action', method: 'PUT', path: '/__api/sites/<id>',
-        desc: '改名称 / 后缀 / 目标地址，以及流媒体模式字段（proxyMode=normal|media、mediaCacheAuthBind 盗链保护、mediaSkipDetailLog 媒体日志开关）；后缀变化时旧链接会一并迁移', auth: true,
+        desc: '改名称 / 后缀 / 目标地址，以及站点模式字段（proxyMode 取注册表键、mediaCacheAuthBind 盗链保护、mediaSkipDetailLog 媒体日志开关、aiKey/aiKeys AI 中转配置）；后缀变化时旧链接会一并迁移', auth: true,
         pathParam: { key: 'id', label: '站点 id', placeholder: 'demo' },
+      },
+      {
+        id: 'site-modes', name: '站点模式注册表', kind: 'setting', method: 'GET', path: '/__api/site-modes', writeMethod: 'POST',
+        desc: '站点类型标签 / 徽标 / 说明 / 执行引擎（KV 可编辑，未配置用默认；内置 normal/media/ai 不可删、引擎不可改，自定义模式可增删改）', auth: true,
       },
       {
         id: 'site-delete', name: '删除站点', kind: 'action', method: 'DELETE', path: '/__api/sites/<id>',
@@ -229,6 +233,10 @@ export const API_CATALOG = [
     desc: '订阅链接、节点国家标注、临时订阅，在「代理节点」选项卡里管理。',
     tab: 'proxy',
     items: [
+      {
+        id: 'sub-gen', name: '订阅生成配置', kind: 'setting', method: 'GET', path: '/__api/sub-gen', writeMethod: 'POST',
+        desc: '节点 ID / 地址 / 路径 / 协议 / 订阅名称与更新间隔；保存后生成的订阅立即按新值输出（修改 UUID 会使旧订阅链接失效）', auth: true,
+      },
       {
         id: 'sub-config', name: '订阅链接', kind: 'setting', method: 'GET', path: '/__api/sub-config', writeMethod: 'POST',
         desc: '浏览器优选从这里拉候选 IP；留空则用本机 /sub', auth: true,

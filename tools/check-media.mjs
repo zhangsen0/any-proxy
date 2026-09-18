@@ -17,7 +17,7 @@
  *
  * 用法：node tools/check-media.mjs
  */
-import { serveCached, cacheableSize, fetchUpstream, MAX_CACHE_BYTES, isMediaRequest, mediaCacheKeyOf } from '../src/proxy.js';
+import { serveCached, cacheableSize, fetchUpstream, MAX_CACHE_BYTES, isMediaRequest, mediaCacheKeyOf, mediaR2Key, serveR2Segment } from '../src/proxy.js';
 import { countResponseBytes } from '../worker.js';
 
 let pass = 0;
@@ -211,6 +211,28 @@ console.log('\n[11] 分片边缘缓存：CF Cache API 拒绝 206（cache.put 对
   await serveCached(ctx2, 'https://x/seg2.ts?__apv=1', () => ok);
   await flush(ctx2);
   check('200 媒体小响应（HLS/DASH 分片）写入缓存', c2.puts.length === 1, `put 次数=${c2.puts.length}`);
+}
+
+console.log('\n[12] R2 持久媒体缓存：key 绑区间（防污染）、无绑定自动降级');
+{
+  const req = (range) => new Request('https://x/v.mp4?api_key=sec1', { headers: range ? { range } : {} });
+  const a = await mediaR2Key('https://x/v.mp4?api_key=sec1', req('bytes=0-99'), true);
+  const b = await mediaR2Key('https://x/v.mp4?api_key=sec1', req('bytes=0-99'), true);
+  const c = await mediaR2Key('https://x/v.mp4?api_key=sec1', req('bytes=100-199'), true);
+  const d = await mediaR2Key('https://x/v.mp4?api_key=sec1', req('bytes=0-99'), false);
+  check('同一请求 key 稳定（可命中）', a === b && a.startsWith('media/') && a.length === 6 + 64, a.slice(0, 20));
+  check('不同 Range 区间 key 不同（防区间污染）', a !== c);
+  check('盗链保护开：不同鉴权身份 key 不同', a !== d);
+
+  // 无 MEDIA_R2 绑定：任何情况都返回 null（降级为纯 Cache API / 透传，绝不能抛错）
+  const ctx = ctxOf();
+  const up = new Response('x'.repeat(16), { status: 206, headers: { 'content-length': '1024', 'content-range': 'bytes 0-1023/10240' } });
+  const r1 = await serveR2Segment(ctx, {}, 'https://x/v.mp4', req('bytes=0-99'), true, up, new Headers());
+  check('未绑定 R2 时降级返回 null（不抛错）', r1 === null);
+  const r2 = await serveR2Segment(ctx, { MEDIA_R2: null }, 'https://x/v.mp4', req('bytes=0-99'), true, up, new Headers());
+  check('R2 为 null 时降级返回 null', r2 === null);
+  const r3 = await serveR2Segment(ctx, { MEDIA_R2: {} }, 'https://x/v.mp4', req('bytes=0-99'), true, new Response('x', { status: 200 }), new Headers());
+  check('非 206 响应不走 R2（降级）', r3 === null);
 }
 
 console.log(`\n媒体与大文件链路：${pass} 项，失败 ${fail} 项\n`);

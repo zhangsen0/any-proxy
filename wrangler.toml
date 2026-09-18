@@ -22,6 +22,14 @@ migrations_dir = "migrations"
 binding = "SITES"
 id = "2a940bcb0dae4b448e8def3ebf4fe27d"
 
+# 流媒体模式的分片持久缓存（R2）：Cache API 存不下的大分片（>4MB）与 206 分片
+# 落 R2，命中即满速返回、零回源。对象带 media:ts 元数据，由 cron 定时清理过期项；
+# 未绑定（本地测试/未配置）时自动降级为纯 Cache API 行为。
+[[r2_buckets]]
+binding = "MEDIA_R2"
+bucket_name = "anyproxy-media"
+
+
 # 可配置变量（非敏感）。全部可留空 —— Worker 侧均有「按请求推导或明确报错」的降级策略，
 # 不会悄悄回退到任何写死的域名 / IP / IP 段。以上变量也可由 GitHub Actions 用 --var 注入（见 deploy-cloudflare.yml）。
 [vars]

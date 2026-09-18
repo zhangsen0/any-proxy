@@ -119,6 +119,79 @@ function isMediaRequest(request, ct) {
  */
 const MAX_CACHE_BYTES = 4 * 1024 * 1024;
 
+// ===================== R2 媒体分片持久缓存（流媒体模式第二层） =====================
+// Cache API 有两条硬限制：cache.put 拒绝 206、单对象上限本项目取 4MB（MAX_CACHE_BYTES）。
+// 播放器拉 MP4 时几乎全是 206 Range 分片，这些分片永远进不了 Cache API，只能每次回源。
+// R2 没有这两条限制：206 分片可原样落盘，作为媒体缓存的持久层，命中即零回源满速返回。
+//  - key：media/<sha256(URL+auth+Range)> —— 分片是「区间快照」，必须绑 Range 区间，
+//    否则不同区间互相污染（R2 不像 Cache API 会对完整 200 响应自动切分）；
+//  - 命中：直接返回 206（Content-Type / Content-Range 从对象元数据还原）；
+//  - miss：回源 206 后 waitUntil 读完整分片写入（单对象 ≤ R2_MAX_OBJECT，避免读大流打爆内存）；
+//  - 过期：对象带 ts 元数据，由 cron 的 sweepMediaR2 定时删除超过 R2_TTL_MS 的对象；
+//  - 未绑定（本地测试 / 未配置 R2）时 serveR2Segment 直接返回 null，自动降级为纯 Cache API。
+const R2_MAX_OBJECT = 64 * 1024 * 1024;   // 单分片缓存上限 64MB（R2 免费额度内的保守值）
+const R2_TTL_MS = 7 * 24 * 3600 * 1000;   // 分片缓存 7 天
+const R2_PREFIX = 'media/';
+
+/** R2 对象 key：URL（含可选鉴权绑定）与 Range 区间的 SHA-256，避免 URL 字符与长度问题 */
+export async function mediaR2Key(targetUrl, request, authBind) {
+  const base = mediaCacheKeyOf(targetUrl, request, authBind);
+  const range = request.headers.get('range') || request.headers.get('if-range') || '';
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(base + '|' + range));
+  return R2_PREFIX + [...new Uint8Array(digest)].map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+/**
+ * R2 媒体分片缓存：命中返回 206 快照；miss 则后台写入并返回 null（调用方走透传）。
+ * 只在流媒体模式 + 206 分片下生效；无 MEDIA_R2 绑定 / 非 206 / 体积超限一律降级。
+ */
+export async function serveR2Segment(ctx, env, targetUrl, request, authBind, upstream, headersOut) {
+  if (!env || !env.MEDIA_R2 || upstream.status !== 206) return null;
+  const key = await mediaR2Key(targetUrl, request, authBind);
+  const obj = await env.MEDIA_R2.get(key).catch(() => null);
+  if (obj) {
+    const md = obj.customMetadata || {};
+    const h = new Headers();
+    if (md.ct) h.set('Content-Type', md.ct);
+    if (md.cr) h.set('Content-Range', md.cr);
+    h.set('Content-Length', String(obj.size));
+    h.set('Accept-Ranges', 'bytes');
+    h.set('X-R2-Cache', 'HIT');
+    cors(h);
+    return new Response(obj.body, { status: 206, headers: h });
+  }
+  const len = parseInt(upstream.headers.get('content-length') || '0', 10);
+  if (len <= 0 || len > R2_MAX_OBJECT) return null;
+  const cr = upstream.headers.get('content-range') || '';
+  const ct = headersOut.get('content-type') || '';
+  try {
+    const body = await upstream.clone().arrayBuffer();
+    ctx.waitUntil(
+      env.MEDIA_R2.put(key, body, { customMetadata: { ct, cr, ts: String(Date.now()) } }).catch(() => {})
+    );
+  } catch {}
+  return null;
+}
+
+/** 定时清理 R2 媒体分片缓存：删除超过 R2_TTL_MS 的对象（无绑定则跳过） */
+export async function sweepMediaR2(env) {
+  if (!env || !env.MEDIA_R2) return;
+  const now = Date.now();
+  let cursor;
+  do {
+    const list = await env.MEDIA_R2.list({ prefix: R2_PREFIX, cursor, limit: 1000 }).catch(() => null);
+    if (!list || !list.objects || !list.objects.length) break;
+    const stale = list.objects
+      .filter(o => {
+        const ts = parseInt((o.customMetadata || {}).ts || '0', 10);
+        return ts > 0 && now - ts > R2_TTL_MS;
+      })
+      .map(o => o.key);
+    if (stale.length) await env.MEDIA_R2.delete(stale).catch(() => {});
+    cursor = list.truncated ? list.cursor : undefined;
+  } while (cursor);
+}
+
 /** 是否允许写入 Cache API：体积已知且不超过上限。
  *  没有 content-length（分块/流式）一律不缓存 —— 无法预知体积时读满整个流是在赌。 */
 function cacheableSize(res) {
@@ -189,7 +262,18 @@ function restoreHeaderValue(s, proxyHost, sitePrefix, targetBase, targetHost) {
  *   - 跨域通道 /p/<id>/__x/<host>/<path>   -> 任意第三方域（页面用到的任何外部资源/接口）
  * 两套通道共用同一套重写规则，因此任何站点的资源、接口、跳转都会留在代理内，不会被浏览器直连。
  */
+
+/** 站点执行引擎：site.engine（新保存站点已解析）优先，旧数据按 proxyMode 兼容映射 */
+function siteEngine(site) {
+  if (site && (site.engine === 'media' || site.engine === 'ai')) return site.engine;
+  if (site && site.proxyMode === 'media') return 'media';
+  if (site && site.proxyMode === 'ai') return 'ai';
+  return 'normal';
+}
+
 async function proxyRequest(request, site, crossHost, ctx, env) {
+  // AI 中转模式（proxyMode=ai）：独立执行路径，不走通用重写（AI 响应 JSON 里没有可重写的链接）
+  if (siteEngine(site) === 'ai') return proxyAiRequest(request, site, ctx);
   const url = new URL(request.url);
   const sitePrefix = `/p/${site.id}`;
   // origin = 代理自身对外地址。脚本上下文的 URL 需要补成绝对地址（见 url.js absOnOrigin）
@@ -423,15 +507,19 @@ async function proxyRequest(request, site, crossHost, ctx, env) {
   // HLS 清单是明文但不在 isText 白名单里，必须单独判定。漏掉这一条，清单会走进下面的
   // 「非文本直传」分支：分片地址与 AES 密钥 URI 原样透出，播放器按根路径去取 → 404 / 解密失败
   if (!isText(ct) && !isHls) {
-    // 流媒体模式（proxyMode=media）：媒体小响应走分片边缘缓存，命中即免回源——
-    //   - HLS/DASH 分片 .ts/.m4s（200 响应）
-    //   - 海报/缩略图 image/*（VidHub 首页海报墙的主要请求，缓存后秒出）
-    // MP4 等 206 Range 分片无法进 Cache API（平台限制：cache.put 拒绝 206），
-    // 由零 CPU 透传满速转发，两者结合播放与浏览体感接近直连。
-    // key 绑（可选）鉴权身份防盗链；体积闸门沿用 MAX_CACHE_BYTES（4MB），整片挡在缓存外。
-    if (request.method === 'GET' && site.proxyMode === 'media' && isMediaRequest(request, ct) && cacheableSize(upstream) && upstream.status === 200) {
-      return serveCached(ctx, mediaCacheKeyOf(targetUrl, request, !!site.mediaCacheAuthBind), () =>
-        new Response(upstream.body, { status: upstream.status, headers: headersOut }));
+    // 流媒体模式（proxyMode=media）：媒体响应走两级边缘缓存，命中即免回源——
+    //   1) Cache API 热缓存：200 完整小响应（HLS/DASH 分片 .ts/.m4s、海报 image/*）；
+    //   2) R2 持久缓存：206 Range 分片（MP4 播放的绝大部分请求）——Cache API 拒绝
+    //      206（平台限制），R2 无此限制，命中直接满速返回、零回源；
+    // 未命中走零 CPU 透传满速转发，三者结合播放与浏览体感接近直连。
+    // key 绑（可选）鉴权身份防盗链；体积闸门沿用 MAX_CACHE_BYTES（Cache API）/ R2_MAX_OBJECT（R2）。
+    if (request.method === 'GET' && siteEngine(site) === 'media' && isMediaRequest(request, ct)) {
+      if (upstream.status === 200 && cacheableSize(upstream)) {
+        return serveCached(ctx, mediaCacheKeyOf(targetUrl, request, !!site.mediaCacheAuthBind), () =>
+          new Response(upstream.body, { status: upstream.status, headers: headersOut }));
+      }
+      const r2 = await serveR2Segment(ctx, env, targetUrl, request, !!site.mediaCacheAuthBind, upstream, headersOut);
+      if (r2) return r2;
     }
     // 非文本资源（图片/字体/音视频）：fingerprinted 走共享缓存，其余直接回源
     if (request.method === 'GET' && upstream.status === 200 && isFingerprinted(url.pathname)) {
@@ -522,7 +610,7 @@ async function proxyRequest(request, site, crossHost, ctx, env) {
   // 只缓存 GET（登录、播放进度等 POST/PUT 不受影响），key 绑鉴权身份
   // （同一用户自缓存，不跨用户串号）；删除 Set-Cookie（Cache API 拒绝缓存
   // 带 Set-Cookie 的响应）；短 TTL 避免缓存住会变化的私有状态。
-  if (request.method === 'GET' && upstream.status === 200 && site.proxyMode === 'media'
+  if (request.method === 'GET' && upstream.status === 200 && siteEngine(site) === 'media'
       && /^application\/json\b/i.test(ct) && rewritten && rewritten.length <= MAX_CACHE_BYTES) {
     const ckey = new Request(mediaCacheKeyOf(targetUrl, request, !!site.mediaCacheAuthBind));
     const cj = await caches.default.match(ckey).catch(() => null);
@@ -787,6 +875,47 @@ async function handleWebSocket(request, site, crossHost) {
   });
 
   return new Response(null, { status: 101, webSocket: client });
+}
+
+// ===================== AI 中转模式（proxyMode=ai） =====================
+// 通用 OpenAI 兼容中转，站点 target 指向上游 API 域名（如 api.openai.com），
+// 路径原样透传（/v1/chat/completions、/v1/models 等），SSE 流式响应零改动转发：
+//   - 入口鉴权（可选）：站点配置 aiKey 后，请求 Authorization 必须匹配（Bearer 前缀或裸 token 均可）；
+//   - 上游 key 轮换：站点 aiKeys 配多个上游 key（逗号 / 换行 / 分号分隔），每次请求随机取一个替换给上游；
+//   - 未配 aiKeys = 纯反代，透传客户端自己带的 key。
+// 不引入任何站点 / 模型 / 供应商特判，加新供应商只改站点 target 与 key 配置。
+async function proxyAiRequest(request, site, ctx) {
+  // 入口鉴权：仅当站点配置了 aiKey 才校验；未配置 = 公开端点（key 由客户端自己带）
+  const entryKey = String(site.aiKey || '').trim();
+  if (entryKey) {
+    const auth = request.headers.get('authorization') || '';
+    const token = auth.startsWith('Bearer ') ? auth.slice(7).trim() : auth.trim();
+    if (token !== entryKey) {
+      return new Response(
+        JSON.stringify({ error: { message: 'Invalid API key provided', type: 'invalid_request_error' } }),
+        { status: 401, headers: { 'content-type': 'application/json', 'cache-control': 'no-store' } }
+      );
+    }
+  }
+  const keys = String(site.aiKeys || '').split(/[\n,;]/).map(s => s.trim()).filter(Boolean);
+  // 目标地址 = 代理入口同路径、同查询，host 换成站点目标域名（协议强制 https）
+  const target = new URL(request.url);
+  target.host = site.host;
+  target.protocol = 'https:';
+  let finalReq = new Request(target.toString(), request);
+  if (keys.length) {
+    const h = new Headers(finalReq.headers);
+    h.set('Authorization', 'Bearer ' + keys[Math.floor(Math.random() * keys.length)]);
+    finalReq = new Request(finalReq, { headers: h });
+  }
+  try {
+    const resp = await fetch(finalReq);
+    const out = new Response(resp.body, { status: resp.status, headers: resp.headers });
+    cors(out.headers);
+    return out;
+  } catch (e) {
+    return new Response('ai proxy error: ' + String(e && e.message || e).slice(0, 300), { status: 502, headers: { 'content-type': 'text/plain; charset=utf-8' } });
+  }
 }
 
 export {

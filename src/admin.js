@@ -2,6 +2,7 @@ import { json, esc, kvKey, validTarget, parseIpv4List, parseDomainList } from '.
 import { toBool } from './config.js';
 import { runtime } from './runtime.js';
 import { listSites, getSite, autoSlug, validSlug, buildTarget, addSite } from './sites.js';
+import { DEFAULT_SITE_MODES, getSiteModes, saveSiteModes, resolveEngine, siteBadge, SITE_ENGINES, BADGE_CLASSES } from './site-modes.js';
 import {
   autoUpdatePreferredDns, filterUsableIps, applyDnsWithSelfCheck, proxyHost, targetHost,
   DNS_INTERVAL, POOL_LIMIT, DOMAIN_POOL_LIMIT,
@@ -245,6 +246,100 @@ async function handleAdmin(request, url, env) {
       const r = await saveConfig(env, patch);
       if (r && r.error) return json({ error: r.error }, 400);
       return json({ ok: true, config: r, active: isActive(r) });
+    }
+  }
+
+  // ---- 站点模式注册表：展示文案 / 徽标 / 说明 / 执行引擎（KV 可编辑，未配置用默认） ----
+  if (path === '/__api/site-modes') {
+    if (request.method === 'GET') {
+      return json({ ok: true, modes: await getSiteModes(), engines: SITE_ENGINES, badgeClasses: BADGE_CLASSES, builtin: ['normal', 'media', 'ai'] });
+    }
+    if (request.method === 'POST') {
+      let body;
+      try { body = await request.json(); } catch { return json({ error: 'invalid json' }, 400); }
+      try {
+        const saved = await saveSiteModes(body.modes);
+        return json({ ok: true, modes: saved });
+      } catch (e) {
+        return json({ error: '保存失败：' + String(e && e.message || e).slice(0, 200) }, 400);
+      }
+    }
+  }
+
+  // ---- 订阅生成配置：节点 ID / 地址 / 路径 / 协议 / 订阅名称等（写 config.json，生成订阅立即生效） ----
+  if (path === '/__api/sub-gen') {
+    if (request.method === 'GET') {
+      const cfg = await readConfig(env);
+      const sg = cfg['优选订阅生成'] || {};
+      return json({
+        ok: true,
+        config: {
+          uuid: cfg.UUID || '',
+          host: cfg.HOST || '',
+          path: cfg.PATH || '/',
+          protocol: cfg['协议类型'] || 'vless',
+          transport: cfg['传输协议'] || 'ws',
+          fingerprint: cfg.Fingerprint || 'chrome',
+          sub_name: sg.SUBNAME || 'edgetunnel',
+          sub_update: sg.SUBUpdateTime || 3,
+          sub_token: sg.TOKEN || '',
+        },
+      });
+    }
+    if (request.method === 'POST') {
+      let body;
+      try { body = await request.json(); } catch { return json({ error: 'invalid json' }, 400); }
+      const patch = {};
+      if (body.uuid !== undefined) {
+        const v = String(body.uuid).trim();
+        if (!/^[0-9a-fA-F-]{32,}$/.test(v.replace(/-/g, ''))) return json({ error: 'UUID 格式不正确（应为 32 位十六进制）' }, 400);
+        patch.UUID = v;
+      }
+      if (body.host !== undefined) {
+        const v = String(body.host).trim();
+        if (!v) return json({ error: '节点地址不能为空' }, 400);
+        patch.HOST = v;
+      }
+      if (body.path !== undefined) {
+        const v = String(body.path).trim();
+        if (!v.startsWith('/')) return json({ error: '节点路径必须以 / 开头' }, 400);
+        patch.PATH = v;
+      }
+      if (body.protocol !== undefined) {
+        const v = String(body.protocol).trim();
+        if (!['vless', 'trojan', 'ss'].includes(v)) return json({ error: '协议类型仅支持 vless / trojan / ss' }, 400);
+        patch['协议类型'] = v;
+      }
+      if (body.transport !== undefined) {
+        const v = String(body.transport).trim();
+        if (!['ws', 'grpc'].includes(v)) return json({ error: '传输协议仅支持 ws / grpc' }, 400);
+        patch['传输协议'] = v;
+      }
+      if (body.fingerprint !== undefined) {
+        const v = String(body.fingerprint).trim();
+        if (v) patch.Fingerprint = v;
+      }
+      // 订阅生成区（嵌套对象整体合并，保留兄弟字段如 local / 本地IP库 / SUB）
+      const cur = await readConfig(env);
+      const sg = { ...(cur['优选订阅生成'] || {}) };
+      if (body.sub_name !== undefined) {
+        const v = String(body.sub_name).trim();
+        if (!v) return json({ error: '订阅名称不能为空' }, 400);
+        sg.SUBNAME = v;
+      }
+      if (body.sub_update !== undefined) {
+        const v = parseInt(body.sub_update, 10);
+        if (!v || v < 1 || v > 1440) return json({ error: '更新间隔需在 1 ~ 1440 分钟之间（1 天）' }, 400);
+        sg.SUBUpdateTime = v;
+      }
+      if (body.sub_token !== undefined) {
+        const v = String(body.sub_token).trim();
+        sg.TOKEN = v;
+      }
+      patch['优选订阅生成'] = sg;
+      const r = await saveConfig(env, patch);
+      if (r && r.error) return json({ error: r.error }, 400);
+      return json({ ok: true });
     }
   }
 
@@ -551,10 +646,22 @@ async function handleAdmin(request, url, env) {
     if (dup) return json({ ok: true, site: dup, reused: true }, 200);
 
     const site = await addSite(name, slug, built);
-    // 流媒体模式字段（新增时可选传入，默认 normal）
-    if (body.proxyMode === 'media') site.proxyMode = 'media';
+    // 站点模式字段（新增时可选传入，默认 normal）：模式键白名单 = 注册表（含自定义键），
+    // 并把「键 → 执行引擎」解析结果冗余进 site.engine（proxy.js 运行期零 KV 依赖）
+    if (body.proxyMode !== undefined) {
+      const mode = String(body.proxyMode);
+      const all = await getSiteModes().catch(() => DEFAULT_SITE_MODES);
+      if (Object.prototype.hasOwnProperty.call(all, mode)) {
+        site.proxyMode = mode;
+        site.engine = resolveEngine(site, all);
+      }
+    }
     if (body.mediaCacheAuthBind) site.mediaCacheAuthBind = true;
     if (body.mediaSkipDetailLog) site.mediaSkipDetailLog = true;
+    if (site.proxyMode === 'ai') {
+      if (body.aiKey !== undefined) site.aiKey = String(body.aiKey).trim();
+      if (body.aiKeys !== undefined) site.aiKeys = String(body.aiKeys).trim();
+    }
     if (site.proxyMode || site.mediaCacheAuthBind || site.mediaSkipDetailLog) {
       await runtime.KV.put(kvKey(slug), JSON.stringify(site));
     }
@@ -592,13 +699,22 @@ async function handleAdmin(request, url, env) {
         keyId = ns;
       }
       if (body.name !== undefined) site.name = String(body.name).trim();
-      // 流媒体模式字段（编辑弹窗新增）：代理类型 / 盗链保护 / 媒体日志开关
+      // 站点模式字段（编辑弹窗新增）：模式键白名单 = 注册表（含自定义键），
+      // 并把「键 → 执行引擎」解析结果冗余进 site.engine（proxy.js 运行期零 KV 依赖）
       if (body.proxyMode !== undefined) {
         const mode = String(body.proxyMode);
-        site.proxyMode = (mode === 'media' || mode === 'normal') ? mode : (site.proxyMode || 'normal');
+        const all = await getSiteModes().catch(() => DEFAULT_SITE_MODES);
+        if (Object.prototype.hasOwnProperty.call(all, mode)) {
+          site.proxyMode = mode;
+          site.engine = resolveEngine(site, all);
+        }
       }
       if (body.mediaCacheAuthBind !== undefined) site.mediaCacheAuthBind = !!body.mediaCacheAuthBind;
       if (body.mediaSkipDetailLog !== undefined) site.mediaSkipDetailLog = !!body.mediaSkipDetailLog;
+      if (site.proxyMode === 'ai') {
+        if (body.aiKey !== undefined) site.aiKey = String(body.aiKey).trim();
+        if (body.aiKeys !== undefined) site.aiKeys = String(body.aiKeys).trim();
+      }
       const wantTarget = body.target !== undefined || body.port !== undefined;
       if (wantTarget) {
         const built = buildTarget(body.target !== undefined ? body.target : site.target, body.port !== undefined ? body.port : site.port);
@@ -657,7 +773,18 @@ async function handleAdmin(request, url, env) {
 
 // ===================== 登录 / 鉴权 =====================
 
+/** 站点徽标：从注册表取展示文案与样式类，未登记的模式回退普通 */
+async function renderSiteBadge(mode, modes) {
+  const m = modes[mode] || modes.normal || DEFAULT_SITE_MODES.normal;
+  return `<span class="tag ${esc(m.badgeClass)}">${esc(m.badge)}</span>`;
+}
+
 async function adminPage(authed, origin, env) {
+  // 站点模式注册表（KV 可编辑，未配置用默认）：编辑弹窗选项、站点列表徽标都由它渲染
+  const modes = await getSiteModes().catch(() => DEFAULT_SITE_MODES);
+  const modeOptions = Object.entries(modes)
+    .map(([k, v]) => `<option value="${esc(k)}">${esc(v.label)}</option>`)
+    .join('');
   // 服务端直接渲染站点列表（首屏秒开，不依赖前端 fetch；前端 load() 仅用于增删/操作后刷新）
   // 页面上展示的「优选目标域名」由配置推导，不写死任何域名
   const pageHost = proxyHost(env, String(origin || '').replace(/^https?:\/\//i, '').split(/[/?#]/)[0].split(':')[0]);
@@ -675,9 +802,9 @@ async function adminPage(authed, origin, env) {
   try {
     const sites = await listSites();
     listHtml = sites.length
-      ? sites.map(s => `<div class="site">
+      ? (await Promise.all(sites.map(async s => `<div class="site">
       <div class="site-head">
-        <span class="site-name">${esc(s.name)} <span class="tag">${esc(s.id)}</span>${s.proxyMode === 'media' ? '<span class="tag badge-media">流媒体</span>' : '<span class="tag badge-normal">普通</span>'}</span>
+        <span class="site-name">${esc(s.name)} <span class="tag">${esc(s.id)}</span>${await renderSiteBadge(s.proxyMode, modes)}</span>
         ${authed ? `<span style="display:inline-flex;gap:6px;"><button type="button" class="mini" data-edit="${esc(s.id)}">编辑</button><button type="button" class="danger mini" data-del="${esc(s.id)}">删除</button></span>` : ''}
       </div>
       <div class="site-target">目标：${esc(s.target)}${s.port ? `（端口 ${esc(s.port)}）` : ''} <span class="tag latency" data-id="${esc(s.id)}">上游测速中…</span></div>
@@ -689,7 +816,7 @@ async function adminPage(authed, origin, env) {
         <button type="button" class="mini" data-copy="${esc(s.target)}" data-copymsg="copyMsg-${esc(s.id)}">复制代理前链接</button>
         <span class="msg" id="copyMsg-${esc(s.id)}"></span>
       </div>
-    </div>`).join('')
+    </div>`))).join('')
       : `<div class="empty">${authed ? '还没有站点，先在上方添加一个。' : '还没有代理站点。'}</div>`;
   } catch {}
   // 外观主题：可用清单、默认主题、配套 CSS 与「首屏防闪」脚本全部由 src/themes.js 给出，
@@ -775,6 +902,15 @@ async function adminPage(authed, origin, env) {
   button.danger { background:transparent; color:var(--err); border:1px solid var(--err); }
   button.danger:hover { background:var(--err-bg); }
   button:disabled { opacity:.5; cursor:not-allowed; transform:none; }
+  .badge-ai { background:#dbeafe; color:#1e40af; border-color:#bfdbfe; }
+  .badge-blue { background:#dbeafe; color:#1e40af; border-color:#bfdbfe; }
+  .badge-purple { background:#ede9fe; color:#5b21b6; border-color:#ddd6fe; }
+  .badge-orange { background:#ffedd5; color:#9a3412; border-color:#fed7aa; }
+  .badge-red { background:#fee2e2; color:#991b1b; border-color:#fecaca; }
+  .mode-row { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+  .mode-row > * { min-width:0; }
+  .mode-row input, .mode-row select { width:auto; flex:0 1 150px; padding:6px 10px; border-radius:6px; border:1px solid var(--line); background:var(--input); color:var(--txt); font-size:13px; box-sizing:border-box; }
+  .mode-key { font-weight:600; min-width:92px; font-size:13px; }
   .site { border:1px solid var(--line); border-radius:var(--radius-sm); padding:var(--sp-3); margin-bottom:var(--sp-2); background:var(--card); transition:border-color .15s, box-shadow .15s; }
   .site:hover { border-color:var(--muted); box-shadow:var(--shadow); }
   .site-head { display:flex; align-items:center; justify-content:space-between; gap:var(--sp-2); flex-wrap:wrap; }
@@ -875,6 +1011,63 @@ ${themeScript}
   </div>` : ''}
 
   ${authed ? `
+  <div class="card" id="subgenCard" data-pane="proxy">
+    <h2>订阅生成配置</h2>
+    <div class="hint" style="margin:-8px 0 4px;">改节点 ID / 地址 / 路径 / 协议与订阅名称，保存后生成的订阅立即按新值输出；<b>修改 UUID 会让旧订阅链接全部失效</b>，需重新复制节点链接。</div>
+    <div class="grid2">
+      <div>
+        <label for="sgName">订阅名称（客户端显示名）</label>
+        <input type="text" id="sgName" placeholder="edgetunnel">
+      </div>
+      <div>
+        <label for="sgUuid">节点 ID（UUID）</label>
+        <input type="text" id="sgUuid" placeholder="xxxxxxxx-xxxx-...">
+      </div>
+    </div>
+    <div class="grid2">
+      <div>
+        <label for="sgHost">节点地址</label>
+        <input type="text" id="sgHost" placeholder="proxy.520215.xyz">
+      </div>
+      <div>
+        <label for="sgPath">路径</label>
+        <input type="text" id="sgPath" placeholder="/">
+      </div>
+    </div>
+    <div class="grid2">
+      <div>
+        <label for="sgProtocol">协议类型</label>
+        <select id="sgProtocol">
+          <option value="vless">vless</option>
+          <option value="trojan">trojan</option>
+          <option value="ss">ss</option>
+        </select>
+      </div>
+      <div>
+        <label for="sgTransport">传输协议</label>
+        <select id="sgTransport">
+          <option value="ws">ws</option>
+          <option value="grpc">grpc</option>
+        </select>
+      </div>
+    </div>
+    <div class="grid2">
+      <div>
+        <label for="sgUpdate">订阅更新间隔（分钟）</label>
+        <input type="number" id="sgUpdate" min="1" max="1440" placeholder="3">
+      </div>
+      <div>
+        <label for="sgToken">订阅 TOKEN（留空保持不变）</label>
+        <input type="text" id="sgToken" placeholder="留空保持不变">
+      </div>
+    </div>
+    <div class="row">
+      <button type="button" id="sgSaveBtn">保存订阅配置</button>
+    </div>
+    <div class="msg" id="sgMsg"></div>
+  </div>` : ''}
+
+  ${authed ? `
   <div class="card" data-pane="proxy" style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;">
     <div>
       <h2 style="margin:0 0 4px;">临时订阅管理</h2>
@@ -961,6 +1154,13 @@ ${themeScript}
     <div class="hint" style="margin:-8px 0 12px;">点击链接访问代理后的页面；复制按钮可复制代理后/代理前两种链接；「编辑」可修改名称、网址、端口、访问后缀（修改后缀后旧链接将失效）。</div>
     <div id="list">${listHtml}</div>
   </div>
+
+  ${authed ? `
+  <div class="card" data-pane="sites">
+    <h2>站点模式（注册表）</h2>
+    <div class="hint" style="margin:-8px 0 4px;">站点列表徽标与编辑弹窗的类型选项都来自这里。内置 normal / media / ai 三种不可删除、引擎不可修改；可自定义模式（自定义标签 / 徽标 / 说明 + 三选一执行引擎），自定义模式的站点按所选引擎执行，新增模式无需改代码。</div>
+    <div id="modesEditor">加载中…</div>
+  </div>` : ''}
 
   ${authed ? `
   <div class="card" id="disguiseCard" data-pane="security">
@@ -1116,11 +1316,11 @@ ${authed ? `
     <input type="text" id="editTarget" placeholder="example.com 或 https://example.com" style="width:100%;box-sizing:border-box;margin:4px 0 10px;padding:9px 12px;border-radius:8px;border:1px solid var(--line);background:var(--input);color:var(--txt);font-size:14px;">
     <label for="editPort">端口（可空）</label>
     <input type="text" id="editPort" placeholder="如 8080，留空使用默认端口" style="width:100%;box-sizing:border-box;margin:4px 0 12px;padding:9px 12px;border-radius:8px;border:1px solid var(--line);background:var(--input);color:var(--txt);font-size:14px;">
-    <label for="editProxyMode">代理类型（流媒体模式：视频分片走边缘缓存，加载像直连一样快）</label>
+    <label for="editProxyMode">代理类型（<span id="editModeHint" style="font-weight:400;color:var(--dim,#64748b);">普通反代</span>）</label>
     <select id="editProxyMode" style="width:100%;box-sizing:border-box;margin:4px 0 10px;padding:9px 12px;border-radius:8px;border:1px solid var(--line);background:var(--input);color:var(--txt);font-size:14px;">
-      <option value="normal">普通反代（默认）</option>
-      <option value="media">流媒体（Emby / Jellyfin / 影视站）</option>
+      ${modeOptions}
     </select>
+    <div id="editMediaFields">
     <label style="display:flex;align-items:center;gap:8px;margin:2px 0 6px;font-size:13px;cursor:pointer;">
       <input type="checkbox" id="editMediaAuthBind" style="width:16px;height:16px;">
       盗链保护（分片缓存按 api_key/token 隔离，不同用户不共享缓存）
@@ -1129,6 +1329,13 @@ ${authed ? `
       <input type="checkbox" id="editMediaSkipLog" style="width:16px;height:16px;">
       媒体流跳过明细日志（省 CPU，默认关闭=记录）
     </label>
+    </div>
+    <div id="editAiFields" style="display:none;">
+      <label for="editAiKey">入口密钥（可选，留空 = 公开端点）</label>
+      <input type="text" id="editAiKey" placeholder="客户端请求必须带此 key 才能访问" style="width:100%;box-sizing:border-box;margin:4px 0 10px;padding:9px 12px;border-radius:8px;border:1px solid var(--line);background:var(--input);color:var(--txt);font-size:14px;">
+      <label for="editAiKeys">上游 Key 列表（逗号 / 换行分隔，请求随机轮换；留空 = 透传客户端自己的 key）</label>
+      <textarea id="editAiKeys" rows="3" placeholder="sk-xxx1&#10;sk-xxx2" style="width:100%;box-sizing:border-box;margin:4px 0 12px;padding:9px 12px;border-radius:8px;border:1px solid var(--line);background:var(--input);color:var(--txt);font-size:14px;resize:vertical;"></textarea>
+    </div>
     <div class="msg" id="editMsg" style="min-height:18px;margin:0 0 6px;"></div>
     <div style="display:flex;gap:10px;">
       <button type="button" id="editSave" style="flex:1;">保存</button>
@@ -1529,6 +1736,125 @@ if (dgSaveBtn) {
   if (dgPrev) dgPrev.onclick = function () { window.open('/__api/disguise-preview', '_blank', 'noopener'); };
 }
 
+const sgSaveBtn = document.getElementById('sgSaveBtn');
+if (sgSaveBtn) {
+  const sgIds = ['sgName', 'sgUuid', 'sgHost', 'sgPath', 'sgProtocol', 'sgTransport', 'sgUpdate', 'sgToken'];
+  api('/__api/sub-gen').then(function (r) {
+    if (!r.ok || !r.data || !r.data.config) return;
+    const c = r.data.config;
+    const map = { sgName: c.sub_name, sgUuid: c.uuid, sgHost: c.host, sgPath: c.path, sgProtocol: c.protocol, sgTransport: c.transport, sgUpdate: c.sub_update, sgToken: c.sub_token };
+    sgIds.forEach(function (id) { const el = document.getElementById(id); if (el && map[id] !== undefined && map[id] !== null) el.value = map[id]; });
+  }).catch(function () {});
+  sgSaveBtn.onclick = async function () {
+    sgSaveBtn.disabled = true;
+    setMsg('sgMsg', '保存中…', false);
+    const v = function (id) { const el = document.getElementById(id); return el ? el.value : ''; };
+    const body = {
+      uuid: v('sgUuid'),
+      host: v('sgHost'),
+      path: v('sgPath'),
+      protocol: v('sgProtocol'),
+      transport: v('sgTransport'),
+      sub_name: v('sgName'),
+      sub_update: parseInt(v('sgUpdate'), 10) || 3,
+    };
+    const tk = v('sgToken');
+    if (tk) body.sub_token = tk;
+    try {
+      const r = await api('/__api/sub-gen', { method: 'POST', body: JSON.stringify(body) });
+      if (!r.ok) setMsg('sgMsg', r.data.error || '保存失败', true);
+      else setMsg('sgMsg', '已保存，生成的订阅将按新配置输出', false);
+    } catch (err) {
+      setMsg('sgMsg', '请求失败：' + (err && err.message ? err.message : err), true);
+    }
+    sgSaveBtn.disabled = false;
+  };
+}
+
+// ===== 站点模式注册表编辑器（自包含：不依赖任何模块导入） =====
+(function () {
+  const box = document.getElementById('modesEditor');
+  if (!box) return;
+  var modes = null;
+  var engines = ['normal', 'media', 'ai'];
+  var builtinKeys = ['normal', 'media', 'ai'];
+  var badgeOpts = [
+    ['badge-normal', '灰（普通）'], ['badge-media', '绿（流媒体）'], ['badge-ai', '蓝（AI）'],
+    ['badge-blue', '蓝'], ['badge-purple', '紫'], ['badge-orange', '橙'], ['badge-red', '红'],
+  ];
+  function esc2(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
+  }
+  function render() {
+    const rows = Object.keys(modes).map(function (k) {
+      const v = modes[k];
+      const builtin = builtinKeys.indexOf(k) >= 0;
+      return '<div class="mode-row" data-key="' + esc2(k) + '">'
+        + '<span class="mode-key">' + esc2(k) + '</span>'
+        + '<input data-f="label" value="' + esc2(v.label) + '" placeholder="标签">'
+        + '<input data-f="badge" value="' + esc2(v.badge) + '" placeholder="徽标" style="flex:0 1 90px;">'
+        + '<select data-f="badgeClass">' + badgeOpts.map(function (b) {
+          return '<option value="' + b[0] + '"' + (v.badgeClass === b[0] ? ' selected' : '') + '>' + b[1] + '</option>';
+        }).join('') + '</select>'
+        + (builtin ? '' : '<select data-f="engine">' + engines.map(function (e) {
+          return '<option value="' + e + '"' + (v.engine === e ? ' selected' : '') + '>' + e + '</option>';
+        }).join('') + '</select>')
+        + '<input data-f="hint" value="' + esc2(v.hint) + '" placeholder="说明（编辑弹窗展示）" style="flex:1 1 200px;">'
+        + (builtin ? '<span class="tag" title="内置模式不可删除">内置</span>' : '<button type="button" class="danger mini" data-del="1">删除</button>')
+        + '</div>';
+    }).join('');
+    box.innerHTML = '<div style="display:flex;flex-direction:column;gap:8px;">' + rows + '</div>'
+      + '<div class="row" style="margin-top:12px;">'
+      + '<button type="button" id="modesAddBtn" class="ghost">+ 添加自定义模式</button>'
+      + '<button type="button" id="modesSaveBtn">保存注册表</button>'
+      + '</div>'
+      + '<div class="msg" id="modesMsg"></div>';
+    box.querySelectorAll('[data-del]').forEach(function (btn) {
+      btn.onclick = function () {
+        const row = btn.closest('.mode-row');
+        if (row) { delete modes[row.getAttribute('data-key')]; render(); }
+      };
+    });
+    const addBtn = document.getElementById('modesAddBtn');
+    if (addBtn) addBtn.onclick = function () {
+      let n = 1;
+      while (modes['custom-' + n]) n++;
+      modes['custom-' + n] = { label: '自定义模式' + n, badge: '自定义', badgeClass: 'badge-blue', hint: '', engine: 'normal' };
+      render();
+    };
+    const saveBtn = document.getElementById('modesSaveBtn');
+    if (saveBtn) saveBtn.onclick = function () {
+      const out = {};
+      box.querySelectorAll('.mode-row').forEach(function (row) {
+        const k = row.getAttribute('data-key');
+        const o = {};
+        row.querySelectorAll('[data-f]').forEach(function (el) { o[el.getAttribute('data-f')] = el.value; });
+        out[k] = o;
+      });
+      saveBtn.disabled = true;
+      api('/__api/site-modes', { method: 'POST', body: JSON.stringify({ modes: out }) }).then(function (r) {
+        const msg = document.getElementById('modesMsg');
+        if (r.ok) { modes = r.data.modes; render(); msg.textContent = '已保存'; msg.style.color = ''; }
+        else { msg.textContent = (r.data && r.data.error) || '保存失败'; msg.style.color = 'var(--err)'; }
+        saveBtn.disabled = false;
+      }).catch(function (e) {
+        const msg = document.getElementById('modesMsg');
+        msg.textContent = '请求失败：' + String(e && e.message || e);
+        msg.style.color = 'var(--err)';
+        saveBtn.disabled = false;
+      });
+    };
+  }
+  api('/__api/site-modes').then(function (r) {
+    if (!r.ok || !r.data || !r.data.modes) return;
+    modes = r.data.modes;
+    engines = r.data.engines || engines;
+    render();
+  }).catch(function () { box.innerHTML = '<div class="empty">加载失败，请刷新重试</div>'; });
+})();
+
 async function load() {
   const box = $('#list');
   let r;
@@ -1543,6 +1869,16 @@ async function load() {
     box.innerHTML = '<div class="empty">加载失败，请稍后重试<br><button type="button" class="ghost" style="margin-top:10px;" onclick="load()">点击重试</button></div>';
     return;
   }
+  // 站点徽标从注册表渲染（KV 可编辑，未配置用默认），注册表拉取失败回退普通徽标
+  let modeMap = null;
+  try {
+    const mr = await api('/__api/site-modes');
+    if (mr.ok && mr.data && mr.data.modes) modeMap = mr.data.modes;
+  } catch {}
+  function renderBadge(mode) {
+    const m = (modeMap && (modeMap[mode] || modeMap.normal)) || { badge: '普通', badgeClass: 'badge-normal' };
+    return '<span class="tag ' + escapeHtml(m.badgeClass) + '">' + escapeHtml(m.badge) + '</span>';
+  }
   const sites = r.data.sites || [];
   if (!sites.length) {
     box.innerHTML = AUTHED
@@ -1554,7 +1890,7 @@ async function load() {
   box.innerHTML = sites.map(s => \`
     <div class="site">
       <div class="site-head">
-        <span class="site-name">\${escapeHtml(s.name)} <span class="tag">\${escapeHtml(s.id)}</span>\${s.proxyMode === 'media' ? '<span class="tag badge-media">流媒体</span>' : '<span class="tag badge-normal">普通</span>'}</span>
+        <span class="site-name">\${escapeHtml(s.name)} <span class="tag">\${escapeHtml(s.id)}</span>\${renderBadge(s.proxyMode)}</span>
         \${AUTHED ? '<span style="display:inline-flex;gap:6px;"><button type="button" class="mini" data-edit="' + s.id + '">编辑</button><button type="button" class="danger mini" data-del="' + s.id + '">删除</button></span>' : ''}
       </div>
       <div class="site-target">目标：\${escapeHtml(s.target)}\${s.port ? '（端口 ' + escapeHtml(s.port) + '）' : ''} <span class="tag latency" data-id="\${s.id}">上游测速中…</span></div>
@@ -1622,19 +1958,32 @@ function openEditModal(site) {
   document.getElementById('editName').value = site.name || '';
   document.getElementById('editTarget').value = site.target || '';
   document.getElementById('editPort').value = site.port || '';
-  document.getElementById('editProxyMode').value = site.proxyMode === 'media' ? 'media' : 'normal';
+  document.getElementById('editProxyMode').value = site.proxyMode === 'media' || site.proxyMode === 'ai' ? site.proxyMode : 'normal';
   document.getElementById('editMediaAuthBind').checked = !!site.mediaCacheAuthBind;
   document.getElementById('editMediaSkipLog').checked = !!site.mediaSkipDetailLog;
+  document.getElementById('editAiKey').value = site.aiKey || '';
+  document.getElementById('editAiKeys').value = site.aiKeys || '';
+  syncEditModeFields(document.getElementById('editProxyMode').value);
   document.getElementById('editMsg').textContent = '';
   m.style.display = 'flex';
   const f = document.getElementById('editSlug');
   f.value = site.id;
+}
+/** 代理类型切换：联动模式说明与专属字段显隐（media 字段 / ai 字段） */
+function syncEditModeFields(mode) {
+  const hint = document.getElementById('editModeHint');
+  const media = document.getElementById('editMediaFields');
+  const ai = document.getElementById('editAiFields');
+  if (mode === 'media') { hint.textContent = '视频分片走边缘缓存，加载像直连一样快'; media.style.display = ''; ai.style.display = 'none'; }
+  else if (mode === 'ai') { hint.textContent = 'OpenAI 兼容接口转发，可配多上游 key 轮换与入口密钥'; media.style.display = 'none'; ai.style.display = ''; }
+  else { hint.textContent = '通用网页 / 接口反代'; media.style.display = 'none'; ai.style.display = 'none'; }
 }
 function closeEditModal() { document.getElementById('editModal').style.display = 'none'; }
 
 const editModal = document.getElementById('editModal');
 if (editModal) {
   editModal.addEventListener('click', (e) => { if (e.target === editModal) closeEditModal(); });
+  document.getElementById('editProxyMode').addEventListener('change', (e) => syncEditModeFields(e.target.value));
   document.getElementById('editSave').addEventListener('click', async (e) => {
     e.preventDefault();
     const oldId = document.getElementById('editId').value;
@@ -1648,6 +1997,8 @@ if (editModal) {
       proxyMode: document.getElementById('editProxyMode').value,
       mediaCacheAuthBind: document.getElementById('editMediaAuthBind').checked,
       mediaSkipDetailLog: document.getElementById('editMediaSkipLog').checked,
+      aiKey: document.getElementById('editAiKey').value,
+      aiKeys: document.getElementById('editAiKeys').value,
     };
     const btn = document.getElementById('editSave');
     btn.disabled = true;

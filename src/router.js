@@ -14,6 +14,7 @@ import {
   renderHome, renderNotFound, renderRobots, emptyFavicon,
 } from './disguise.js';
 import { subscriptionTaggingEnabled, styleFrom, tagSubscriptionResponse } from './nodetag.js';
+import { detectSubscriptionFormat, convertSubscription } from './subfmt.js';
 import { check as rateLimitCheck } from './ratelimit.js';
 import { readShareConfig, resolve as resolveShare } from './share.js';
 import { notify as notifyAlert } from './alert.js';
@@ -150,6 +151,10 @@ async function handleRequest(request, env, ctx) {
   // 无效请求不会返回任何节点信息，放行不泄漏任何东西。
   if (path === '/sub' || path.startsWith('/sub/')) {
     const resp = await vlessHandler.fetch(request, { ...env, KV: runtime.KV }, ctx);
+    // 多格式输出：?fmt=clash|singbox|base64（文本层转换，见 src/subfmt.js）。
+    // 只认显式参数、不做 UA 猜测，默认保持引擎原样 vless:// 输出。
+    const fmt = detectSubscriptionFormat(url);
+    if (fmt !== 'plain') return await convertSubscription(resp, fmt);
     // 订阅出口：给每个节点的备注补上 IP 归属国家。
     // 开关关闭时这里一次都不会触发，不产生任何外部请求或存储读取。
     if (!(await subscriptionTaggingEnabled(env))) return resp;
@@ -327,6 +332,9 @@ async function dispatchTempSub(request, url, env, ctx) {
   subUrl.searchParams.set('token', token);
   const subReq = new Request(subUrl.toString(), request);
   const resp = await vlessHandler.fetch(subReq, { ...env, KV: runtime.KV, UUID: rec.uuid }, ctx);
+  // 临时订阅同样支持多格式输出：/tsub/<id>?fmt=clash|singbox|base64
+  const fmt = detectSubscriptionFormat(url);
+  if (fmt !== 'plain') return await convertSubscription(resp, fmt);
   // 临时订阅同样是订阅输出，备注规则与主订阅保持一致
   if (!(await subscriptionTaggingEnabled(env))) return resp;
   return await tagSubscriptionResponse(resp, tagOpts(env, ctx));
