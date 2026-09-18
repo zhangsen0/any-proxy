@@ -8,12 +8,13 @@ import { get as getTempSub, isActive as isTempSubActive, subToken as tempSubToke
 import { proxyRequest, friendlyError, handleWebSocket } from './proxy.js';
 import { injectHomeButton } from './inject.js';
 import { CROSS_PREFIX } from './url.js';
-import { scheduledDnsCheck } from './dns.js';
+import { scheduledDnsCheck, resolveProxyHost } from './dns.js';
 import {
   readConfig, isActive, hitEntry, hasGate, gateCookieValue, expiredGateCookie,
   renderHome, renderNotFound, renderRobots, emptyFavicon,
 } from './disguise.js';
 import { subscriptionTaggingEnabled, styleFrom, tagSubscriptionResponse } from './nodetag.js';
+import { sortSubscriptionResponse } from './sublat.js';
 import { engineEnvFor, nodeIdentity } from './settings.js';
 import { check as rateLimitCheck } from './ratelimit.js';
 import { readShareConfig, resolve as resolveShare } from './share.js';
@@ -179,10 +180,18 @@ async function handleRequest(request, env, ctx) {
     else if (fmt === 'base64' || fmt === 'b64') { url.searchParams.set('b64', '1'); subReq = new Request(url.toString(), request); }
     const resp = await vlessHandler.fetch(subReq, await engineEnv(env), ctx);
     if (fmt === 'clash' || fmt === 'clashyaml' || fmt === 'singbox' || fmt === 'sing-box' || fmt === 'sing') return resp;
-    // 订阅出口：给每个节点的备注补上 IP 归属国家。
-    // 开关关闭时这里一次都不会触发，不产生任何外部请求或存储读取。
-    if (!(await subscriptionTaggingEnabled(env))) return resp;
-    return await tagSubscriptionResponse(resp, await tagOpts(env, ctx));
+    // 订阅出口的两层增强（都可以在面板关掉，关掉就是原样透传）：
+    //   1. 给节点备注补 IP 归属国家；
+    //   2. 把节点按实测延迟重排 —— 客户端通常拿第一个节点用，所以顺序就是速度。
+    const subOpts = await tagOpts(env, ctx);
+    let out = resp;
+    if (await subscriptionTaggingEnabled(env)) out = await tagSubscriptionResponse(out, subOpts);
+    // 探测目标域名：面板配置 → 环境变量 → 本次请求的 hostname（与面板「候选拉取」同一口径）
+    out = await sortSubscriptionResponse(out, {
+      ...subOpts,
+      host: (await resolveProxyHost(env, url.hostname)) || url.hostname,
+    });
+    return out;
   }
 
   // ---- 陌生人：只允许「一个普通网站该有的东西」，其余一律伪装 404 ----

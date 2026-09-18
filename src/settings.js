@@ -134,6 +134,16 @@ export const SETTINGS_SPEC = {
     group: 'preferred', label: '延迟实测总预算', unit: '毫秒', level: 'advanced',
     hint: '预算耗尽就按已测到的结果排序，绝不把整个请求拖过 Workers 的墙钟',
   },
+  sub_latency_sort: {
+    type: 'bool', default: true, env: 'SUB_LATENCY_SORT',
+    group: 'preferred', label: '订阅按实测延迟排序',
+    hint: '客户端通常拿订阅里第一个节点用，所以顺序就是速度。开着会把实测最快的排到最前；关着则原样透传上游订阅的顺序（近似随机）。测量结果有缓存，只有缓存过期后那一次拉取会多花几秒',
+  },
+  sub_latency_ttl_ms: {
+    type: 'int', default: 1800000, min: 60000, max: 21600000, env: 'SUB_LATENCY_TTL_MS',
+    group: 'preferred', label: '延迟缓存有效期', unit: '毫秒', level: 'advanced',
+    hint: '缓存期内复用上次实测结果，不重复探测。调大省时间但跟不上网络变化，调小更准但每次拉订阅都要实测一遍',
+  },
   dns_budget_ms: {
     type: 'int', default: 22000, min: 5000, max: 29000, env: 'DNS_BUDGET_MS',
     group: 'preferred', label: '优选总时间预算', unit: '毫秒',

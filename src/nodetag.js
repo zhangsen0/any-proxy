@@ -265,6 +265,6 @@ export async function styleFrom(env) {
 }
 
 export {
-  DEFAULT_STYLE, NODE_RE, SEP, decodeWhole,
+  DEFAULT_STYLE, NODE_RE, SEP, decodeWhole, encodeWhole,
   lineHost, lineRemark, tagText, toggle, MAX_SUB_BYTES,
 };
