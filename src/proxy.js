@@ -2,6 +2,7 @@ import { cors, isText, esc, isNavigation, isFingerprinted } from './util.js';
 import { CROSS_PREFIX, mapAbsoluteUrl, rewriteContent, contentKind, isHlsManifest } from './url.js';
 import { injectLinkFix, buildDocWritePage, rewriteLocations } from './inject.js';
 import { finalizeResponse } from './compress.js';
+import { readR2Config } from './media-r2.js';
 
 // 反向代理核心：请求转发、响应重写、WebSocket 透传
 
@@ -126,11 +127,10 @@ const MAX_CACHE_BYTES = 4 * 1024 * 1024;
 //  - key：media/<sha256(URL+auth+Range)> —— 分片是「区间快照」，必须绑 Range 区间，
 //    否则不同区间互相污染（R2 不像 Cache API 会对完整 200 响应自动切分）；
 //  - 命中：直接返回 206（Content-Type / Content-Range 从对象元数据还原）；
-//  - miss：回源 206 后 waitUntil 读完整分片写入（单对象 ≤ R2_MAX_OBJECT，避免读大流打爆内存）；
-//  - 过期：对象带 ts 元数据，由 cron 的 sweepMediaR2 定时删除超过 R2_TTL_MS 的对象；
+//  - miss：回源 206 后 waitUntil 读完整分片写入（单对象 ≤ 配置的单分片上限，避免读大流打爆内存）；
+//  - 过期：对象带 ts 元数据，由 cron 的 sweepMediaR2 定时删除超过保留天数的对象；
 //  - 未绑定（本地测试 / 未配置 R2）时 serveR2Segment 直接返回 null，自动降级为纯 Cache API。
-const R2_MAX_OBJECT = 64 * 1024 * 1024;   // 单分片缓存上限 64MB（R2 免费额度内的保守值）
-const R2_TTL_MS = 7 * 24 * 3600 * 1000;   // 分片缓存 7 天
+// 启用开关、保留天数、单分片上限全部在「配置中心 → R2 媒体缓存」可编辑（唯一真源 src/media-r2.js）。
 const R2_PREFIX = 'media/';
 
 /** R2 对象 key：URL（含可选鉴权绑定）与 Range 区间的 SHA-256，避免 URL 字符与长度问题 */
@@ -147,6 +147,9 @@ export async function mediaR2Key(targetUrl, request, authBind) {
  */
 export async function serveR2Segment(ctx, env, targetUrl, request, authBind, upstream, headersOut) {
   if (!env || !env.MEDIA_R2 || upstream.status !== 206) return null;
+  // 策略配置（KV 可编辑）：总开关关闭则不写入也不命中；单分片上限过滤超大区间
+  const cfg = await readR2Config(env);
+  if (!cfg.enabled) return null;
   const key = await mediaR2Key(targetUrl, request, authBind);
   const obj = await env.MEDIA_R2.get(key).catch(() => null);
   if (obj) {
@@ -161,7 +164,7 @@ export async function serveR2Segment(ctx, env, targetUrl, request, authBind, ups
     return new Response(obj.body, { status: 206, headers: h });
   }
   const len = parseInt(upstream.headers.get('content-length') || '0', 10);
-  if (len <= 0 || len > R2_MAX_OBJECT) return null;
+  if (len <= 0 || len > cfg.maxObjectMB * 1024 * 1024) return null;
   const cr = upstream.headers.get('content-range') || '';
   const ct = headersOut.get('content-type') || '';
   try {
@@ -173,9 +176,10 @@ export async function serveR2Segment(ctx, env, targetUrl, request, authBind, ups
   return null;
 }
 
-/** 定时清理 R2 媒体分片缓存：删除超过 R2_TTL_MS 的对象（无绑定则跳过） */
+/** 定时清理 R2 媒体分片缓存：删除超过保留天数（配置中心可编辑，默认 7 天）的对象；无绑定则跳过 */
 export async function sweepMediaR2(env) {
   if (!env || !env.MEDIA_R2) return;
+  const ttlMs = (await readR2Config(env)).ttlDays * 24 * 3600 * 1000;
   const now = Date.now();
   let cursor;
   do {
@@ -184,7 +188,7 @@ export async function sweepMediaR2(env) {
     const stale = list.objects
       .filter(o => {
         const ts = parseInt((o.customMetadata || {}).ts || '0', 10);
-        return ts > 0 && now - ts > R2_TTL_MS;
+        return ts > 0 && now - ts > ttlMs;
       })
       .map(o => o.key);
     if (stale.length) await env.MEDIA_R2.delete(stale).catch(() => {});

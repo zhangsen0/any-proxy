@@ -3,6 +3,8 @@ import { toBool } from './config.js';
 import { runtime } from './runtime.js';
 import { listSites, getSite, autoSlug, validSlug, buildTarget, addSite } from './sites.js';
 import { DEFAULT_SITE_MODES, getSiteModes, saveSiteModes, resolveEngine, siteBadge, SITE_ENGINES, BADGE_CLASSES } from './site-modes.js';
+import { readR2Config, saveR2Config, R2_CACHE_SPEC } from './media-r2.js';
+import { sweepMediaR2 } from './proxy.js';
 import {
   autoUpdatePreferredDns, filterUsableIps, applyDnsWithSelfCheck, proxyHost, targetHost,
   DNS_INTERVAL, POOL_LIMIT, DOMAIN_POOL_LIMIT,
@@ -261,6 +263,27 @@ async function handleAdmin(request, url, env) {
       try {
         const saved = await saveSiteModes(body.modes);
         return json({ ok: true, modes: saved });
+      } catch (e) {
+        return json({ error: '保存失败：' + String(e && e.message || e).slice(0, 200) }, 400);
+      }
+    }
+  }
+
+  // ---- R2 媒体缓存策略：保留天数（KV 可编辑）+ 立即清理过期分片 ----
+  if (path === '/__api/r2-cache') {
+    if (request.method === 'GET') {
+      return json({ ok: true, config: await readR2Config(env), spec: R2_CACHE_SPEC, bound: !!(env && env.MEDIA_R2) });
+    }
+    if (request.method === 'POST') {
+      let body;
+      try { body = await request.json(); } catch { return json({ error: 'invalid json' }, 400); }
+      if (body && body.action === 'clean') {
+        try { await sweepMediaR2(env); return json({ ok: true, cleaned: true }); }
+        catch (e) { return json({ error: '清理失败：' + String(e && e.message || e).slice(0, 200) }, 400); }
+      }
+      try {
+        const saved = await saveR2Config(env, { ttlDays: body.ttlDays });
+        return json({ ok: true, config: saved });
       } catch (e) {
         return json({ error: '保存失败：' + String(e && e.message || e).slice(0, 200) }, 400);
       }
@@ -811,6 +834,10 @@ async function adminPage(authed, origin, env) {
   // 首页伪装配置：面板里展示当前状态；口令是否已设置只给出布尔，不把明文带上管理页 HTML
   let dgCfg = null;
   try { dgCfg = await readConfig(env); } catch {}
+  // R2 媒体缓存策略（KV 可编辑）：面板展示当前值并可在配置中心修改
+  let r2Cfg = null;
+  try { r2Cfg = await readR2Config(env); } catch {}
+  const r2Bound = !!(env && env.MEDIA_R2);
   const hasToken = !!(dgCfg && dgCfg.token);
   // 节点备注的国家标注：面板展示当前来源（面板配置 / 环境变量 / 默认），便于判断为什么是这个值
   let ntCfg = null;
@@ -1188,6 +1215,34 @@ ${themeScript}
   </div>
 
   <div class="card" data-pane="registry">
+    <h2>R2 媒体缓存</h2>
+    <div class="hint" style="margin:-8px 0 4px;">流媒体模式下播放器拉的 206 视频分片会持久落 R2，命中即零回源满速返回。缓存按「网址 + 鉴权 + 区间」去重，热门视频只存一份；关闭总开关后不再写入也不命中，链路回到 Cache API + 透传。${r2Bound ? '' : '当前未绑定 R2（环境缺少 MEDIA_R2），此卡片仅展示默认策略。'}</div>
+    <div class="grid2">
+      <div>
+        <label for="r2Enabled">总开关</label>
+        <select id="r2Enabled" style="width:100%;box-sizing:border-box;margin:4px 0 10px;padding:9px 12px;border-radius:8px;border:1px solid var(--line);background:var(--input);color:var(--txt);font-size:14px;">
+          <option value="true"${r2Cfg && r2Cfg.enabled ? ' selected' : ''}>开启</option>
+          <option value="false"${r2Cfg && !r2Cfg.enabled ? ' selected' : ''}>关闭</option>
+        </select>
+      </div>
+      <div>
+        <label for="r2TtlDays">分片保留天数（${R2_CACHE_SPEC.ttlDays.min}~${R2_CACHE_SPEC.ttlDays.max}）</label>
+        <input id="r2TtlDays" type="number" min="${R2_CACHE_SPEC.ttlDays.min}" max="${R2_CACHE_SPEC.ttlDays.max}" style="width:100%;box-sizing:border-box;margin:4px 0 10px;padding:9px 12px;border-radius:8px;border:1px solid var(--line);background:var(--input);color:var(--txt);font-size:14px;" placeholder="默认 ${R2_CACHE_SPEC.ttlDays.default} 天" value="${r2Cfg ? r2Cfg.ttlDays : ''}">
+      </div>
+      <div>
+        <label for="r2MaxMB">单分片缓存上限 MB（${R2_CACHE_SPEC.maxObjectMB.min}~${R2_CACHE_SPEC.maxObjectMB.max}）</label>
+        <input id="r2MaxMB" type="number" min="${R2_CACHE_SPEC.maxObjectMB.min}" max="${R2_CACHE_SPEC.maxObjectMB.max}" style="width:100%;box-sizing:border-box;margin:4px 0 10px;padding:9px 12px;border-radius:8px;border:1px solid var(--line);background:var(--input);color:var(--txt);font-size:14px;" placeholder="默认 ${R2_CACHE_SPEC.maxObjectMB.default} MB" value="${r2Cfg ? r2Cfg.maxObjectMB : ''}">
+      </div>
+    </div>
+    <div class="row">
+      <button type="button" id="r2TtlBtn">保存缓存策略</button>
+      <button type="button" id="r2CleanBtn" class="ghost">立即清理过期分片</button>
+    </div>
+    <div class="hint" style="margin-top:6px;">保存后立即生效：开关即时切换，上限影响之后的写入，保留天数影响之后每个清理周期；「立即清理」马上删除当前已过期的分片，不等待周期。</div>
+    <div class="msg" id="r2Msg"></div>
+  </div>
+
+  <div class="card" data-pane="registry">
     <h2>系统配置字典（只读）</h2>
     <div class="hint" style="margin:-8px 0 4px;">系统内所有注册表 / 字典的集中查看。标记「真源」的是代码级定义（改代码后重新部署生效，运行逻辑依赖它们的键值，请勿在面板直接改）；可编辑的注册表（如上方站点模式）在面板内单独维护。</div>
     ${dictHtml}
@@ -1479,6 +1534,44 @@ api('/__api/speedtest').then(r => {
     if (inp) inp.value = r.data.interval_minutes;
   }
 })();
+// ===== R2 媒体缓存策略：总开关 / 保留天数 / 单分片上限 + 立即清理 =====
+const r2TtlBtn = document.getElementById('r2TtlBtn');
+if (r2TtlBtn) {
+  r2TtlBtn.onclick = async () => {
+    const en = document.getElementById('r2Enabled');
+    const ttl = document.getElementById('r2TtlDays');
+    const mx = document.getElementById('r2MaxMB');
+    const v = parseInt(ttl.value, 10);
+    const m = parseInt(mx.value, 10);
+    // 区间从输入框自身读（服务端按 R2_CACHE_SPEC 渲染的 min/max），浏览器不重复抄默认值
+    if (!v || v < Number(ttl.min) || v > Number(ttl.max)) { setMsg('r2Msg', '保留天数需在 ' + ttl.min + ' ~ ' + ttl.max + ' 之间', true); return; }
+    if (!m || m < Number(mx.min) || m > Number(mx.max)) { setMsg('r2Msg', '单分片上限需在 ' + mx.min + ' ~ ' + mx.max + ' MB 之间', true); return; }
+    setMsg('r2Msg', '正在保存…');
+    r2TtlBtn.disabled = true;
+    try {
+      const r = await api('/__api/r2-cache', { method: 'POST', body: JSON.stringify({ enabled: en.value === 'true', ttlDays: v, maxObjectMB: m }) });
+      setMsg('r2Msg', r.ok ? '已保存：' + (en.value === 'true' ? '开启' : '关闭') + '，保留 ' + v + ' 天，单分片上限 ' + m + ' MB' : (r.data.error || '保存失败'), !r.ok);
+    } catch (e) {
+      setMsg('r2Msg', '请求失败：' + String(e && e.message || e), true);
+    }
+    r2TtlBtn.disabled = false;
+  };
+}
+const r2CleanBtn = document.getElementById('r2CleanBtn');
+if (r2CleanBtn) {
+  r2CleanBtn.onclick = async () => {
+    setMsg('r2Msg', '正在清理…');
+    r2CleanBtn.disabled = true;
+    try {
+      const r = await api('/__api/r2-cache', { method: 'POST', body: JSON.stringify({ action: 'clean' }) });
+      setMsg('r2Msg', r.ok ? '已清理当前过期的分片' : (r.data.error || '清理失败'), !r.ok);
+    } catch (e) {
+      setMsg('r2Msg', '请求失败：' + String(e && e.message || e), true);
+    }
+    r2CleanBtn.disabled = false;
+  };
+}
+
 const dnsBtn = document.getElementById('dnsBtn');
 if (dnsBtn) {
   dnsBtn.onclick = async () => {

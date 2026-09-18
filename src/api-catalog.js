@@ -234,6 +234,10 @@ export const API_CATALOG = [
         id: 'site-modes', name: '站点模式注册表', kind: 'setting', method: 'GET', path: '/__api/site-modes', writeMethod: 'POST',
         desc: '站点类型标签 / 徽标 / 说明 / 执行引擎（KV 可编辑，未配置用默认；内置 normal/media/ai 不可删、引擎不可改，自定义模式可增删改）', auth: true,
       },
+      {
+        id: 'r2-cache', name: 'R2 媒体缓存策略', kind: 'setting', method: 'GET', path: '/__api/r2-cache', writeMethod: 'POST',
+        desc: '流媒体分片持久缓存的策略：总开关 / 保留天数（1~365）/ 单分片上限 MB（1~256），KV 可编辑立即生效；POST {action:"clean"} 立即清理过期分片', auth: true,
+      },
     ],
   },
   {
