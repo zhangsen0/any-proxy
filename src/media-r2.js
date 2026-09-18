@@ -38,8 +38,19 @@ export function sanitizeR2Config(cfg) {
   return out;
 }
 
+/**
+ * 自己解析，不依赖 KV 的 'json' 选项。
+ *
+ * 真人踩过的坑：原先写的是 get(KV_KEY, 'json')。原生 KV binding 支持这个第二参数，
+ * 但 D1 后端（createD1KV）的 get 只声明了一个形参，第二参数被丢掉、返回的是**字符串**。
+ * sanitizeR2Config 收到字符串会整份回退默认值 —— 于是「面板提示已保存，刷新后又变回默认」。
+ * 同一个项目两种存储后端，读取口径必须自己兜住，不能指望底层抽象。
+ */
 export async function readR2Config() {
-  const v = await runtime.KV.get(KV_KEY, 'json').catch(() => null);
+  const raw = await runtime.KV.get(KV_KEY).catch(() => null);
+  let v = null;
+  if (raw && typeof raw === 'object') v = raw;
+  else if (typeof raw === 'string' && raw.trim()) { try { v = JSON.parse(raw); } catch { v = null; } }
   return sanitizeR2Config(v);
 }
 
