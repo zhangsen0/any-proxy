@@ -551,6 +551,13 @@ async function handleAdmin(request, url, env) {
     if (dup) return json({ ok: true, site: dup, reused: true }, 200);
 
     const site = await addSite(name, slug, built);
+    // 流媒体模式字段（新增时可选传入，默认 normal）
+    if (body.proxyMode === 'media') site.proxyMode = 'media';
+    if (body.mediaCacheAuthBind) site.mediaCacheAuthBind = true;
+    if (body.mediaSkipDetailLog) site.mediaSkipDetailLog = true;
+    if (site.proxyMode || site.mediaCacheAuthBind || site.mediaSkipDetailLog) {
+      await runtime.KV.put(kvKey(slug), JSON.stringify(site));
+    }
     return json({ ok: true, site }, 201);
   }
 
@@ -585,6 +592,13 @@ async function handleAdmin(request, url, env) {
         keyId = ns;
       }
       if (body.name !== undefined) site.name = String(body.name).trim();
+      // 流媒体模式字段（编辑弹窗新增）：代理类型 / 盗链保护 / 媒体日志开关
+      if (body.proxyMode !== undefined) {
+        const mode = String(body.proxyMode);
+        site.proxyMode = (mode === 'media' || mode === 'normal') ? mode : (site.proxyMode || 'normal');
+      }
+      if (body.mediaCacheAuthBind !== undefined) site.mediaCacheAuthBind = !!body.mediaCacheAuthBind;
+      if (body.mediaSkipDetailLog !== undefined) site.mediaSkipDetailLog = !!body.mediaSkipDetailLog;
       const wantTarget = body.target !== undefined || body.port !== undefined;
       if (wantTarget) {
         const built = buildTarget(body.target !== undefined ? body.target : site.target, body.port !== undefined ? body.port : site.port);
@@ -663,7 +677,7 @@ async function adminPage(authed, origin, env) {
     listHtml = sites.length
       ? sites.map(s => `<div class="site">
       <div class="site-head">
-        <span class="site-name">${esc(s.name)} <span class="tag">${esc(s.id)}</span></span>
+        <span class="site-name">${esc(s.name)} <span class="tag">${esc(s.id)}</span>${s.proxyMode === 'media' ? '<span class="tag" style="background:#dcfce7;color:#166534;border-color:#86efac;">流媒体</span>' : ''}</span>
         ${authed ? `<span style="display:inline-flex;gap:6px;"><button type="button" class="mini" data-edit="${esc(s.id)}">编辑</button><button type="button" class="danger mini" data-del="${esc(s.id)}">删除</button></span>` : ''}
       </div>
       <div class="site-target">目标：${esc(s.target)}${s.port ? `（端口 ${esc(s.port)}）` : ''} <span class="tag latency" data-id="${esc(s.id)}">上游测速中…</span></div>
@@ -1099,6 +1113,19 @@ ${authed ? `
     <input type="text" id="editTarget" placeholder="example.com 或 https://example.com" style="width:100%;box-sizing:border-box;margin:4px 0 10px;padding:9px 12px;border-radius:8px;border:1px solid var(--line);background:var(--input);color:var(--txt);font-size:14px;">
     <label for="editPort">端口（可空）</label>
     <input type="text" id="editPort" placeholder="如 8080，留空使用默认端口" style="width:100%;box-sizing:border-box;margin:4px 0 12px;padding:9px 12px;border-radius:8px;border:1px solid var(--line);background:var(--input);color:var(--txt);font-size:14px;">
+    <label for="editProxyMode">代理类型（流媒体模式：视频分片走边缘缓存，加载像直连一样快）</label>
+    <select id="editProxyMode" style="width:100%;box-sizing:border-box;margin:4px 0 10px;padding:9px 12px;border-radius:8px;border:1px solid var(--line);background:var(--input);color:var(--txt);font-size:14px;">
+      <option value="normal">普通反代（默认）</option>
+      <option value="media">流媒体（Emby / Jellyfin / 影视站）</option>
+    </select>
+    <label style="display:flex;align-items:center;gap:8px;margin:2px 0 6px;font-size:13px;cursor:pointer;">
+      <input type="checkbox" id="editMediaAuthBind" style="width:16px;height:16px;">
+      盗链保护（分片缓存按 api_key/token 隔离，不同用户不共享缓存）
+    </label>
+    <label style="display:flex;align-items:center;gap:8px;margin:2px 0 12px;font-size:13px;cursor:pointer;">
+      <input type="checkbox" id="editMediaSkipLog" style="width:16px;height:16px;">
+      媒体流跳过明细日志（省 CPU，默认关闭=记录）
+    </label>
     <div class="msg" id="editMsg" style="min-height:18px;margin:0 0 6px;"></div>
     <div style="display:flex;gap:10px;">
       <button type="button" id="editSave" style="flex:1;">保存</button>
@@ -1592,6 +1619,9 @@ function openEditModal(site) {
   document.getElementById('editName').value = site.name || '';
   document.getElementById('editTarget').value = site.target || '';
   document.getElementById('editPort').value = site.port || '';
+  document.getElementById('editProxyMode').value = site.proxyMode === 'media' ? 'media' : 'normal';
+  document.getElementById('editMediaAuthBind').checked = !!site.mediaCacheAuthBind;
+  document.getElementById('editMediaSkipLog').checked = !!site.mediaSkipDetailLog;
   document.getElementById('editMsg').textContent = '';
   m.style.display = 'flex';
   const f = document.getElementById('editSlug');
@@ -1610,7 +1640,12 @@ if (editModal) {
     const port = document.getElementById('editPort').value.trim();
     const slug = document.getElementById('editSlug').value.trim();
     if (!name || !target) { document.getElementById('editMsg').textContent = '请填写名称和网址'; document.getElementById('editMsg').style.color = 'var(--err)'; return; }
-    const body = { name, target, port, slug };
+    const body = {
+      name, target, port, slug,
+      proxyMode: document.getElementById('editProxyMode').value,
+      mediaCacheAuthBind: document.getElementById('editMediaAuthBind').checked,
+      mediaSkipDetailLog: document.getElementById('editMediaSkipLog').checked,
+    };
     const btn = document.getElementById('editSave');
     btn.disabled = true;
     try {

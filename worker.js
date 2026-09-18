@@ -25,23 +25,59 @@ import { scheduledDnsCheck } from './src/dns.js';
 import { readConfig, isActive, renderNotFound } from './src/disguise.js';
 import { record as recordVisit, recordBytes } from './src/stats.js';
 import { matchVisitScope } from './src/scopes.js';
+import { getSite } from './src/sites.js';
 
 /** WebSocket 升级响应没有正常响应体，不能套流计数 */
 const WS_SWITCHING_PROTOCOLS = 101;
 
 /**
- * 响应一律由 TransformStream 边发边数**实际传输字节**，不信任响应头 Content-Length ——
- * 后者是「声称的大小」：大文件请求一旦被客户端中途掐断（播放器放弃、弱网断流），
- * 头里整片的大小会被当成实际流量，日志里出现几十 GB 的虚高
- * （线上实测：边缘只发了 0.5GB，日志记了 20GB）。
- * 用 TransformStream 只做累加，不缓存内容，所以大文件也不会多占内存。
+ * 超过此声明体积的响应不再套流计数（与 proxy.js 的 MAX_CACHE_BYTES 同值）。
+ * 原因见 countResponseBytes 透传分支的注释。
+ */
+const PASSTHROUGH_MAX_BYTES = 4 * 1024 * 1024;
+
+/**
+ * 响应字节计数的两条路：
+ *
+ * 1. 小响应（页面 / 接口 / 图片 / JS / CSS）：套 TransformStream 边发边数**实际传输字节**。
+ *    不信任响应头 Content-Length —— 后者是「声称的大小」，大文件请求一旦被客户端中途
+ *    掐断（播放器放弃、弱网断流），头里整片的大小会被当成实际流量，日志里出现几十 GB
+ *    的虚高（线上实测：边缘只发了 0.5GB，日志记了 20GB）。小响应量小，逐 chunk 累加的
+ *    CPU 开销可忽略，无中断风险。
+ *
+ * 2. 媒体 / 大文件响应（206 分片、video/audio、带 Range、声明体积 > 4MB）：**直接透传，
+ *    不套流**。教训：给所有响应套 TransformStream 后，高速转发时每个 chunk 都要执行 JS
+ *    回调（累加 + enqueue），累计 CPU 撞上 CF 免费版 10ms/请求配额 → Worker 被冻结 →
+ *    响应流随机被掐 → 播放器分片拿不全 → 重试 / 无 Range 全量重下 → 「流量虚高但播不了」。
+ *    播放流畅优先于逐字节精度：此类响应用上游 Content-Length 头记账（完整传输时 == 实际
+ *    字节，不虚高），客户端中途断开的交叉信号由 CF 用量驾驶舱的边缘 499 计数承担。
+ *
  * 顺带记两个维度（回答「流量都去哪了 / 是不是播不了」）：
- *   - aborted：流没发完就断开（客户端放弃）→ 计入 aborts；
+ *   - aborted：流没发完就断开（客户端放弃）→ 计入 aborts（仅套流路径可感知）；
  *   - media：206 / video|audio / 带 Range 的请求 → 计入 mbytes。
  */
-function countResponseBytes(response, scope, env, ctx, media) {
+export function countResponseBytes(response, scope, env, ctx, media) {
   if (!response || !response.body) return response;
   if (response.status === WS_SWITCHING_PROTOCOLS) return response;
+
+  const declared = parseInt(response.headers.get('content-length') || '0', 10);
+  const ct = response.headers.get('content-type') || '';
+  // 只有「体积已知」的媒体/大文件才透传（头记账有据可依）；
+  // 没有 content-length 的分块媒体流（直播/动态流）无法用头记账，仍套流精确计数，
+  // 这类响应通常量小或短暂，逐 chunk 回调的 CPU 开销可接受。
+  const isPassthrough = declared > 0 && (media || declared > PASSTHROUGH_MAX_BYTES || /^(?:video|audio)\//.test(ct));
+  if (isPassthrough) {
+    // 媒体/大文件：零 CPU 透传，按上游声明体积记账（完整传输时精确）。
+    // 若站点配了 mediaSkipDetailLog=1（媒体流跳过明细记账降 CPU），调用方已提前放行。
+    if (declared > 0) {
+      try {
+        if (ctx && typeof ctx.waitUntil === 'function') {
+          ctx.waitUntil(recordBytes({ scope, bytes: declared, media: true, aborted: false, env }));
+        }
+      } catch { /* 统计永不阻塞请求 */ }
+    }
+    return response;
+  }
 
   let total = 0;
   let aborted = false;
@@ -95,6 +131,16 @@ export default {
           // 媒体流分类：206 分片 / video|audio 内容 / 带 Range 的请求 —— 播放链路专用维度
           const ct = response.headers.get('content-type') || '';
           const media = response.status === 206 || /^(?:video|audio)\//.test(ct) || !!request.headers.get('range');
+          if (media) {
+            // 流媒体模式的站点可配 mediaSkipDetailLog=1：媒体请求跳过明细记账，降 CPU 与
+            // KV/D1 写放大（流量风暴时有效）；默认 0 = 记录。配置读取失败时保守默认记录。
+            let skipMediaDetail = false;
+            try {
+              const site = await getSite(scope);
+              skipMediaDetail = !!(site && site.mediaSkipDetailLog);
+            } catch {}
+            if (skipMediaDetail) return response;
+          }
           response = countResponseBytes(response, scope, env, ctx, media);
         }
       } catch {}

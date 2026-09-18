@@ -235,6 +235,7 @@ section('2.5 落盘失败自动重试（KV 抖动不再蒸发计数）');
 section('2.6 媒体流量 mbytes 与传输中断 aborts');
 {
   // 2e. 媒体流分类：video/mp4 直通 → 流量单独进 mbytes，回答「流量都去哪了」
+  // 无 content-length（分块流式）的媒体没有可用的头记账，仍走套流精确计数
   mem.set('site:demo4', JSON.stringify({
     id: 'demo4', name: '四号片场', host: '127.0.0.1', target: 'http://127.0.0.1', scheme: 'http',
   }));
@@ -247,13 +248,16 @@ section('2.6 媒体流量 mbytes 与传输中断 aborts');
   await flush(env);
   const d5 = (await apiGet('/__api/stats?days=7', { Cookie: COOKIE })).data || {};
   const demo4 = (d5.series || []).find(s => s.scope === 'p:demo4');
-  ok('视频响应计入媒体流量', !!demo4 && demo4.mbytes === MOV.length,
+  ok('视频响应计入媒体流量（无长度分块流仍套流精确计数）', !!demo4 && demo4.mbytes === MOV.length,
     demo4 ? `mbytes=${demo4.mbytes}（期望 ${MOV.length}）` : '未找到 p:demo4');
   ok('这条只有媒体：总流量 == 媒体流量', !!demo4 && demo4.bytes === demo4.mbytes,
     demo4 ? `bytes=${demo4.bytes} mbytes=${demo4.mbytes}` : '');
 
-  // 2f. ⭐ 传输中断：客户端读一半就 cancel（播放器放弃 / 弱网断流）→ aborts +1，
-  //     已传输的字节照记（既不是整片、也不是 0）。头部谎报 80000 也不能多记。
+  // 2f. ⭐ 传输中断的两条路径（播放器放弃 / 弱网断流）：
+  //   - 带 content-length 的媒体/大文件（Emby 206 分片、200 整片都是）→ 零 CPU 透传，
+  //     按上游头记账（完整传输时 == 实际字节，不虚高）。客户端中途断开在透传路径
+  //     无法感知，**不误报 aborts**，中断信号交给 CF 用量驾驶舱的边缘 499 计数交叉验证。
+  //   - 小响应（页面/接口/图片）→ 套流精确计数，cancel 时 aborts +1 且只记已传字节。
   mem.set('site:demo5', JSON.stringify({
     id: 'demo5', name: '五号基站', host: '127.0.0.1', target: 'http://127.0.0.1', scheme: 'http',
   }));
@@ -273,11 +277,37 @@ section('2.6 媒体流量 mbytes 与传输中断 aborts');
 
   const d6 = (await apiGet('/__api/stats?days=7', { Cookie: COOKIE })).data || {};
   const demo5 = (d6.series || []).find(s => s.scope === 'p:demo5');
-  ok('中断被计入（aborts=1）', !!demo5 && demo5.aborts === 1, demo5 ? `aborts=${demo5.aborts}` : '未找到 p:demo5');
-  ok('中断时已传输的字节照记（且远小于头部声称的 80000）', !!demo5 && demo5.bytes > 0 && demo5.bytes < 80000,
-    demo5 ? `bytes=${demo5.bytes}` : '');
-  ok('中断的媒体字节同样进 mbytes', !!demo5 && demo5.mbytes === demo5.bytes,
+  ok('带 content-length 的媒体按头记账（零 CPU 透传，完整传输时精确）', !!demo5 && demo5.bytes === 80000,
+    demo5 ? `bytes=${demo5.bytes}（期望 80000）` : '未找到 p:demo5');
+  ok('透传路径不误报中断（aborts=0，交叉验证走 CF 边缘 499）', !!demo5 && demo5.aborts === 0,
+    demo5 ? `aborts=${demo5.aborts}` : '');
+  ok('媒体字节同样进 mbytes', !!demo5 && demo5.mbytes === 80000,
     demo5 ? `mbytes=${demo5.mbytes}` : '');
+
+  // 2g. 小响应中断：套流路径保留 aborts 检测（页面/图片半路放弃 → 只记已传部分）
+  // 用非文本小响应（image/png）：走直传分支、不读 body，套流后 cancel 才能触发中断信号
+  mem.set('site:demo6', JSON.stringify({
+    id: 'demo6', name: '六号小站', host: '127.0.0.1', target: 'http://127.0.0.1', scheme: 'http',
+  }));
+  globalThis.fetch = async () => new Response(new ReadableStream({
+    start(c) { c.enqueue(new TextEncoder().encode('Q'.repeat(5000))); /* 故意不 close */ },
+  }), { status: 200, headers: { 'content-type': 'image/png', 'content-length': '90000' } });
+
+  const pending3 = [];
+  const ctx3 = { waitUntil: (p) => { pending3.push(p); } };
+  const res6 = await worker.fetch(new Request(ORIGIN + '/p/demo6/cover.png', { headers: VISITOR }), env, ctx3);
+  const reader6 = res6.body.getReader();
+  await reader6.read();
+  await reader6.cancel();
+  await Promise.all(pending3.map(p => Promise.resolve(p).catch(() => {})));
+  await new Promise(r => setTimeout(r, 10));
+  await flush(env);
+
+  const d7 = (await apiGet('/__api/stats?days=7', { Cookie: COOKIE })).data || {};
+  const demo6 = (d7.series || []).find(s => s.scope === 'p:demo6');
+  ok('小响应中断被计入（aborts=1）', !!demo6 && demo6.aborts === 1, demo6 ? `aborts=${demo6.aborts}` : '未找到 p:demo6');
+  ok('中断时已传输的字节照记（远小于头部声称的 90000）', !!demo6 && demo6.bytes > 0 && demo6.bytes < 90000,
+    demo6 ? `bytes=${demo6.bytes}` : '');
 
   // 恢复成常规假源站
   globalThis.fetch = async () => new Response(UP_BODY, {

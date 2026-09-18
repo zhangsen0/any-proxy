@@ -213,7 +213,7 @@ export const API_CATALOG = [
       },
       {
         id: 'site-update', name: '修改站点', kind: 'action', method: 'PUT', path: '/__api/sites/<id>',
-        desc: '改名称 / 后缀 / 目标地址；后缀变化时旧链接会一并迁移', auth: true,
+        desc: '改名称 / 后缀 / 目标地址，以及流媒体模式字段（proxyMode=normal|media、mediaCacheAuthBind 盗链保护、mediaSkipDetailLog 媒体日志开关）；后缀变化时旧链接会一并迁移', auth: true,
         pathParam: { key: 'id', label: '站点 id', placeholder: 'demo' },
       },
       {

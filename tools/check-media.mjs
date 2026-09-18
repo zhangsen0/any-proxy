@@ -7,12 +7,18 @@
  * 1. 视频被整个读进 Worker 内存写 Cache API —— 请求拖到超时、播放器重试又重下一遍，
  *    表现为「网速极慢 + 转发流量暴涨 + 最后还是播不了」。
  * 2. 带 Range 的分片请求被重试 / 对冲 —— 每个分片下两遍，带宽被自己吃掉，反而更慢。
+ * 3. 所有响应套 TransformStream 计数 —— 高速转发时 JS 回调累计 CPU 撞 CF 免费版
+ *    10ms/请求配额 → 流随机被掐 → 播放器分片拿不全 → 重试 → 流量虚高（随机中断的根因）。
+ * 4. 流媒体模式（proxyMode=media）：媒体分片边缘缓存 key 必须绑 Range 与（可选）鉴权，
+ *    否则不同分片区间互相污染、不同用户共享缓存（盗链）。
  *
- * 两条的共同点：单看代码都是「为了更快」，只有把「体积」和「重试次数」钉住才防得住。
+ * 两条的共同点：单看代码都是「为了更快」，只有把「体积」「重试次数」「是否套流」
+ * 「缓存 key 粒度」钉住才防得住。
  *
  * 用法：node tools/check-media.mjs
  */
-import { serveCached, cacheableSize, fetchUpstream, MAX_CACHE_BYTES } from '../src/proxy.js';
+import { serveCached, cacheableSize, fetchUpstream, MAX_CACHE_BYTES, isMediaRequest, mediaCacheKeyOf } from '../src/proxy.js';
+import { countResponseBytes } from '../worker.js';
 
 let pass = 0;
 let fail = 0;
@@ -141,6 +147,68 @@ console.log('\n[7] 对冲：Range 请求即使配了阈值也必须关闭');
   await fetchUpstream('https://x/seg.ts', { method: 'GET', headers: { range: 'bytes=0-1' } }, 0);
   check('hedgeMs=0 时只发一次', calls === 1, `调用 ${calls} 次`);
   globalThis.fetch = real;
+}
+
+console.log('\n[8] 流式计数：媒体 / 大文件直接透传（修复随机中断），小响应保留套流精确计数');
+{
+  // 206 分片（media=true）：必须返回原响应引用（不套 TransformStream，零 CPU 透传）
+  const ctx = { waitUntil: () => {} };
+  const part = new Response('x'.repeat(64), { status: 206, headers: { 'content-length': '64' } });
+  check('206 分片直接透传（返回原响应，不套流）', countResponseBytes(part, 'uhdnow', {}, ctx, true) === part);
+
+  // 无 Range 但 Content-Type 是 video/*（整片 200）：同样透传
+  const full = new Response('x'.repeat(64), { status: 200, headers: { 'content-length': '64', 'content-type': 'video/mp4' } });
+  check('video/mp4 整片直接透传（返回原响应，不套流）', countResponseBytes(full, 'uhdnow', {}, ctx, false) === full);
+
+  // 声明体积 > 4MB 的响应（大 JS bundle / 大文件）：同样透传
+  const big = new Response('x'.repeat(64), { status: 200, headers: { 'content-length': String(MAX_CACHE_BYTES + 1) } });
+  check('声明 >4MB 的大响应直接透传（返回原响应，不套流）', countResponseBytes(big, 'uhdnow', {}, ctx, false) === big);
+
+  // 小响应（页面 / 接口 / 图片）：仍套流精确计数（返回新 Response）
+  const small = new Response('x'.repeat(64), { status: 200, headers: { 'content-length': '64' } });
+  const smallOut = countResponseBytes(small, 'uhdnow', {}, ctx, false);
+  check('小响应仍套流精确计数（返回新 Response）', smallOut !== small && smallOut instanceof Response);
+}
+
+console.log('\n[9] 流媒体请求判定（isMediaRequest）：宁可宽不可漏，普通页面不误伤');
+{
+  check('带 Range 头判媒体', isMediaRequest(new Request('https://x/v.m3u8', { headers: { range: 'bytes=0-1' } }), ''));
+  check('路径含 /stream 判媒体', isMediaRequest(new Request('https://x/play/video/123'), ''));
+  check('路径含 /hls 判媒体', isMediaRequest(new Request('https://x/hls/main/index.m3u8'), ''));
+  check('HLS 清单 Content-Type 判媒体', isMediaRequest(new Request('https://x/v.m3u8'), 'application/vnd.apple.mpegurl'));
+  check('DASH 清单 Content-Type 判媒体', isMediaRequest(new Request('https://x/v.mpd'), 'application/dash+xml'));
+  check('video Content-Type 判媒体', isMediaRequest(new Request('https://x/a.mp4'), 'video/mp4'));
+  check('普通页面不判媒体', !isMediaRequest(new Request('https://x/'), 'text/html'));
+  check('JSON 接口不判媒体', !isMediaRequest(new Request('https://x/api/data'), 'application/json'));
+}
+
+console.log('\n[10] 媒体分片缓存 key：Range 必绑（防区间污染），鉴权按开关绑定（防盗链）');
+{
+  const req = (range) => new Request('https://x/v.mp4?api_key=sec1', { headers: range ? { range } : {} });
+  const k1 = mediaCacheKeyOf('https://x/v.mp4?api_key=sec1', req('bytes=0-99'), false);
+  check('缓存 key 绑定 Range 区间（防不同分片互相污染）', k1.includes('__r=bytes%3D0-99'), k1);
+  const kNoRange = mediaCacheKeyOf('https://x/v.mp4?api_key=sec1', req(null), false);
+  check('无 Range 请求不绑定区间', !kNoRange.includes('__r='));
+  const kAuth = mediaCacheKeyOf('https://x/v.mp4?api_key=sec1', req('bytes=0-99'), true);
+  check('盗链保护开：key 绑定鉴权身份（用户缓存隔离）', kAuth.includes('__auth=sec1'));
+  const kNoAuth = mediaCacheKeyOf('https://x/v.mp4?api_key=sec1', req('bytes=0-99'), false);
+  check('盗链保护关：key 不含鉴权身份（共享缓存）', !kNoAuth.includes('__auth='));
+}
+
+console.log('\n[11] 分片边缘缓存：allowPartial 时 206 可写缓存（流媒体模式的加速点），默认仍拒绝');
+{
+  const c = fakeCaches();
+  globalThis.caches = c;
+  const part = new Response('x'.repeat(16), { status: 206, headers: { 'content-length': '1024', 'content-range': 'bytes 0-1023/10240' } });
+  const ctx = ctxOf();
+  await serveCached(ctx, 'https://x/seg.ts?__apv=1&__r=bytes%3D0-1023', () => part, true);
+  await flush(ctx);
+  check('流媒体模式：206 分片写入缓存（allowPartial=true）', c.puts.length === 1, `put 次数=${c.puts.length}`);
+
+  const c2 = fakeCaches();
+  globalThis.caches = c2;
+  await serveCached(ctxOf(), 'https://x/seg2.ts', () => part, false);
+  check('默认（非流媒体分支）：206 分片不写缓存', c2.puts.length === 0);
 }
 
 console.log(`\n媒体与大文件链路：${pass} 项，失败 ${fail} 项\n`);
