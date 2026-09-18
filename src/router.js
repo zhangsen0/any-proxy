@@ -145,6 +145,17 @@ async function handleRequest(request, env, ctx) {
     }
   }
 
+  // ---- 订阅拉取：客户端行为（v2rayN / Clash 等拉取不带本站 cookie）----
+  // 与 /tsub/ 同理，永不参与伪装门禁；token 由代理引擎内部校验，
+  // 无效请求不会返回任何节点信息，放行不泄漏任何东西。
+  if (path === '/sub' || path.startsWith('/sub/')) {
+    const resp = await vlessHandler.fetch(request, { ...env, KV: runtime.KV }, ctx);
+    // 订阅出口：给每个节点的备注补上 IP 归属国家。
+    // 开关关闭时这里一次都不会触发，不产生任何外部请求或存储读取。
+    if (!(await subscriptionTaggingEnabled(env))) return resp;
+    return await tagSubscriptionResponse(resp, tagOpts(env, ctx));
+  }
+
   // ---- 陌生人：只允许「一个普通网站该有的东西」，其余一律伪装 404 ----
   if (stranger) {
     if (path === '/favicon.ico') return emptyFavicon();
@@ -204,7 +215,7 @@ async function handleRequest(request, env, ctx) {
     return await dispatchTempSub(request, url, env, ctx);
   }
 
-  if (path === '/login' || path === '/admin' || path.startsWith('/admin/') || path === '/logout' || path === '/sub' || path.startsWith('/sub/')) {
+  if (path === '/login' || path === '/admin' || path.startsWith('/admin/') || path === '/logout') {
     // 统一登出：面板/主页任何登出入口都同时清除两个子系统的 cookie，并回主页
     if (path === '/logout') {
       const h = new Headers({ 'Content-Type': 'text/html; charset=utf-8' });
@@ -230,12 +241,6 @@ async function handleRequest(request, env, ctx) {
       h.delete('content-encoding');
       h.delete('content-length');
       return new Response(injectHomeButton(text), { status: 200, headers: h });
-    }
-    // 订阅出口：给每个节点的备注补上 IP 归属国家。
-    // 开关关闭时这里一次都不会触发，不产生任何外部请求或存储读取。
-    if (path === '/sub' || path.startsWith('/sub/')) {
-      if (!(await subscriptionTaggingEnabled(env))) return resp;
-      return await tagSubscriptionResponse(resp, tagOpts(env, ctx));
     }
     return resp;
   }
