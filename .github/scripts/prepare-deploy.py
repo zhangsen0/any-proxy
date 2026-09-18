@@ -75,7 +75,12 @@ def cfApi(path, method='GET', payload=None):
         'Content-Type': 'application/json',
     })
     with urllib.request.urlopen(req, timeout=30) as resp:
-        return json.load(resp)
+        data = json.load(resp)
+    # CF 的 v4 接口失败时也可能回 200，只看 result 会把「权限不够」读成「一个资源都没有」，
+    # 然后脚本兴冲冲去新建一个 —— 所以 success 必须当场查。
+    if data.get('success') is False:
+        raise RuntimeError('接口返回失败：%s' % (data.get('errors') or '未知错误'))
+    return data
 
 
 def cfList(path):
@@ -114,7 +119,12 @@ def resolveR2():
     if given:
         return given
     try:
-        for bucket in cfList('r2/buckets'):
+        # R2 的列表接口与 D1 / KV 不是同一种结构：它返回 {"result":{"buckets":[...]}}，
+        # 而那两个返回 {"result":[...]}。照搬 cfList 会拿到一个 dict，遍历它得到的是
+        # 键名字符串 —— 于是「桶明明在」也被判成不存在，脚本转头去新建并撞上重名错误。
+        result = cfApi('r2/buckets').get('result') or {}
+        buckets = result.get('buckets') if isinstance(result, dict) else result
+        for bucket in (buckets or []):
             if bucket.get('name') == R2_NAME:
                 return R2_NAME
         cfApi('r2/buckets', 'POST', {'name': R2_NAME})
@@ -178,30 +188,44 @@ def main():
         values['KV_NAMESPACE_ID'] = LOCAL_ID
         values['R2_BUCKET_NAME'] = R2_NAME
     else:
-        if backend == 'kv':
-            values['KV_NAMESPACE_ID'] = resolveKv()
-        else:
-            values['D1_DATABASE_ID'] = resolveD1()
+        # 拿不到 ID 就直接说清楚是哪个变量、去哪里填 —— wrangler 那边只会报
+        # 「找不到资源」，而真正的原因是这里没拿到，两者差着十万八千里。
+        key = 'KV_NAMESPACE_ID' if backend == 'kv' else 'D1_DATABASE_ID'
+        resolver = resolveKv if backend == 'kv' else resolveD1
+        try:
+            got = resolver()
+        except Exception as exc:  # noqa: BLE001 —— 这一段就是要把它翻译成人话
+            sys.exit('[prepare-deploy] 拿不到 %s：%s\n'
+                     '  两个办法：① 在仓库 Settings → Secrets and variables → Actions 的 Variables 里'
+                     '直接填 %s；② 确认 CLOUDFLARE_API_TOKEN / CLOUDFLARE_ACCOUNT_ID 有效且有建库权限。'
+                     % (key, exc, key))
+        if not got:
+            sys.exit('[prepare-deploy] %s 解析结果为空，无法渲染 %s（同上，两个办法二选一）' % (key, key))
+        values[key] = got
         r2 = resolveR2()
         if r2:
             values['R2_BUCKET_NAME'] = r2
         else:
             text = cutSection(text, '[[r2_buckets]]')
 
-    # ---- 3. 渲染 ----
+    # ---- 3. 渲染并**立刻落盘** ----
+    #
+    # 这一步的先后不能换：迁移是另一个进程（wrangler）去读 wrangler.toml，
+    # 它读的是磁盘上的文件，不是这里的变量。曾经把迁移排在写盘之前，于是 wrangler
+    # 拿到的是还没渲染的占位符，报「Expected "name" to be of type string … but got
+    # "__WORKER_NAME__"」—— 而脚本自己的日志一片绿，看着像 wrangler 坏了。
     text = render(text, values)
+    with open(path, 'w', encoding='utf-8') as fh:
+        fh.write(text)
+    log('已渲染 %s（Worker 名 %s）' % (path, values['WORKER_NAME']))
 
-    # ---- 4. d1 模式：建表。放在渲染之后，wrangler 此刻读到的是最终配置 ----
+    # ---- 4. d1 模式：建表 ----
     if backend == 'd1' and not local and not os.environ.get('ANYPROXY_SKIP_MIGRATIONS'):
         subprocess.run(
             ['npx', 'wrangler', 'd1', 'migrations', 'apply', D1_NAME, '--remote'],
             check=True,
         )
         log('d1 模式：迁移已应用')
-
-    with open(path, 'w', encoding='utf-8') as fh:
-        fh.write(text)
-    log('已渲染 %s（Worker 名 %s）' % (path, values['WORKER_NAME']))
 
 
 if __name__ == '__main__':

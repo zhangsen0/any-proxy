@@ -16,7 +16,7 @@
  *
  * 用法：node tools/check-wrangler.mjs
  */
-import { readFileSync, mkdtempSync, copyFileSync, rmSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync, mkdtempSync, copyFileSync, rmSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -130,7 +130,44 @@ section('4. 真跑：kv 模式');
   ok('没配仓库地址时链接留空，而不是编一个别人的', /GH_ACTIONS_URL = ""/.test(r.text));
 }
 
-section('5. 真跑：本地模式');
+section('5. 真跑：迁移时磁盘上已经是渲染好的配置');
+{
+  // 这一条来自一次真事故：脚本把「应用 D1 迁移」排在写盘之前，于是 wrangler 读到的是
+  // 还没渲染的占位符，报 name 不合法；而脚本自己那几行日志全是绿的，看着像 wrangler 坏了。
+  // 迁移是另一个进程去读磁盘上的文件，所以这里用一个假的 npx 把「它当时看到的文件」
+  // 抄下来，直接验那份内容。
+  const dir = mkdtempSync(join(tmpdir(), 'ap-wrangler-mig-'));
+  const bin = join(dir, 'bin');
+  const dump = join(dir, 'seen.toml');
+  mkdirSync(bin, { recursive: true });
+  writeFileSync(join(bin, 'npx'), '#!/bin/sh\ncat wrangler.toml > "' + dump + '"\nexit 0\n', { mode: 0o755 });
+  const file = join(dir, 'wrangler.toml');
+  copyFileSync(join(ROOT, 'wrangler.toml'), file);
+  const r = spawnSync('python3', [SCRIPT], {
+    cwd: dir,
+    env: {
+      PATH: bin + ':' + (process.env.PATH || '/usr/bin:/bin'),
+      STORAGE_BACKEND: 'd1',
+      D1_DATABASE_ID: D1_TEST,
+      GITHUB_REPOSITORY: 'alice/any-proxy',
+    },
+    encoding: 'utf8',
+  });
+  const seen = (() => { try { return readFileSync(dump, 'utf8'); } catch { return ''; } })();
+  rmSync(dir, { recursive: true, force: true });
+
+  ok('脚本正常退出', r.status === 0, ((r.stdout || '') + (r.stderr || '')).trim());
+  ok('迁移确实被调用了（假 npx 拿到了文件）', seen.length > 0);
+  ok('迁移时读到的 D1 ID 已经是真值', seen.includes(D1_TEST));
+  ok('迁移时读到的配置里没有占位符', placeholdersOf(seen).length === 0, placeholdersOf(seen).join(',') || '—');
+  // 顺序本身也钉一下：写盘必须排在迁移之前，否则上面三条迟早被改回去
+  const atWrite = script.indexOf('fh.write(text)');
+  const atMigrate = script.indexOf("'migrations', 'apply'");
+  ok('写盘语句排在迁移之前（不是靠巧合）', atWrite > 0 && atMigrate > 0 && atWrite < atMigrate,
+    `write@${atWrite} / migrate@${atMigrate}`);
+}
+
+section('6. 真跑：本地模式');
 {
   const r = runPrepare({ GITHUB_REPOSITORY: '' }, ['--local']);
   ok('本地模式不碰云端也能渲染', r.code === 0, r.log);
@@ -140,8 +177,8 @@ section('5. 真跑：本地模式');
   ok('R2 绑定在本地保留（wrangler dev 用得上）', r.text.includes('[[r2_buckets]]'));
 }
 
-// ===================== 6. 部署流程接上了 =====================
-section('6. 部署流程把变量接进了脚本');
+// ===================== 7. 部署流程接上了 =====================
+section('7. 部署流程把变量接进了脚本');
 {
   ok('部署前仍会跑一次渲染脚本', workflow.includes('prepare-deploy.py'));
   for (const v of ['WORKER_NAME', 'D1_DATABASE_ID', 'KV_NAMESPACE_ID', 'R2_BUCKET_NAME', 'GH_ACTIONS_URL']) {
@@ -149,8 +186,22 @@ section('6. 部署流程把变量接进了脚本');
   }
 }
 
-// ===================== 7. 文档不再教人抄 ID =====================
-section('7. 文档里不再出现写死的 ID');
+// ===================== 8. 脚本自身的健壮性 =====================
+section('8. 渲染脚本自己别踩坑');
+{
+  // CF 的 v4 接口失败时也可能回 200：只看 result 会把「权限不够」读成「一个资源都没有」，
+  // 脚本转头去新建，撞上重名错误，而真正的线索被吞掉了
+  ok('接口返回 success:false 时当场报错', /get\('success'\) is False/.test(script));
+  // R2 列表返回 {"result":{"buckets":[...]}}，D1 / KV 返回 {"result":[...]}。
+  // 照搬 cfList 会遍历到一个 dict 的键名 —— 「桶明明在」被判成不存在，然后误降级
+  ok('R2 列表按 result.buckets 解包（结构与 D1/KV 不同）',
+    /result\.get\('buckets'\)/.test(script) && !/cfList\('r2\/buckets'\)/.test(script));
+  ok('拿不到存储 ID 时报错要点名变量与解决办法', /拿不到 %s/.test(script) && script.includes('Variables'));
+  ok('ID 解析成空值不会被当成成功渲染出去', /解析结果为空/.test(script));
+}
+
+// ===================== 9. 文档不再教人抄 ID =====================
+section('9. 文档里不再出现写死的 ID');
 {
   for (const doc of ['README.md', 'docs/11-新手部署手把手.md', 'docs/05-部署上线.md']) {
     let text = '';
