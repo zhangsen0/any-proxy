@@ -133,6 +133,48 @@ function gridHtml(list, spec, uid, opts = {}) {
   return parts.join('');
 }
 
+// ===================== 长表单：按分组切页 =====================
+//
+// 「运行参数」一张表单 30 多个字段、8 个分组，平铺成一屏要滚很久 —— 找一项要在
+// 滚动条里来回来去。这里把滚动换成一次点击：字段按 section 切成若干组，一次只显示一组。
+//
+// 为什么是通用能力而不是给某一张表单开的后门：判定只看「字段有没有声明 section、
+// 够不够多」，任何参数表长到这个规模都自动获得同样的待遇，界面层没有为它写专用结构。
+// 隐藏的组**不销毁**（只是 hidden），所以保存时整张表单的值一起提交 ——
+// 切到别的组再改回来，之前的改动还在。
+
+/** 字段数超过它、且字段自带分组时才切成标签页。短表单切成两三个标签反而更麻烦 */
+export const GROUP_TABS_MIN = 10;
+
+/** 按 section 切成有序的组（保持字段原本的顺序，同名的合并） */
+function sectionBlocks(params) {
+  const blocks = [];
+  for (const p of params) {
+    const name = p.section || '';
+    const last = blocks[blocks.length - 1];
+    if (last && last.name === name) last.params.push(p);
+    else blocks.push({ name, params: [p] });
+  }
+  return blocks;
+}
+
+/** 一组：基础字段铺开，进阶字段收进折叠。组名由标签承担，不再重复一行小标题 */
+function groupBlockHtml(block, index, spec, uid) {
+  const basic = block.params.filter(p => p.level !== 'advanced');
+  const advanced = block.params.filter(p => p.level === 'advanced');
+  return `<div class="cfg-group" data-gpane="${index}"${index ? ' hidden' : ''}>
+    ${basic.length ? gridHtml(basic, spec, uid) : ''}
+    ${advanced.length ? `<details class="cfg-more"><summary>进阶选项（${advanced.length} 项，通常不用改）</summary>${gridHtml(advanced, spec, uid)}</details>` : ''}
+  </div>`;
+}
+
+/** 分组标签条。第一组默认选中，与 groupBlockHtml 的 hidden 口径保持一致 */
+function subtabsHtml(blocks) {
+  const btns = blocks.map((b, i) => `<button type="button" class="subtab${i ? '' : ' is-on'}" data-gi="${i}"`
+    + ` aria-selected="${i ? 'false' : 'true'}">${esc(b.name || '其它')}</button>`).join('');
+  return `<div class="cfg-subtabs" data-cfg-subtabs>${btns}</div>`;
+}
+
 // ===================== 设置块 / 工具项 =====================
 
 /**
@@ -147,14 +189,20 @@ export function renderSettingForm(item, opts = {}) {
   const advanced = params.filter(p => p.level === 'advanced');
   // 字段声明了 section 就分段渲染（分组小标题），没声明则维持一片平铺
   const sectioned = params.some(p => p.section);
+  // 够长且能分组 → 切成标签页一次一组；否则维持原来的「平铺 + 进阶折叠」
+  const blocks = sectioned ? sectionBlocks(params) : [];
+  const useTabs = sectioned && params.length > GROUP_TABS_MIN && blocks.length > 1;
+  const body = useTabs
+    ? subtabsHtml(blocks) + blocks.map((b, i) => groupBlockHtml(b, i, item.spec, uid)).join('')
+    : (basic.length ? gridHtml(basic, item.spec, uid, { sections: sectioned }) : '')
+      + (advanced.length ? `<details class="cfg-more"><summary>进阶选项（${advanced.length} 项，通常不用改）</summary>${gridHtml(advanced, item.spec, uid, { sections: sectioned })}</details>` : '');
   return `<div class="cfg-set" data-setting data-uid="${esc(uid)}" data-path="${esc(item.path)}" data-method="${esc(writeMethodOf(item))}"${item.normalize ? ` data-normalize="${esc(item.normalize)}"` : ''}>
     <div class="cfg-set-head">
       <b>${esc(item.name)}</b>
       <span class="cfg-state" data-state></span>
     </div>
     ${item.desc ? `<div class="cfg-desc">${esc(item.desc)}</div>` : ''}
-    ${basic.length ? gridHtml(basic, item.spec, uid, { sections: sectioned }) : ''}
-    ${advanced.length ? `<details class="cfg-more"><summary>进阶选项（${advanced.length} 项，通常不用改）</summary>${gridHtml(advanced, item.spec, uid, { sections: sectioned })}</details>` : ''}
+    ${body}
     <div class="row cfg-actions">
       <button type="button" class="mini" data-act="save" disabled>保存</button>
       <button type="button" class="mini" data-act="revert" disabled>还原</button>
@@ -308,6 +356,22 @@ function configInit() {
     if (save) save.disabled = !dirty.length;
     if (revert) revert.disabled = !dirty.length;
     setState(set, dirty.length ? '有 ' + dirty.length + ' 处未保存' : '已同步', dirty.length ? 'dirty' : '');
+    markGroupDots(set, dirty);
+  }
+
+  /** 哪几个分组里躺着未保存的改动：切走之后那一屏看不见了，标签上要留个记号 */
+  function markGroupDots(set, dirty) {
+    const bar = $('[data-cfg-subtabs]', set);
+    if (!bar) return;
+    const groups = new Set();
+    (dirty || []).forEach(el => {
+      const pane = el.closest ? el.closest('[data-gpane]') : null;
+      if (pane) groups.add(pane.getAttribute('data-gpane'));
+    });
+    $$('.subtab', bar).forEach(b => {
+      if (groups.has(b.getAttribute('data-gi'))) b.setAttribute('data-dot', '1');
+      else b.removeAttribute('data-dot');
+    });
   }
   function bodyOf(set) {
     const out = {};
@@ -435,8 +499,25 @@ function configInit() {
     }).then(() => { if (btn) btn.disabled = false; });
   }
 
+  /** 分组标签：一次显示一组。隐藏只是 hidden，字段仍在表单里，保存时照常提交 */
+  function bindGroupTabs(set) {
+    const bar = $('[data-cfg-subtabs]', set);
+    if (!bar) return;
+    const btns = $$('.subtab', bar);
+    btns.forEach(btn => {
+      btn.onclick = () => {
+        btns.forEach(b => { b.classList.remove('is-on'); b.setAttribute('aria-selected', 'false'); });
+        btn.classList.add('is-on');
+        btn.setAttribute('aria-selected', 'true');
+        const gi = btn.getAttribute('data-gi');
+        $$('[data-gpane]', set).forEach(g => { g.hidden = g.getAttribute('data-gpane') !== gi; });
+      };
+    });
+  }
+
   // ---- 绑定 ----
   $$('[data-setting]').forEach(set => {
+    bindGroupTabs(set);
     $$('[data-key]', set).forEach(el => {
       const ev = (el.type === 'checkbox' || el.tagName === 'SELECT') ? 'change' : 'input';
       el.addEventListener(ev, () => refresh(set));
@@ -508,6 +589,16 @@ const CONFIG_CSS = `
      左侧竖线来自主题的 --line，跟随主题换肤，不另立一套颜色 */
   .cfg-section { font-size:12px; font-weight:600; color:var(--txt); margin:var(--sp-3) 0 0; padding-left:8px; border-left:2px solid var(--accent); line-height:1.6; }
   .cfg-section + .cfg-grid { margin-top:var(--sp-2); }
+  /* 长表单的分组标签：把「滚很久找一项」换成一次点击。
+     圆点 = 这一组里有未保存的改动（切走之后它就看不见了，只能靠这个记号提醒）；
+     颜色一律走主题变量，换肤时跟着变。 */
+  .cfg-subtabs { display:flex; flex-wrap:wrap; gap:6px; margin:0 0 var(--sp-3); }
+  .cfg-subtabs .subtab { position:relative; width:auto; margin:0; padding:5px 12px; font-size:12px; font-weight:500;
+    border:1px solid var(--line); border-radius:999px; background:transparent; color:var(--muted); cursor:pointer; white-space:nowrap; }
+  .cfg-subtabs .subtab:hover { background:transparent; color:var(--txt); transform:none; box-shadow:none; }
+  .cfg-subtabs .subtab.is-on { background:var(--accent); border-color:var(--accent); color:var(--on-accent); }
+  .cfg-subtabs .subtab[data-dot]::after { content:''; position:absolute; top:-2px; right:-2px; width:7px; height:7px;
+    border-radius:50%; background:var(--err); border:1px solid var(--card); }
   .cfg-num { position:relative; display:block; }
   .cfg-num em { position:absolute; right:11px; top:50%; transform:translateY(-50%); font-style:normal; font-size:11px; color:var(--muted); pointer-events:none; }
   /* 右侧要让出「单位」后缀的位置；选择器比全站那条更具体，不必用 !important */

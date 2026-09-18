@@ -1,5 +1,17 @@
 # Cloudflare Worker 配置文件（Any-Proxy 动态版）
-name = "any-proxy"
+#
+# ## 这个文件里的 __XXX__ 是占位符，不是可以直接部署的值
+#
+# 以前这里写的是本项目账号下的 D1 / KV 资源 ID，fork 之后不改就部署失败 ——
+# 而「知道要去改哪里」这件事本身就得先读一遍源码。现在改成占位符，部署前由
+# .github/scripts/prepare-deploy.py 统一渲染：
+#   - 仓库 Variables 里配了 → 用你配的值
+#   - 没配 → 调 Cloudflare 接口自动创建（D1 数据库 / KV 命名空间 / R2 桶），拿了 ID 回填
+#   - R2 建不出来（账号没开通）→ 直接去掉该绑定，Worker 自动降级为纯 Cache API
+#   - 健康检查链接 → 按 GITHUB_REPOSITORY 拼成你自己仓库的地址
+# 所以 fork 之后**不用改这个文件**，也不用去控制台抄 ID。
+# 本地 `wrangler dev` 前先跑一次同一脚本（加 --local，用占位 ID，不碰云端资源）。
+name = "__WORKER_NAME__"
 main = "worker.js"
 compatibility_date = "2025-01-01"
 
@@ -22,26 +34,27 @@ crons = ["*/5 * * * *"]
 [[d1_databases]]
 binding = "DB"
 database_name = "any-proxy-db"
-database_id = "2d033029-8ed0-4d2b-8291-b261d21bb5d6"
+database_id = "__D1_DATABASE_ID__"
 migrations_dir = "migrations"
 
 [[kv_namespaces]]
 binding = "SITES"
-id = "2a940bcb0dae4b448e8def3ebf4fe27d"
+id = "__KV_NAMESPACE_ID__"
 
 # 流媒体模式的分片持久缓存（R2）：Cache API 存不下的大分片（>4MB）与 206 分片
 # 落 R2，命中即满速返回、零回源。对象带 media:ts 元数据，由 cron 定时清理过期项；
-# 未绑定（本地测试/未配置）时自动降级为纯 Cache API 行为。
+# 未绑定（本地测试/未配置）时自动降级为纯 Cache API 行为 —— 所以 R2 建不出来时
+# 部署脚本会直接删掉这一段，而不是让部署失败。
 [[r2_buckets]]
 binding = "MEDIA_R2"
-bucket_name = "anyproxy-media"
+bucket_name = "__R2_BUCKET_NAME__"
 
 
 # 可配置变量（非敏感）。全部可留空 —— Worker 侧均有「按请求推导或明确报错」的降级策略，
 # 不会悄悄回退到任何写死的域名 / IP / IP 段。以上变量也可由 GitHub Actions 用 --var 注入（见 deploy-cloudflare.yml）。
 [vars]
-# 管理页「手动触发健康检查」跳转链接（改为你自己的仓库 Actions 地址；留空则主页不显示该按钮）
-GH_ACTIONS_URL = "https://github.com/zhangsen0/any-proxy/actions/workflows/healthcheck.yml"
+# 管理页「手动触发健康检查」跳转链接（部署脚本按仓库地址自动填；留空则主页不显示该按钮）
+GH_ACTIONS_URL = "__GH_ACTIONS_URL__"
 # PREF_DOMAINS    = "www.cloudflare.com speed.cloudflare.com"  # 候选域名池种子，优选用；留空则由面板填写
 # CF_IP_RANGES    = "104.16.0.0/13 172.64.0.0/13"              # 自定义边缘 IP 段；留空则运行时拉取官方列表并缓存
 # CF_IP_RANGES_URL = "https://api.cloudflare.com/client/v4/ips" # 边缘 IP 段数据源，可换成自建镜像

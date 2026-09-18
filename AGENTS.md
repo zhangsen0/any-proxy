@@ -26,6 +26,7 @@
 - 数值/区间/词表的真源归属（除运行参数外）：`STATS_RANGES / DEFAULT_RANGE_DAYS` → `src/stats.js`；布尔词表 → `config.js` 的 `toBool`；主题字段约束 → `themes.js` SCHEMA（经 `themeFieldBounds()/clampFieldByName()` 消费）；IPv4/域名/列表解析 → `util.js`（`isIpv4 / isDomain / parseIpv4List / parseDomainList`）。
 - **不要在别处重写正则、重抄 min/max、写裸数值兜底**（`|| 40` 这类）。需要默认值就 import 真源常量；运行参数一律走 `readSetting(s) / readSettings(env)`，**禁止在模块里直读 `env.XXX`**（唯一例外是 `settings.js` 自己作为环境变量种子的兜底）。
 - 只有**部署形态**项留在 wrangler.toml / 环境变量：`STORAGE_BACKEND / DB / SITES / MEDIA_R2`（改它等于换存储，必须与绑定同改）与 `PASSWORD / KEY`（凭据，不进 KV）。
+- **wrangler.toml 里不许写死资源 ID**：D1 的 `database_id`、KV 的 `id`、R2 的 `bucket_name`、`name`、`GH_ACTIONS_URL` 一律写成 `__XXX__` 占位符，由 `.github/scripts/prepare-deploy.py` 在部署前渲染（仓库 Variables 优先，没配就调 CF 接口自动创建；R2 建不出来就删绑定降级）。判据是「版本库里不能出现任何 UUID / 32 位十六进制形态的 ID」，由 `check-wrangler.mjs` 静态 + 真跑双重钉住。
 - 面板 HTML 的 `min/max/value` 必须从 SCHEMA/常量插值，不许手写。
 - 运行参数改完**必须即时生效**：写库后由 `notifyConfigChange(section)` 广播，各模块在 `onConfigChange` 里清掉自己的进程内快照（见 `cf-analytics.js` 的 `cache.clear()`、`geoip.js` 的 `cfNets = null`）。新增模块级缓存，就要同时挂一个清缓存的钩子。
 - **写入侧不许静默忽略**：`saveSettings` 遇到 `SETTINGS_SPEC` 之外的键直接报 400 并点名是哪个字段。静默忽略会让「字段名写错 / 调用方还在用旧别名」表现为「提示保存成功、值却没变」——不报错、日志干净，只能人肉比对。同理，新增接口时别再造一层 `{别名} → 注册表字段名` 的翻译。
@@ -74,7 +75,7 @@ CF 边缘（workers.dev 与自定义域行为一致）会：① 改写入站 `Ac
 ## 7. 提交与部署纪律
 
 - 提交信息一律**中文**。
-- 提交前跑全套：`check-rewrite / check-disguise / check-nodetag / check-anycast / check-themes / check-compress / check-smoke / check-guard / check-configui / check-stats / check-cf-panel / check-single-source / check-settings` + `node tools/gen-manual.mjs --check`。
+- 提交前跑全套：`check-rewrite / check-disguise / check-nodetag / check-anycast / check-themes / check-compress / check-smoke / check-guard / check-configui / check-stats / check-cf-panel / check-single-source / check-settings / check-wrangler` + `node tools/gen-manual.mjs --check`。
 - 改 `api-catalog.js` 后必须跑 `gen-manual.mjs --write`，否则 `docs/09` 附录与代码脱节（CI 会卡住）。
 - push 到 master 触发自动部署 + 线上 e2e；部署后带 `ap_auth` cookie 抽查 `/__admin`（未登录应伪装 404）。
 - 统计（数据驾驶舱）默认**关闭**，`record_admin` 缺省 false——改配置面板时别把默认值写反。

@@ -99,6 +99,11 @@ jobs:
       # 排序用例刻意用串行：并发下快的先完成，顺序天然就对，测不出去掉 .sort() 的情况。
       - name: 节点延迟实测校验
         run: node tools/check-latency.mjs
+      # 部署形态：wrangler.toml 里的资源 ID 是占位符，靠 prepare-deploy.py 渲染。
+      # 防两件事 ——「fork 之后部署失败且看不出为什么」（写死别人账号的资源 ID），
+      # 以及「脚本漏了一行替换」（静态比对照样绿，所以这里真的把脚本跑起来验产物）。
+      - name: 部署配置渲染校验
+        run: node tools/check-wrangler.mjs
       # 操作手册的速查表由目录生成。手抄的字段名与默认值必然过期，这里卡住不同步
       - name: 操作手册与代码同步校验
         run: node tools/gen-manual.mjs

@@ -472,6 +472,39 @@ section('11. 临时链接区块（api 包装契约行为校验）');
   }
 }
 
+// ===================== 12. 长表单切成分组标签 =====================
+section('12. 长表单切成分组标签（一屏不再滚很久）');
+{
+  const runtime = flat.find(i => i.id === 'settings-runtime');
+  const html = renderSettingForm(runtime);
+  const groups = [...new Set(runtime.params.map(p => p.section))];
+  const panes = [...html.matchAll(/data-gpane="(\d+)"/g)].map(m => m[1]);
+
+  ok('长表单确实触发了分组标签', html.includes('data-cfg-subtabs'), `${runtime.params.length} 个字段`);
+  ok('标签数与分组数一致', (html.match(/class="subtab/g) || []).length === groups.length, `${groups.length} 组`);
+  ok('每组一个容器且编号连续', panes.length === groups.length
+    && panes.every((v, i) => String(i) === v), panes.join(','));
+  ok('只有第一组默认展开', /data-gpane="0">/.test(html)
+    && !/data-gpane="0" hidden/.test(html)
+    && (html.match(/data-gpane="\d+" hidden/g) || []).length === groups.length - 1);
+  // 切页只是 hidden，不是不渲染 —— 否则「切到别的组再保存」会把前一组的值静默丢掉
+  const missKey = runtime.params.map(p => p.key)
+    .filter(k => !html.includes(`data-key="${k}"`));
+  ok('所有字段仍然渲染（切页不销毁字段）', missKey.length === 0, missKey.join(',') || runtime.params.length + ' 个');
+  ok('组内的进阶项仍然收进折叠', (html.match(/cfg-more/g) || []).length >= 1,
+    `${(html.match(/cfg-more/g) || []).length} 个折叠块`);
+  ok('分组标签也是主题变量配色（无写死色值）', !/#[0-9a-f]{6}/i.test(
+    (CONFIG_CSS.split('.cfg-subtabs')[1] || '').split('.cfg-num')[0] || ''));
+
+  const short = renderSettingForm(flat.find(i => i.id === 'ratelimit-config'));
+  ok('短表单不被切成标签（切了反而更麻烦）', !short.includes('data-cfg-subtabs'));
+
+  ok('前端脚本绑定了分组标签', CONFIG_JS.includes('data-cfg-subtabs') && CONFIG_JS.includes('data-gpane'));
+  ok('切页时会同步 aria 选中态', CONFIG_JS.includes('aria-selected'));
+  ok('有未保存改动的分组会在标签上留记号', CONFIG_JS.includes('data-dot'));
+  ok('管理页真的渲染出了运行参数分组标签', pageHtml.includes('data-cfg-subtabs'));
+}
+
 globalThis.fetch = undefined;
 
 console.log(`\n=== ${fail === 0 ? '全部通过' : '存在失败'} ===`);console.log(`配置页与接口目录：${pass + fail} 项，失败 ${fail} 项`);

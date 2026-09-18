@@ -22,6 +22,15 @@ jobs:
       CF_ZONE_ID: ${{ secrets.CF_ZONE_ID }}
       # GitHub 仓库 Variables.STORAGE_BACKEND 可选 kv，默认 d1（D1 为默认后端，部署前自动应用迁移）
       STORAGE_BACKEND: ${{ vars.STORAGE_BACKEND || 'd1' }}
+      # 部署形态项：wrangler.toml 里是占位符，由 prepare-deploy.py 在部署前渲染。
+      # 不配置也能跑 —— 缺哪个就调 Cloudflare 接口自动创建（D1 数据库 / KV 命名空间 / R2 桶）；
+      # 想复用已有资源时才需要在这里填 ID。R2 建不出来会自动去掉绑定，不会卡住部署。
+      WORKER_NAME: ${{ vars.WORKER_NAME }}
+      D1_DATABASE_ID: ${{ vars.D1_DATABASE_ID }}
+      KV_NAMESPACE_ID: ${{ vars.KV_NAMESPACE_ID }}
+      R2_BUCKET_NAME: ${{ vars.R2_BUCKET_NAME }}
+      # 健康检查链接：留空则按当前仓库地址自动生成（GITHUB_REPOSITORY 由 Actions 自带）
+      GH_ACTIONS_URL: ${{ vars.GH_ACTIONS_URL }}
       # 优选 / 自愈的目标域名与派生配置全部来自仓库变量，不在代码里写死任何域名
       PROXY_HOST: ${{ vars.PROXY_HOST }}
       PREF_DOMAINS: ${{ vars.PREF_DOMAINS }}
@@ -48,8 +57,8 @@ jobs:
         run: npm install -g wrangler@3.114.0
 
       - name: Prepare config
-        # 按 STORAGE_BACKEND 裁剪 wrangler.toml，只绑定实际使用的后端（d1 默认 / kv 可选），
-        # d1 模式同时应用 D1 迁移；控制逻辑见 .github/scripts/prepare-deploy.py
+        # 渲染 wrangler.toml 的占位符（缺的自动创建 Cloudflare 资源），并按 STORAGE_BACKEND
+        # 裁剪绑定、d1 模式应用迁移；控制逻辑见 .github/scripts/prepare-deploy.py
         run: python3 .github/scripts/prepare-deploy.py
 
       - name: Deploy Worker

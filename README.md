@@ -107,8 +107,9 @@
 |---|---|
 | **Account ID** | Cloudflare Dashboard 右下角。 |
 | **API Token** | 权限：`Workers Scripts: Edit`、`Workers KV Storage: Edit`（kv 后端）、`D1`（d1 后端，默认），并包含 **DNS 编辑** 权限（DNS 优选需要），账号级别。 |
-| **D1 数据库**（默认后端） | 创建 `any-proxy-db`，把 `database_id` 填入 `wrangler.toml`；表结构由 `migrations/0001_init.sql` 定义，部署时自动应用。 |
-| **KV Namespace**（kv 后端可选） | 创建后把 Namespace ID 填入 `wrangler.toml`（绑定名 `SITES`，勿改）。 |
+| **D1 数据库**（默认后端） | **不用手动建**：部署前脚本会复用同名库 `any-proxy-db`，没有就自动创建；表结构由 `migrations/0001_init.sql` 定义，部署时自动应用。想指定已有库才需要填 Variables 里的 `D1_DATABASE_ID`。 |
+| **KV Namespace**（kv 后端可选） | 同上，绑定名 `SITES`（勿改）；脚本自动复用 / 创建，也可 Variables 里填 `KV_NAMESPACE_ID` 指定。 |
+| **R2 桶**（媒体分片缓存，可选） | 脚本自动复用 / 创建 `anyproxy-media`；账号没开通 R2 时自动去掉该绑定，媒体缓存降级为纯 Cache API。 |
 | 自定义域名（可选） | 接入 Cloudflare，并把 DNS CNAME 到 Worker。 |
 
 ### 2. 配置 GitHub Secrets / Variables
@@ -121,7 +122,7 @@
 git push origin master
 ```
 
-GitHub Actions 自动执行：按 `STORAGE_BACKEND` 裁剪 `wrangler.toml`（**只绑定实际使用的后端**，d1 保留 D1 并应用迁移、kv 保留 KV）→ `wrangler deploy` → 写入 Secrets。之后每次 push 自动重新部署，也可在 Actions 页手动触发。
+GitHub Actions 自动执行：渲染 `wrangler.toml` 里的占位符（缺哪个存储资源就自动创建，见 `.github/scripts/prepare-deploy.py`）→ 按 `STORAGE_BACKEND` 裁剪绑定（**只绑定实际使用的后端**，d1 保留 D1 并应用迁移、kv 保留 KV）→ `wrangler deploy` → 写入 Secrets。之后每次 push 自动重新部署，也可在 Actions 页手动触发。
 
 ---
 
@@ -248,7 +249,7 @@ Worker 侧还有一组可选变量（`wrangler.toml` 的 `[vars]`，非敏感）
 
 ```
 worker.js              统一入口：绑定运行时 + 请求路由；scheduled 处理 DNS 定时任务
-wrangler.toml          Worker 配置：D1 绑定 DB（默认后端，migrations_dir=migrations）、KV 绑定 SITES、cron */5 * * * *、vars.GH_ACTIONS_URL
+wrangler.toml          Worker 配置：D1 绑定 DB（默认后端，migrations_dir=migrations）、KV 绑定 SITES、R2 绑定 MEDIA_R2、cron */5 * * * *、vars.GH_ACTIONS_URL（资源 ID 是占位符，部署前由 prepare-deploy.py 渲染）
 AGENTS.md              AI 协作开发约束：单一真源、api 包装契约、注入脚本自包含等硬性约定（改代码前必读）
 src/
   runtime.js           平台注入绑定（KV / PASSWORD）的共享容器；按 STORAGE_BACKEND 选择 KV 或 D1

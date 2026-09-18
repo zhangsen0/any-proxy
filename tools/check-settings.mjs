@@ -119,7 +119,15 @@ section('2. 面板渲染（每个字段都有控件）');
   const missing = panelParams().map(p => p.key).filter(k => !html.includes(`data-key="${k}"`));
   ok('每个字段都渲染了控件', missing.length === 0, missing.join(',') || `${panelParams().length} 个字段`);
   const sections = [...new Set(panelParams().map(p => p.section))];
-  ok('分组名渲染成了小标题', sections.every(s => html.includes(`>${s}</div>`)), `${sections.length} 段`);
+  // 分组名要么当小标题，要么当分组标签 —— 长表单切成标签后就不再有小标题了。
+  // 判据是「每个分组名都在界面上出现，且只以一种方式出现」：两样都渲染会上下各占一遍
+  const asTitle = sections.filter(s => html.includes(`>${s}</div>`));
+  const asTab = sections.filter(s => html.includes(`>${s}</button>`));
+  ok('每个分组名都在界面上出现（小标题或标签）',
+    sections.every(s => asTitle.includes(s) || asTab.includes(s)),
+    `小标题 ${asTitle.length} / 标签 ${asTab.length}，共 ${sections.length} 组`);
+  ok('分组名不会同时出现两遍（小标题与标签不并存）', asTitle.length === 0 || asTab.length === 0,
+    asTitle.length && asTab.length ? `既有 ${asTitle.length} 个小标题又有 ${asTab.length} 个标签` : '—');
   ok('整数控件带 SPEC 的区间（面板与运行时同一份约束）',
     intControlMismatch(html, panelParams().map(p => p.key)).length === 0,
     intControlMismatch(html, panelParams().map(p => p.key)).join(',') || `${panelParams().filter(p => panelSpec()[p.key].type === 'int').length} 个整数控件`);
