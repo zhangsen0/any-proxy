@@ -189,7 +189,7 @@ section('5. 默认值单一真源（主题轮换间隔 / 统计回看档位）')
     Array.isArray(STATS_RANGES) && STATS_RANGES.length > 0 && STATS_RANGES.every(n => Number.isInteger(n) && n > 0),
     JSON.stringify(STATS_RANGES));
   // 档位数据以**实参**形式跟在注入脚本末尾（旧写法是 var STATS_DEFAULT_DAYS=，
-  // 部署压缩后那个名字会和函数体里的引用对不上，见 tools/check-minify.mjs）
+  // 一旦开了部署压缩，那个名字会和函数体里的引用对不上，见 docs/07-踩坑记录.md 第 19 条）
   ok('注入脚本带上了默认档位数据（不是自己写死）',
     new RegExp(`,\\s*${DEFAULT_RANGE_DAYS}\\s*\\)`).test(STATS_JS),
     (STATS_JS.match(/,\s*\d+\s*\)/) || ['无'])[0]);
