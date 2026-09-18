@@ -369,6 +369,47 @@ console.log('\n[14] 接口链路：/__api/pick-speed 存得进去也读得回来
   mem.delete('PICK_SPEED');
 }
 
+console.log('\n[15] 「把当前池子写入 DNS」也要按浏览器测速排序');
+{
+  // 这条接口（/__api/preferred-ips?apply）与「立即更新优选 IP」（/__api/dns-run）是两个入口。
+  // 这里防的退化：只给主链路接了测速表，手动应用这条路悄悄退回「谁先探到谁在前」——
+  // 两条入口一个口径，否则用户点不同按钮会得到不同顺序，还以为是网络变了。
+  mem.delete('PICK_SPEED');
+  mem.set('PICK_SPEED', JSON.stringify({ ts: Date.now(), ms: { '9.9.9.1': 500, '9.9.9.2': 50 } }));
+  mem.set('PREF_IPS', '9.9.9.1\n9.9.9.2');   // 优选池是 store:'kv'，键 PREF_IPS
+  mem.set('APP_CONFIG', JSON.stringify({ settings: {
+    cf_zone_id: 'zone1', cf_api_token: 'tok', proxy_host: 'proxy.example.com', dns_settle_ms: 0,
+  } }));
+  invalidateDoc();
+  // mock 分流：HTTP 探测（http://IP/...）全部连通；CF API 读到 0 条 A 记录、写入成功；域名自检 200
+  globalThis.fetch = async (u, opts = {}) => {
+    const s = String(u);
+    if (s.startsWith('http://') && /\/__api\//.test(s)) return new Response('ok', { status: 200 });
+    if (s.includes('/dns_records')) {
+      if (opts.method === 'POST') return new Response(JSON.stringify({ success: true, result: {} }), { status: 200 });
+      return new Response(JSON.stringify({ success: true, result: [] }), { status: 200 });
+    }
+    return new Response('ok', { status: 200 });
+  };
+  const { handleRequest } = await import('../src/router.js');
+  const cookie = 'ap_auth=' + Buffer.from('dev').toString('base64');
+  const res = await handleRequest(new Request('https://proxy.example.com/__api/preferred-ips', {
+    method: 'POST',
+    headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ apply: true }),
+  }), {}, {});
+  const data = await res.json().catch(() => ({}));
+  const upd = data.updated || {};
+  check('apply 返回 200 且写入了 A 记录', res.status === 200 && upd.ok === true && (upd.changed || 0) >= 1,
+    'HTTP ' + res.status + ' ' + JSON.stringify(upd).slice(0, 120));
+  check('写进 A 记录的第一个是浏览器测速最快的（50ms 在前）',
+    Array.isArray(upd.ips) && upd.ips[0] === '9.9.9.2', JSON.stringify(upd.ips));
+  check('note 如实说明按测速排序', /按浏览器测速排序（命中 2\/2 个）/.test(upd.note || ''), String(upd.note));
+  mem.delete('PICK_SPEED');
+  mem.delete('APP_CONFIG');
+  invalidateDoc();
+}
+
 console.log(`\n=== ${fail === 0 ? '全部通过' : '存在失败'} ===`);
 console.log(`节点延迟实测：${pass} 项，失败 ${fail} 项\n`);
 process.exit(fail ? 1 : 0);

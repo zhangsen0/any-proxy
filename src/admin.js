@@ -40,7 +40,7 @@ import { renderStatsPane, STATS_JS, STATS_CSS } from './stats-ui.js';
 import { renderCfPane, CF_JS, CF_CSS } from './cf-panel.js';
 import { cfAnalytics } from './cf-analytics.js';
 import { readTagSettings } from './nodetag.js';
-import { readPickSpeed, savePickSpeed, spread } from './pickspeed.js';
+import { readPickSpeed, savePickSpeed, rankByPickSpeed, spread } from './pickspeed.js';
 
 /**
  * 输入是不是「一个字都没填」。
@@ -244,8 +244,18 @@ async function handleAdmin(request, url, env) {
           updated = { ok: false, error: '无法确定优选目标域名：请配置 PROXY_HOST' };
         } else {
           const usable = await filterUsableIps(uniq, { host: ctx.host, deadlineMs: ctx.deadlineMs, budgetMs: 10000 });
-          const res = await applyDnsWithSelfCheck(env, usable, ctx);
-          updated = { ok: res.ok, ips: res.ips || [], changed: res.changed || 0, verified: res.verified, error: res.error, note: res.note || '', host: ctx.host };
+          // 与「立即更新优选 IP」（/__api/dns-run）同一套排序：通断过滤之后按浏览器测速表重排。
+          // 少了这一步，手动应用这条路就会退回「谁先探到谁在前」—— 两条入口一个口径，才不会
+          // 出现「点按钮 A 有序、点按钮 B 乱序」这种查不出来的偏差。
+          const ranked = await rankByPickSpeed(env, usable, {});
+          const pickNote = ranked.applied ? `按浏览器测速排序（命中 ${ranked.matched}/${usable.length} 个）`
+            : (ranked.reason === 'stale' ? '浏览器测速结果已过期，本次按服务端探测顺序' : '');
+          const res = await applyDnsWithSelfCheck(env, ranked.ips, ctx);
+          updated = {
+            ok: res.ok, ips: res.ips || [], changed: res.changed || 0, verified: res.verified,
+            error: res.error, host: ctx.host,
+            note: [pickNote, res.note || ''].filter(Boolean).join('｜'),
+          };
         }
       }
       // 回带落盘后的值，面板才能立刻把「保存后的真值」显示出来（而不是留着用户填的原文）
