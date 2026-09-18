@@ -982,15 +982,18 @@ async function adminPage(authed, origin, env) {
   // 系统配置字典（代码级真源，只读）：集中列出系统所有字典 / 注册表的当前可用项
   // 真源位置在标注的模块文件里，面板只读展示；可编辑的注册表（站点模式）在配置中心单独维护
   let dictHtml = '<div class="empty">字典加载失败</div>';
+  let dictGroups = 0;
   try {
-    dictHtml = [
+    const dicts = [
       { title: '访问渠道注册表', src: 'src/scopes.js', items: VISIT_SCOPES.map(s => `${s.id} · ${s.label}（${s.prefixes.join(' ')}）`) },
       { title: '统计档位（天）', src: 'src/stats.js', items: STATS_RANGES.map(d => `${d} 天`) },
       { title: '告警事件', src: 'src/alert.js', items: ALERT_EVENTS.map(e => `${e.id} · ${e.label}：${e.desc}`) },
       { title: '伪装模板', src: 'src/disguise.js', items: listTemplates().map(t => `${t.id}：${t.desc}`) },
       { title: '执行引擎词表', src: 'src/site-modes.js', items: SITE_ENGINES },
       { title: '徽标色板', src: 'src/site-modes.js', items: BADGE_CLASSES },
-    ].map(g => `
+    ];
+    dictGroups = dicts.length;
+    dictHtml = dicts.map(g => `
     <div class="dict-group" style="margin:12px 0 0;">
       <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:6px;">
         <b>${esc(g.title)}</b><span class="tag" style="font-weight:400;">真源 ${esc(g.src)}</span>
@@ -1357,7 +1360,7 @@ ${themeScript}
   <div class="card" data-pane="registry">
     <h2>系统配置字典（只读）</h2>
     <div class="hint" style="margin:-8px 0 4px;">系统内所有注册表 / 字典的集中查看。标记「真源」的是代码级定义（改代码后重新部署生效，运行逻辑依赖它们的键值，请勿在面板直接改）；可编辑的注册表（如上方站点模式）在面板内单独维护。</div>
-    ${dictHtml}
+    <details class="cfg-more"><summary>展开 ${dictGroups} 组字典（平时用不上，改代码对照时才看）</summary>${dictHtml}</details>
   </div>` : ''}
 
   ${authed ? `
