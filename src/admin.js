@@ -308,20 +308,27 @@ async function handleAdmin(request, url, env) {
     }
   }
 
-  // ---- 订阅生成配置：节点 ID / 地址 / 路径 / 协议 / 订阅名称等（写 config.json，生成订阅立即生效） ----
+  // ---- 订阅生成配置：引擎配置在 KV config.json（vless.js 每次请求直接读、无缓存），
+  // 与面板分区配置 APP_CONFIG / 伪装配置 DISGUISE_CONFIG 是相互独立的存储，
+  // 这里只读写引擎这份，保存后下一次订阅请求立即按新值输出 ----
   if (path === '/__api/sub-gen') {
+    const readEngineCfg = async () => {
+      const raw = await runtime.KV.get('config.json').catch(() => null);
+      if (!raw) return null;
+      try { return JSON.parse(raw); } catch { return null; }
+    };
     if (request.method === 'GET') {
-      const cfg = await readConfig(env);
-      const sg = cfg['优选订阅生成'] || {};
+      const cfg = await readEngineCfg();
+      const sg = (cfg && cfg['优选订阅生成']) || {};
       return json({
         ok: true,
         config: {
-          uuid: cfg.UUID || '',
-          host: cfg.HOST || '',
-          path: cfg.PATH || '/',
-          protocol: cfg['协议类型'] || 'vless',
-          transport: cfg['传输协议'] || 'ws',
-          fingerprint: cfg.Fingerprint || 'chrome',
+          uuid: (cfg && cfg.UUID) || '',
+          host: (cfg && cfg.HOST) || '',
+          path: (cfg && cfg.PATH) || '/',
+          protocol: (cfg && cfg['协议类型']) || 'vless',
+          transport: (cfg && cfg['传输协议']) || 'ws',
+          fingerprint: (cfg && cfg.Fingerprint) || 'chrome',
           sub_name: sg.SUBNAME || 'edgetunnel',
           sub_update: sg.SUBUpdateTime || 3,
           sub_token: sg.TOKEN || '',
@@ -331,39 +338,38 @@ async function handleAdmin(request, url, env) {
     if (request.method === 'POST') {
       let body;
       try { body = await request.json(); } catch { return json({ error: 'invalid json' }, 400); }
-      const patch = {};
+      const cur = (await readEngineCfg()) || {};
       // 「留空保持不变」：下面每个字段只在「有值」时才处理，空字符串/未传一律跳过
       if (body.uuid !== undefined && String(body.uuid).trim() !== '') {
         const v = String(body.uuid).trim();
         if (!/^[0-9a-fA-F-]{32,}$/.test(v.replace(/-/g, ''))) return json({ error: 'UUID 格式不正确（应为 32 位十六进制）' }, 400);
-        patch.UUID = v;
+        cur.UUID = v;
       }
       if (body.host !== undefined && String(body.host).trim() !== '') {
         const v = String(body.host).trim();
-        patch.HOST = v;
+        cur.HOST = v;
       }
       if (body.path !== undefined && String(body.path).trim() !== '') {
         const v = String(body.path).trim();
         if (!v.startsWith('/')) return json({ error: '节点路径必须以 / 开头' }, 400);
-        patch.PATH = v;
+        cur.PATH = v;
       }
       if (body.protocol !== undefined && String(body.protocol).trim() !== '') {
         const v = String(body.protocol).trim();
         if (!['vless', 'trojan', 'ss'].includes(v)) return json({ error: '协议类型仅支持 vless / trojan / ss' }, 400);
-        patch['协议类型'] = v;
+        cur['协议类型'] = v;
       }
       if (body.transport !== undefined && String(body.transport).trim() !== '') {
         const v = String(body.transport).trim();
         if (!['ws', 'grpc'].includes(v)) return json({ error: '传输协议仅支持 ws / grpc' }, 400);
-        patch['传输协议'] = v;
+        cur['传输协议'] = v;
       }
       if (body.fingerprint !== undefined && String(body.fingerprint).trim() !== '') {
         const v = String(body.fingerprint).trim();
-        patch.Fingerprint = v;
+        cur.Fingerprint = v;
       }
       // 订阅生成区（嵌套对象整体合并，保留兄弟字段如 local / 本地IP库 / SUB）
-      const cur = await readConfig(env);
-      const sg = { ...(cur['优选订阅生成'] || {}) };
+      const sg = { ...((cur && cur['优选订阅生成']) || {}) };
       if (body.sub_name !== undefined && String(body.sub_name).trim() !== '') {
         const v = String(body.sub_name).trim();
         sg.SUBNAME = v;
@@ -377,9 +383,12 @@ async function handleAdmin(request, url, env) {
         const v = String(body.sub_token).trim();
         sg.TOKEN = v;
       }
-      patch['优选订阅生成'] = sg;
-      const r = await saveConfig(env, patch);
-      if (r && r.error) return json({ error: r.error }, 400);
+      cur['优选订阅生成'] = sg;
+      try {
+        await runtime.KV.put('config.json', JSON.stringify(cur));
+      } catch (e) {
+        return json({ error: '保存失败：' + String(e && e.message || e).slice(0, 200) }, 400);
+      }
       return json({ ok: true });
     }
   }
