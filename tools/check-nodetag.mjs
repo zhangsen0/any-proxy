@@ -284,7 +284,9 @@ console.log('\n=== 8. 管理接口：/__api/node-tag 必须真的能调通 ===')
   ok('返回 JSON 而不是 HTML 兜底页', /json/i.test(g.ct) && !g.text.includes('<html'), g.text.slice(0, 60));
   let cfg = null;
   try { cfg = JSON.parse(g.text).config; } catch {}
-  ok('带回开关与样式字段', !!cfg && typeof cfg.enabled === 'boolean' && !!cfg.style, JSON.stringify(cfg));
+  // 接口返回的是注册表字段名（node_tag_enabled / node_tag_style），与面板 data-key 一致。
+  // 曾经返回领域短名 enabled / style，面板按 data-key 取不到，保存成功也显示不出来。
+  ok('带回开关与样式字段', !!cfg && typeof cfg.node_tag_enabled === 'boolean' && !!cfg.node_tag_style, JSON.stringify(cfg));
 
   // 请求体就是注册表的字段名：接口不再认第三套 {enabled, style} 别名。
   // 这一条同时也是「写路径只有一套字段名」的守卫 —— 若有人再加一层翻译，
@@ -293,7 +295,7 @@ console.log('\n=== 8. 管理接口：/__api/node-tag 必须真的能调通 ===')
   ok('POST 保存返回 200', p.status === 200, `status=${p.status} ${/json/i.test(p.ct) ? '' : p.text.slice(0, 40)}${p.err ? ' err=' + p.err : ''}`);
   let saved = null;
   try { saved = JSON.parse(p.text).config; } catch {}
-  ok('保存后开关与样式真的写回', !!saved && saved.enabled === false && saved.style === 'flag-name', JSON.stringify(saved));
+  ok('保存后开关与样式真的写回', !!saved && saved.node_tag_enabled === false && saved.node_tag_style === 'flag-name', JSON.stringify(saved));
   // 来源标注统一由注册表归因：存在独立 KV 键里就算是「面板配置」。
   // 原本这里断言的是 'kv'（旧实现自己编的第三种来源名），而面板只认 panel/env/default/legacy。
   ok('来源变成面板配置（panel）', !!saved && saved.sourceOn === 'panel' && saved.sourceStyle === 'panel', JSON.stringify(saved));
@@ -303,7 +305,7 @@ console.log('\n=== 8. 管理接口：/__api/node-tag 必须真的能调通 ===')
     if (q.status !== 400 || !/未知配置项/.test(e)) return false;
     const c = await call('GET');                                        // 且配置一点没变
     let now = null; try { now = JSON.parse(c.text).config; } catch {}
-    return !!now && now.enabled === false && now.style === 'flag-name';
+    return !!now && now.node_tag_enabled === false && now.node_tag_style === 'flag-name';
   })(), '旧别名应当报 400 而不是静默忽略');
 
   // 复原，避免影响其它用例对默认值的判断（用注册表字段名）

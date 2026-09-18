@@ -95,12 +95,12 @@ section('1. IP / 域名解析（唯一实现在 util.js）');
 // ===================== 2. 面板接口必须与运行时同口径 =====================
 section('2. 面板接口的校验口径（这一节的用例在修好之前是红的）');
 {
-  const bad = await call('/__api/preferred-ips', { method: 'POST', body: { ips: '999.999.999.999' } });
+  const bad = await call('/__api/preferred-ips', { method: 'POST', body: { preferred_ips: '999.999.999.999' } });
   ok('优选池接口拒绝段值越界的 IP', bad.status === 400, `HTTP ${bad.status} ${JSON.stringify(bad.data)}`);
 
   const mixed = await call('/__api/preferred-ips', {
     method: 'POST',
-    body: { ips: '104.17.109.97\n104.17.109.97\n1.2.3\n8.8.8.8 # 主用' },
+    body: { preferred_ips: '104.17.109.97\n104.17.109.97\n1.2.3\n8.8.8.8 # 主用' },
   });
   ok('优选池接口接收合法 IP 并去重', mixed.status === 200 && mixed.data.count === 2, JSON.stringify(mixed.data));
 
@@ -109,9 +109,9 @@ section('2. 面板接口的校验口径（这一节的用例在修好之前是�
 
   const readBack = await call('/__api/preferred-ips');
   ok('读回与落盘一致（面板与运行时同一个池子）',
-    (readBack.data.ips || []).join(',') === '104.17.109.97,8.8.8.8', JSON.stringify(readBack.data.ips));
+    (readBack.data.preferred_ips || []).join(',') === '104.17.109.97,8.8.8.8', JSON.stringify(readBack.data.preferred_ips));
 
-  const badGood = await call('/__api/pool-config', { method: 'POST', body: { good_ips: '999.1.1.1' } });
+  const badGood = await call('/__api/pool-config', { method: 'POST', body: { pool_good_ips: '999.1.1.1' } });
   ok('健康集接口同样拒绝非法 IP', badGood.status === 400, `HTTP ${badGood.status}`);
 
   const badDomain = await call('/__api/pool-config', { method: 'POST', body: { pref_domains: 'not a domain' } });
@@ -123,7 +123,7 @@ section('2. 面板接口的校验口径（这一节的用例在修好之前是�
 
   // 超限：面板写入的上限必须等于运行时读取的上限，否则人填多了会被静默丢掉
   const many = Array.from({ length: POOL_LIMIT + 20 }, (_, i) => `10.1.${Math.floor(i / 255)}.${i % 255}`).join('\n');
-  const capped = await call('/__api/preferred-ips', { method: 'POST', body: { ips: many } });
+  const capped = await call('/__api/preferred-ips', { method: 'POST', body: { preferred_ips: many } });
   ok('超量写入被截到 POOL_LIMIT', capped.status === 200 && capped.data.count === POOL_LIMIT, `count=${capped.data && capped.data.count} POOL_LIMIT=${POOL_LIMIT}`);
   ok('落盘条数也是 POOL_LIMIT', (mem.get('PREF_IPS') || '').split('\n').length === POOL_LIMIT);
   const limits = await call('/__api/pool-config');
@@ -136,21 +136,21 @@ section('2. 面板接口的校验口径（这一节的用例在修好之前是�
 section('3. 自动优选频率（默认值与区间由 DNS_INTERVAL 单点定义）');
 {
   const fresh = await call('/__api/dns-config');
-  ok('未配置时返回 DNS_INTERVAL.default', fresh.data.interval_minutes === DNS_INTERVAL.default,
-    `${fresh.data.interval_minutes} vs ${DNS_INTERVAL.default}`);
+  ok('未配置时返回 DNS_INTERVAL.default', fresh.data.dns_interval_minutes === DNS_INTERVAL.default,
+    `${fresh.data.dns_interval_minutes} vs ${DNS_INTERVAL.default}`);
   ok('接口同时报出允许区间', fresh.data.min === DNS_INTERVAL.min && fresh.data.max === DNS_INTERVAL.max,
     `${fresh.data.min}~${fresh.data.max}`);
 
-  const low = await call('/__api/dns-config', { method: 'POST', body: { interval_minutes: DNS_INTERVAL.min - 1 } });
-  const high = await call('/__api/dns-config', { method: 'POST', body: { interval_minutes: DNS_INTERVAL.max + 1 } });
-  const atMin = await call('/__api/dns-config', { method: 'POST', body: { interval_minutes: DNS_INTERVAL.min } });
-  const atMax = await call('/__api/dns-config', { method: 'POST', body: { interval_minutes: DNS_INTERVAL.max } });
+  const low = await call('/__api/dns-config', { method: 'POST', body: { dns_interval_minutes: DNS_INTERVAL.min - 1 } });
+  const high = await call('/__api/dns-config', { method: 'POST', body: { dns_interval_minutes: DNS_INTERVAL.max + 1 } });
+  const atMin = await call('/__api/dns-config', { method: 'POST', body: { dns_interval_minutes: DNS_INTERVAL.min } });
+  const atMax = await call('/__api/dns-config', { method: 'POST', body: { dns_interval_minutes: DNS_INTERVAL.max } });
   ok('低于下限被拒', low.status === 400, `HTTP ${low.status}`);
   ok('高于上限被拒', high.status === 400, `HTTP ${high.status}`);
   ok('边界值恰好可用（区间是闭区间）', atMin.status === 200 && atMax.status === 200, `${atMin.status}/${atMax.status}`);
 
   const after = await call('/__api/dns-config');
-  ok('调度器读到的值就是面板存的值', after.data.interval_minutes === DNS_INTERVAL.max, String(after.data.interval_minutes));
+  ok('调度器读到的值就是面板存的值', after.data.dns_interval_minutes === DNS_INTERVAL.max, String(after.data.dns_interval_minutes));
 }
 
 // ===================== 4. 布尔词表只有一份 =====================

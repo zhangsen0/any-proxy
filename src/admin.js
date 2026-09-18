@@ -126,12 +126,16 @@ async function handleAdmin(request, url, env) {
   // 默认值与允许区间都取 DNS_INTERVAL —— 调度器用的是同一份，
   // 不再在这里另写一个 720 / 5~1440（写两处就会有一天两边对不上）；
   // 值本身存进统一运行参数（历史独立键 DNS_CONFIG 由 settings.js 兜底迁移）
+  // 字段名只有一套：面板渲染出的 data-key、本接口收发的键、注册表里的键，都是
+  // dns_interval_minutes。曾经这里是 interval_minutes —— 面板发 dns_interval_minutes，
+  // 接口读 interval_minutes，parseInt(undefined) 得到 NaN，于是「填了合法值却报范围错」，
+  // 永远保存不上。只读的 min / max 是给控件的区间提示，不参与读写。
   if (path === '/__api/dns-config') {
     if (request.method === 'GET') {
       const cfg = await readSettings(env);
       return json({
         ok: true,
-        interval_minutes: cfg.dns_interval_minutes,
+        dns_interval_minutes: cfg.dns_interval_minutes,
         min: DNS_INTERVAL.min,
         max: DNS_INTERVAL.max,
       });
@@ -144,13 +148,13 @@ async function handleAdmin(request, url, env) {
       } catch {
         return json({ error: 'invalid json' }, 400);
       }
-      const interval = parseInt(body.interval_minutes, 10);
+      const interval = parseInt(body.dns_interval_minutes, 10);
       if (!interval || interval < DNS_INTERVAL.min || interval > DNS_INTERVAL.max) {
         return json({ error: `更新频率需在 ${DNS_INTERVAL.min} ~ ${DNS_INTERVAL.max} 分钟之间` }, 400);
       }
       const r = await saveSettings(env, { dns_interval_minutes: interval });
       if (r && r.error) return json({ error: r.error }, 400);
-      return json({ ok: true, interval_minutes: r.values.dns_interval_minutes });
+      return json({ ok: true, dns_interval_minutes: r.values.dns_interval_minutes });
     }
   }
 
@@ -177,10 +181,13 @@ async function handleAdmin(request, url, env) {
   // 字段、解析口径与条数上限全部来自运行参数注册表（settings.js 的 preferred_ips，store: 'kv'）：
   // 这里不再自己读 KV、也不再自己写上限判断 —— 面板存进去的、运行时读出来的、这个接口返回的，
   // 必然是同一批 IP（见 check-single-source 的「落盘条数 = 面板上限」用例）。
+  // 同上，键名与面板/注册表一致：preferred_ips。
+  // 曾经这里收 ips —— 面板发 preferred_ips，接口取到 undefined，blankList(undefined) 为真
+  // 于是跳过校验直接把空值写进去：返回「已保存」，池子却被清空（或什么都没变）。
   if (path === '/__api/preferred-ips') {
     if (request.method === 'GET') {
       const cfg = await readSettings(env);
-      return json({ ok: true, ips: cfg.preferred_ips, limit: cfg.pool_limit });
+      return json({ ok: true, preferred_ips: cfg.preferred_ips, limit: cfg.pool_limit });
     }
     if (request.method === 'POST') {
       let body;
@@ -191,10 +198,10 @@ async function handleAdmin(request, url, env) {
       }
       // 「非空输入却一条都没留下」要当场说清楚：否则就是「提示保存成功、池子其实是空的」。
       // 用 util.js 的同一个解析器做这个判断（它就是注册表读写共用的那一份），不另立规则。
-      if (!blankList(body.ips) && !parseIpv4List(body.ips).length) {
+      if (!blankList(body.preferred_ips) && !parseIpv4List(body.preferred_ips).length) {
         return json({ error: '没有有效的 IP（每行一个 IPv4 地址，每段需在 0~255）' }, 400);
       }
-      const r = await saveSettings(env, { preferred_ips: body.ips });
+      const r = await saveSettings(env, { preferred_ips: body.preferred_ips });
       if (r && r.error) return json({ error: r.error }, 400);
       const uniq = r.values.preferred_ips;
       let updated = null;
@@ -209,7 +216,8 @@ async function handleAdmin(request, url, env) {
           updated = { ok: res.ok, ips: res.ips || [], changed: res.changed || 0, verified: res.verified, error: res.error, note: res.note || '', host: ctx.host };
         }
       }
-      return json({ ok: true, count: uniq.length, updated });
+      // 回带落盘后的值，面板才能立刻把「保存后的真值」显示出来（而不是留着用户填的原文）
+      return json({ ok: true, preferred_ips: uniq, count: uniq.length, updated });
     }
   }
 
@@ -580,14 +588,29 @@ async function handleAdmin(request, url, env) {
   // 所以这里既不写真名也不写映射表：请求体就是注册表的字段名，写入直接走 saveSettings。
   // 曾经这里有一层 {enabled, style} → KV 的翻译，而 nodetag.js 那边又只认环境变量 ——
   // 于是「面板改了样式、订阅输出没变」。现在取值只有 readSettings 一条路。
+  //
+  // 保存其实是成功的，但 GET 返回的是领域里的短名（enabled / style）而不是注册表字段名
+  // （node_tag_enabled / node_tag_style）：面板按 data-key 取值，一个都匹配不上，
+  // 于是两个控件永远显示空白 —— 用户看到的就是「保存了，但没保存上」。
+  // 这里把返回值投影回注册表字段名，来源标注作为附带信息保留。
+  async function tagPanelConfig(env) {
+    const t = await readTagSettings(env);
+    return {
+      node_tag_enabled: t.enabled,
+      node_tag_style: t.style,
+      sourceOn: t.sourceOn,
+      sourceStyle: t.sourceStyle,
+    };
+  }
+
   if (path === '/__api/node-tag') {
-    if (request.method === 'GET') return json({ ok: true, config: await readTagSettings(env) });
+    if (request.method === 'GET') return json({ ok: true, config: await tagPanelConfig(env) });
     if (request.method === 'POST') {
       let body;
       try { body = await request.json(); } catch { return json({ error: 'invalid json' }, 400); }
       const r = await saveSettings(env, body);
       if (r && r.error) return json({ error: r.error }, 400);
-      return json({ ok: true, config: await readTagSettings(env) });
+      return json({ ok: true, config: await tagPanelConfig(env) });
     }
   }
 
@@ -612,7 +635,7 @@ async function handleAdmin(request, url, env) {
       try { const l = await runtime.KV.get('HC_LAST_RUN'); if (l) last = parseInt(l, 10) || 0; } catch {}
       return json({
         ok: true,
-        good_ips: cfg.pool_good_ips,
+        pool_good_ips: cfg.pool_good_ips,
         pref_domains: cfg.pref_domains,
         last_run: last,
         limits: { ips: cfg.pool_limit, domains: cfg.domain_pool_limit },
@@ -623,11 +646,14 @@ async function handleAdmin(request, url, env) {
       try { body = await request.json(); } catch { return json({ error: 'invalid json' }, 400); }
       const patch = {};
       // 非空输入却一条都没留下 = 直接说清楚（与 preferred-ips 同一条判断，都走 util.js 的解析器）
-      if (body.good_ips !== undefined) {
-        if (!blankList(body.good_ips) && !parseIpv4List(body.good_ips).length) {
+      // 键名同样只用注册表那一套（pool_good_ips）：旧的 good_ips 与面板发的 pool_good_ips
+      // 对不上，导致「可用集」这一栏存不进去，而同表单里的候选域名池（pref_domains 同名）能存 ——
+      // 同一张卡片一半生效一半不生效，最难排查的那种。
+      if (body.pool_good_ips !== undefined) {
+        if (!blankList(body.pool_good_ips) && !parseIpv4List(body.pool_good_ips).length) {
           return json({ error: '没有有效的 IP（每行一个 IPv4 地址，每段需在 0~255）' }, 400);
         }
-        patch.pool_good_ips = body.good_ips;
+        patch.pool_good_ips = body.pool_good_ips;
       }
       if (body.pref_domains !== undefined) {
         if (!blankList(body.pref_domains) && !parseDomainList(body.pref_domains).length) {
@@ -635,11 +661,11 @@ async function handleAdmin(request, url, env) {
         }
         patch.pref_domains = body.pref_domains;
       }
-      if (!Object.keys(patch).length) return json({ error: '没有可保存的字段（good_ips / pref_domains）' }, 400);
+      if (!Object.keys(patch).length) return json({ error: '没有可保存的字段（pool_good_ips / pref_domains）' }, 400);
       const r = await saveSettings(env, patch);
       if (r && r.error) return json({ error: r.error }, 400);
       const out = { ok: true };
-      if (body.good_ips !== undefined) out.good_ips = r.values.pool_good_ips;
+      if (body.pool_good_ips !== undefined) out.pool_good_ips = r.values.pool_good_ips;
       if (body.pref_domains !== undefined) out.pref_domains = r.values.pref_domains;
       return json(out);
     }
@@ -1483,7 +1509,7 @@ api('/__api/speedtest').then(r => {
   const cur = document.getElementById('dnsCur');
   if (!cur) return;
   const r = await api('/__api/dns-config');
-  if (r.ok && r.data.interval_minutes) cur.textContent = r.data.interval_minutes + ' 分钟';
+  if (r.ok && r.data.dns_interval_minutes) cur.textContent = r.data.dns_interval_minutes + ' 分钟';
 })();
 // ===== R2 媒体缓存策略：总开关 / 保留天数 / 单分片上限 / 总量上限 + 用量展示 + 立即清理 =====
 const r2Stat = document.getElementById('r2Stat');
@@ -1623,7 +1649,7 @@ if (autoBtn) {
     if (!cands.length) {
       try {
         const r = await api('/__api/preferred-ips');
-        if (r.ok && r.data.ips && r.data.ips.length) { cands = r.data.ips; note = '订阅无候选，改用当前优选池'; }
+        if (r.ok && r.data.preferred_ips && r.data.preferred_ips.length) { cands = r.data.preferred_ips; note = '订阅无候选，改用当前优选池'; }
       } catch {}
     }
     cands = [...new Set(cands.filter(ip => /^\\d{1,3}(\\.\\d{1,3}){3}$/.test(ip)))].slice(0, 40);

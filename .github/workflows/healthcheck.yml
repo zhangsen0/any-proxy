@@ -107,9 +107,9 @@ jobs:
           #      存储后端由 Worker 侧统一选择，不再直连 KV Namespace ----
           TS=$(date +%s)
           POOL=$(apiget "https://$HOST/__api/pool-config?t=$TS" || true)
-          GOOD_API=$(echo "$POOL" | python3 -c "import sys,json;d=json.load(sys.stdin);print(' '.join(d.get('good_ips',[])))" 2>/dev/null || true)
+          GOOD_API=$(echo "$POOL" | python3 -c "import sys,json;d=json.load(sys.stdin);print(' '.join(d.get('pool_good_ips',[])))" 2>/dev/null || true)
           DOMAINS_API=$(echo "$POOL" | python3 -c "import sys,json;d=json.load(sys.stdin);print(' '.join(d.get('pref_domains',[])))" 2>/dev/null || true)
-          ADD_API=$(apiget "https://$HOST/__api/preferred-ips?t=$TS" | python3 -c "import sys,json;d=json.load(sys.stdin);print(' '.join(d.get('ips',[])))" 2>/dev/null || true)
+          ADD_API=$(apiget "https://$HOST/__api/preferred-ips?t=$TS" | python3 -c "import sys,json;d=json.load(sys.stdin);print(' '.join(d.get('preferred_ips',[])))" 2>/dev/null || true)
           # 候选来源（均可配置，无写死）：订阅链接（Worker 侧已按 IP 归属过滤）+ 已验证可用集 + 优选池
           SUB_API=$(apiget "https://$HOST/__api/preferred-candidates?t=$TS" | python3 -c "import sys,json;d=json.load(sys.stdin);print(' '.join(d.get('ips',[])))" 2>/dev/null || true)
           CAND=$(echo "$GOOD_API $ADD_API $SUB_API" | tr ' ' '\n' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | sort -u | tr ' ' '\n')
@@ -157,7 +157,7 @@ jobs:
           if [ -z "$COOKIE" ]; then
             echo "⚠️ 无法登录 Worker，GOOD_IPS 未写回（候选池将只依赖域名解析兜底）"
           else
-            GOOD_BODY=$(python3 -c "import sys,json;print(json.dumps({'good_ips': sys.stdin.read().split()}))" <<< "$GOOD")
+            GOOD_BODY=$(python3 -c "import sys,json;print(json.dumps({'pool_good_ips': sys.stdin.read().split()}))" <<< "$GOOD")
             curl -s -m 15 -X POST -H "Content-Type: application/json" -H "Cookie: $COOKIE" \
               -d "$GOOD_BODY" "https://$HOST/__api/pool-config" -o /dev/null -w "GOOD_IPS 更新: %{http_code}\n"
           fi

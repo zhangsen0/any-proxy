@@ -265,8 +265,8 @@ section('6. 老部署的独立 KV 键仍被认（升级不丢配置）');
 
   // 老的独立接口与统一接口必须同源（否则又变成两份定义）
   const compat = await call('/__api/dns-config');
-  ok('/__api/dns-config 与运行参数同源', compat.data.interval_minutes === 720, String(compat.data.interval_minutes));
-  const compatSet = await call('/__api/dns-config', { method: 'POST', body: { interval_minutes: 60 } });
+  ok('/__api/dns-config 与运行参数同源', compat.data.dns_interval_minutes === 720, String(compat.data.dns_interval_minutes));
+  const compatSet = await call('/__api/dns-config', { method: 'POST', body: { dns_interval_minutes: 60 } });
   ok('老接口写入也能被统一接口读到',
     compatSet.status === 200 && (await readSettings(env)).dns_interval_minutes === 60,
     String((await readSettings(env)).dns_interval_minutes));
