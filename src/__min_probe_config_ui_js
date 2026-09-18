@@ -1,0 +1,108 @@
+import{esc as s}from"./util.js";import{API_CATALOG as J,splitCatalog as U,flatCatalog as F,TAB_LABELS as L}from"./api-catalog.js";const M=["/__api"],B=["/__api/login","/__api/logout","/__api/config"];function w(e){return e.kind?e.kind:String(e.method||"GET").toUpperCase()==="GET"?"query":"action"}function D(e){return String(e.writeMethod||e.method||"POST").toUpperCase()}function O(e,i){if(e.type)return e.type;if(e.options)return"select";const a=i&&i[e.key];return a?a.type==="bool"?"bool":a.type==="int"?"number":"text":"text"}function R(e,i){const a=e&&e[i]||{};return{min:typeof a.min=="number"?a.min:null,max:typeof a.max=="number"?a.max:null}}function K(e,i){if(e.placeholder!==void 0)return e.placeholder;const a=i&&i[e.key]||{};if(a.secret)return"\u5DF2\u914D\u7F6E\u5219\u7559\u7A7A";const r=a.default;return r===""||r===null||r===void 0?"\u7559\u7A7A\u8868\u793A\u4E0D\u8BBE\u7F6E":typeof r=="boolean"?"":`\u9ED8\u8BA4 ${r}`}function V(e,i,a){const r=`cfg-${a}-${e.key}`,f=`id="${r}" data-key="${s(e.key)}"${e.in?` data-in="${s(e.in)}"`:""}${e.secretFlag?' data-secret="1"':""}`,u=K(e,i),l=O(e,i);if(l==="bool")return`<label class="cfg-switch" for="${r}"><input type="checkbox" ${f}><span class="cfg-track"><i></i></span><span class="cfg-switch-label" data-toggle-label>\u5173\u95ED</span></label>`;if(l==="number"){const d=R(i,e.key),p=(d.min!==null?` min="${d.min}"`:"")+(d.max!==null?` max="${d.max}"`:""),g=e.unit?`<em>${s(e.unit)}</em>`:"";return`<span class="cfg-num"><input type="number" ${f}${p} inputmode="numeric" placeholder="${s(u)}">${g}</span>`}if(l==="textarea")return`<textarea ${f} rows="${s(String(e.rows||3))}" placeholder="${s(u)}"></textarea>`;if(l==="select"){const d=(e.options||[]).map(p=>`<option value="${s(p.value)}">${s(p.label)}</option>`).join("");return`<select ${f}>${d}</select>`}return l==="password"?`<input type="password" ${f} placeholder="${s(u)}" autocomplete="new-password">`:`<input type="text" ${f} placeholder="${s(u)}">`}function _(e,i,a){const r=i&&i[e.key]||{},f=O(e,i),u=!!e.wide||f==="textarea",l=r.secret?'<span class="cfg-badge" data-secret-badge hidden>\u5DF2\u914D\u7F6E</span>':"",d=r.secret?{...e,secretFlag:!0}:e;return`<div class="cfg-field${u?" wide":""}" data-field="${s(e.key)}">
+    <label for="cfg-${a}-${s(e.key)}">${s(e.label||e.key)}${l}</label>
+    ${V(d,i,a)}
+    ${e.hint?`<div class="cfg-hint">${s(e.hint)}</div>`:""}
+  </div>`}function S(e,i,a,r={}){if(!r.sections)return`<div class="cfg-grid">${e.map(p=>_(p,i,a)).join("")}</div>`;const f=[];let u=null,l=[];const d=()=>{l.length&&f.push(`<div class="cfg-grid">${l.map(p=>_(p,i,a)).join("")}</div>`),l=[]};for(const p of e){const g=p.section||"";g!==u&&(d(),u=g,g&&f.push(`<div class="cfg-section">${s(g)}</div>`)),l.push(p)}return d(),f.join("")}function z(e,i={}){const a=e.params||[];if(!a.length)return"";const r=i.uid||e.id,f=a.filter(d=>d.level!=="advanced"),u=a.filter(d=>d.level==="advanced"),l=a.some(d=>d.section);return`<div class="cfg-set" data-setting data-uid="${s(r)}" data-path="${s(e.path)}" data-method="${s(D(e))}"${e.normalize?` data-normalize="${s(e.normalize)}"`:""}>
+    <div class="cfg-set-head">
+      <b>${s(e.name)}</b>
+      <span class="cfg-state" data-state></span>
+    </div>
+    ${e.desc?`<div class="cfg-desc">${s(e.desc)}</div>`:""}
+    ${f.length?S(f,e.spec,r,{sections:l}):""}
+    ${u.length?`<details class="cfg-more"><summary>\u8FDB\u9636\u9009\u9879\uFF08${u.length} \u9879\uFF0C\u901A\u5E38\u4E0D\u7528\u6539\uFF09</summary>${S(u,e.spec,r,{sections:l})}</details>`:""}
+    <div class="row cfg-actions">
+      <button type="button" class="mini" data-act="save" disabled>\u4FDD\u5B58</button>
+      <button type="button" class="mini" data-act="revert" disabled>\u8FD8\u539F</button>
+      <span class="msg" data-msg></span>
+    </div>
+  </div>`}function A(e,i={}){const a=i.uid||e.id,r=String(e.method||"GET").toUpperCase(),f=e.params||[],u=r==="GET"?"\u67E5\u770B":e.danger?"\u786E\u8BA4\u6267\u884C":"\u6267\u884C",l=e.body&&typeof e.body=="object"&&Object.keys(e.body).length?` data-body="${s(JSON.stringify(e.body))}"`:"";return`<div class="cfg-tool" data-tool data-uid="${s(a)}" data-path="${s(e.path)}" data-method="${s(r)}" data-name="${s(e.name)}"${e.danger?' data-confirm="1"':""}${l}>
+    <div class="cfg-tool-main">
+      <div class="cfg-tool-text">
+        <b>${s(e.name)}</b>
+        <span class="cfg-tool-desc">${s(e.desc||"")}${e.auth===!1?"\uFF08\u533F\u540D\u53EF\u8BFB\uFF09":""}</span>
+      </div>
+      <button type="button" class="mini${e.danger?" danger":""}" data-act="run">${s(u)}</button>
+    </div>
+    ${f.length?`<div class="cfg-tool-params">${S(f,e.spec,a)}</div>`:""}
+    <div class="cfg-result" hidden><pre data-out></pre></div>
+    <div class="msg" data-msg></div>
+  </div>`}function et(e,i={}){const a=F().find(r=>r.id===e);return a?z(a,i):""}function nt(e){const i=[];for(const a of J)if(!(a.hidden||a.tab!==e))for(const r of a.items)r.hidden||w(r)==="setting"||r.keep||i.push(A(r));return i.join("")}function X(){const{cards:e,tools:i}=U(),a=[];a.push('<div class="cfg-lead" data-pane="config">\u8FD9\u91CC\u53EA\u653E\u6CA1\u6709\u72EC\u7ACB\u9009\u9879\u5361\u7684\u8BBE\u7F6E\u9879\u3002\u5176\u4F59\u529F\u80FD\uFF08\u7AD9\u70B9\u3001\u6570\u636E\u9A7E\u9A76\u8231\u3001\u4F18\u9009 IP\u3001\u4F2A\u88C5\u3001\u4E3B\u9898\u3001\u4E34\u65F6\u94FE\u63A5\uFF09\u5404\u81EA\u6709\u4E13\u5C5E\u9009\u9879\u5361\uFF0C\u7528\u9876\u90E8\u6807\u7B7E\u5207\u6362\u5373\u53EF\u3002</div>');for(const{group:r,items:f}of e){const u=f.filter(g=>w(g)==="setting"),l=f.filter(g=>w(g)!=="setting"),d=l.filter(g=>String(g.method||"GET").toUpperCase()==="GET"),p=l.filter(g=>String(g.method||"GET").toUpperCase()!=="GET");a.push(`<div class="card cfg-card" data-pane="config" data-group="${s(r.id)}">
+      <h2>${s(r.name)}</h2>
+      ${u.map(g=>z(g)).join("")}
+      ${l.length?`<details class="cfg-tools"><summary>\u5DE5\u5177\uFF08${l.length} \u9879\uFF09</summary>
+        ${[...d,...p].map(g=>A(g)).join("")}
+      </details>`:""}
+    </div>`)}return i.length&&a.push(`<div class="card cfg-card" data-pane="config" data-group="diagnostics">
+      <h2>\u8BCA\u65AD\u5DE5\u5177</h2>
+      <div class="hint" style="margin:-8px 0 4px;">\u6392\u67E5\u95EE\u9898\u65F6\u624D\u7528\u5F97\u4E0A\uFF0C\u4E0D\u53C2\u4E0E\u65E5\u5E38\u914D\u7F6E\u3002</div>
+      ${i.map(r=>A(r)).join("")}
+    </div>`),a.join("")}function Y(){const e=(t,n)=>(n||document).querySelector(t),i=(t,n)=>[].slice.call((n||document).querySelectorAll(t));function a(t){const n=t.parentNode&&t.parentNode.querySelector?t.parentNode.querySelector("[data-toggle-label]"):null;n&&(n.textContent=t.checked?"\u5F00\u542F":"\u5173\u95ED")}function r(t){return t.type==="checkbox"?t.checked:t.value}function f(t,n){if(t.type==="checkbox"){t.checked=!!n,a(t);return}if(t.tagName==="TEXTAREA"){t.value=Array.isArray(n)?n.join(`
+`):n==null?"":String(n);return}t.value=n==null?"":String(n)}function u(t){t.setAttribute("data-back",JSON.stringify(r(t))),t.removeAttribute("data-dirty")}function l(t){const n=t.getAttribute("data-back");return n===null?!1:JSON.stringify(r(t))!==n}function d(t,n,c){const o=e("[data-state]",t);o&&(o.textContent=n||"",o.className="cfg-state"+(c?" "+c:""))}function p(t,n,c){const o=e("[data-msg]",t);o&&(o.textContent=n||"",o.className="msg "+(c?"err":"ok"))}function g(t){const n=i("[data-key]",t),c=n.filter(l);n.forEach(m=>{l(m)?m.setAttribute("data-dirty","1"):m.removeAttribute("data-dirty")});const o=e('[data-act="save"]',t),h=e('[data-act="revert"]',t);o&&(o.disabled=!c.length),h&&(h.disabled=!c.length),d(t,c.length?"\u6709 "+c.length+" \u5904\u672A\u4FDD\u5B58":"\u5DF2\u540C\u6B65",c.length?"dirty":"")}function j(t){const n={};return i("[data-key]",t).forEach(c=>{const o=c.getAttribute("data-key"),h=r(c);if(!(c.getAttribute("data-secret")==="1"&&(h===""||h===null))){if(t.getAttribute("data-normalize")==="lines"&&typeof h=="string"){n[o]=h.split(`
+`).map(m=>m.trim()).filter(Boolean);return}n[o]=h}}),n}function E(t){return t&&t.config&&typeof t.config=="object"?t.config:t||{}}function x(t,n){i("[data-key]",t).forEach(c=>{const o=c.getAttribute("data-key");if(n[o]!==void 0)f(c,n[o]);else if(n["has_"+o]!==void 0){const h=c.closest?c.closest(".cfg-field"):null,m=h?h.querySelector("[data-secret-badge]"):null;m&&(m.hidden=!n["has_"+o]),n["has_"+o]&&c.setAttribute("placeholder","\u5DF2\u914D\u7F6E\uFF0C\u7559\u7A7A\u8868\u793A\u4E0D\u4FEE\u6539"),f(c,"")}u(c)})}function G(t){return d(t,"\u8BFB\u53D6\u4E2D\u2026",""),api(t.getAttribute("data-path")).then(n=>{x(t,E(n.data)),g(t)}).catch(n=>{x(t,{}),d(t,"\u8BFB\u53D6\u5931\u8D25\uFF1A"+(n&&n.message||n),"bad"),p(t,"\u672A\u80FD\u8BFB\u5230\u5F53\u524D\u503C\uFF1B\u76F4\u63A5\u586B\u5199\u540E\u4FDD\u5B58\u4E5F\u53EF\u4EE5",!0)})}function I(t){const n=j(t),c=e('[data-act="save"]',t);c&&(c.disabled=!0),d(t,"\u4FDD\u5B58\u4E2D\u2026",""),p(t,""),api(t.getAttribute("data-path"),{method:t.getAttribute("data-method")||"POST",body:JSON.stringify(n)}).then(o=>{if(!o.ok){d(t,"\u4FDD\u5B58\u5931\u8D25","bad"),p(t,o.data&&o.data.error||"HTTP "+o.status,!0),g(t);return}x(t,E(o.data)),g(t),d(t,"\u5DF2\u4FDD\u5B58","done"),p(t,"\u5DF2\u4FDD\u5B58\u5E76\u751F\u6548",!1)}).catch(()=>{d(t,"\u4FDD\u5B58\u5931\u8D25","bad"),p(t,"\u8BF7\u6C42\u672A\u9001\u8FBE\uFF0C\u8BF7\u68C0\u67E5\u7F51\u7EDC\u540E\u91CD\u8BD5",!0),g(t)})}function P(t){i("[data-key]",t).forEach(n=>{const c=n.getAttribute("data-back");if(c!==null)try{f(n,JSON.parse(c))}catch{}}),p(t,""),g(t)}function q(t){const n=t.getAttribute("data-path")||"",c=(t.getAttribute("data-method")||"GET").toUpperCase(),o=e('[data-act="run"]',t),h=e(".cfg-result",t),m=e("[data-out]",t);let y={};const T=t.getAttribute("data-body");if(T)try{y=JSON.parse(T)||{}}catch{y={}}const $=[];i("[data-key]",t).forEach(b=>{const v=r(b);if(v===""||v===null)return;const k=b.getAttribute("data-key");b.getAttribute("data-in")==="query"?$.push(encodeURIComponent(k)+"="+encodeURIComponent(v)):y[k]=v});const H=$.length?n+(n.indexOf("?")>=0?"&":"?")+$.join("&"):n;if(t.getAttribute("data-confirm")==="1"&&!window.confirm("\u786E\u5B9A\u8981\u6267\u884C\u300C"+(t.getAttribute("data-name")||"\u8BE5\u64CD\u4F5C")+"\u300D\u5417\uFF1F"))return;o&&(o.disabled=!0),p(t,"\u6267\u884C\u4E2D\u2026",!1);const C={method:c};c!=="GET"&&(C.body=JSON.stringify(y)),api(H,C).then(b=>{let v;try{v=JSON.stringify(b.data,null,2)}catch{v=String(b.data)}v&&v.length>4e3&&(v=v.slice(0,4e3)+`
+\u2026\uFF08\u5185\u5BB9\u8FC7\u957F\u5DF2\u622A\u65AD\uFF09`),m&&(m.textContent=v||"(\u65E0\u8FD4\u56DE\u5185\u5BB9)"),h&&(h.hidden=!1),p(t,b.ok?"\u5B8C\u6210":b.data&&b.data.error||"HTTP "+b.status,!b.ok)}).catch(b=>{p(t,"\u8BF7\u6C42\u5931\u8D25\uFF1A"+(b&&b.message||b),!0)}).then(()=>{o&&(o.disabled=!1)})}i("[data-setting]").forEach(t=>{i("[data-key]",t).forEach(o=>{const h=o.type==="checkbox"||o.tagName==="SELECT"?"change":"input";o.addEventListener(h,()=>g(t)),o.type==="checkbox"&&o.addEventListener("change",()=>a(o))});const n=e('[data-act="save"]',t),c=e('[data-act="revert"]',t);n&&(n.onclick=()=>I(t)),c&&(c.onclick=()=>P(t)),G(t)}),i("[data-tool]").forEach(t=>{const n=e('[data-act="run"]',t);n&&(n.onclick=()=>q(t))})}const N='var __name=function(t,v){try{Object.defineProperty(t,"name",{value:v,configurable:true});}catch(e){}return t;};',Q=`${N}(${Y.toString()})();`,W=`
+  /* \u6587\u6848\u884C\u672C\u5C31\u5728\u5361\u7247\u4E4B\u5916\uFF0C\u7528\u5361\u7247\u5185\u8FB9\u8DDD\u5BF9\u9F50\u5B83\uFF0C\u8BFB\u8D77\u6765\u624D\u548C\u5361\u7247\u91CC\u7684\u5185\u5BB9\u540C\u4E00\u6761\u7AD6\u7EBF */
+  .cfg-lead { font-size:13px; color:var(--muted); line-height:1.8; margin:2px 0 var(--sp-2); padding:0 var(--card-pad); }
+  /* \u5361\u7247\u5EA6\u91CF\u5FC5\u987B\u8DDF\u5168\u7AD9\u540C\u6E90\uFF1A\u66FE\u7ECF\u8FD9\u91CC\u5199\u6B7B\u6210 var(--sp-3) var(--sp-4)\uFF0C
+     \u4E8E\u662F\u914D\u7F6E\u9875\u7684\u8F93\u5165\u6846\u6BD4\u5176\u5B83\u9009\u9879\u5361\u5DE6\u53F3\u5404\u7A84\u4E00\u622A */
+  .cfg-card { padding:var(--card-pad); }
+  /* \u8BBE\u7F6E\u5757\uFF1A\u4E00\u4E2A\u5757 = \u4E00\u4E2A\u53EF\u8BFB\u53EF\u5199\u7684\u63A5\u53E3\u3002
+     \u8FD9\u91CC\u523B\u610F**\u4E0D\u7ED9\u6A2A\u5411\u5185\u8FB9\u8DDD**\uFF0C\u5B57\u6BB5\u5DE6\u53F3\u8FB9\u754C\u76F4\u63A5\u5BF9\u9F50\u5361\u7247\u5185\u5BB9\u533A\uFF1B
+     \u5B83\u4EE5\u524D\u662F\u4E00\u5C42\u5E26\u8FB9\u6846\u548C\u5E95\u8272\u7684\u5185\u5D4C\u76D2\u5B50\uFF0C\u7B49\u4E8E\u5728\u5361\u7247\u91CC\u53C8\u7F29\u8FDB 16px \u2014\u2014
+     \u914D\u7F6E\u9875\u548C\u4E34\u65F6\u94FE\u63A5\u9875\u7684\u8F93\u5165\u6846\u56E0\u6B64\u6BD4\u524D\u9762\u51E0\u4E2A\u9009\u9879\u5361\u7A84\u4E00\u5708\u3002\u5757\u4E0E\u5757\u4E4B\u95F4\u7528\u4E00\u6761
+     \u5206\u9694\u7EBF\u533A\u5206\uFF0C\u6BD4\u5957\u76D2\u5B50\u66F4\u8F7B\u3002 */
+  .cfg-set { padding:0; }
+  .cfg-set + .cfg-set { margin-top:var(--sp-3); border-top:1px solid var(--line); padding-top:var(--sp-3); }
+  .cfg-set-head { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+  .cfg-set-head b { font-size:14px; font-weight:600; }
+  .cfg-state { font-size:12px; color:var(--muted); }
+  .cfg-state.dirty { color:var(--accent); }
+  .cfg-state.done { color:var(--ok); }
+  .cfg-state.bad { color:var(--err); }
+  .cfg-desc { font-size:12px; color:var(--muted); line-height:1.7; margin:4px 0 var(--sp-3); }
+  /* \u5217\u5BBD\u8D70 --field-min\uFF1A\u5BB9\u5668\u591F\u5BBD\u591A\u6392\u4E00\u5217\u3001\u7A84\u5C4F\u81EA\u7136\u56DE\u843D\u4E00\u5217\uFF0C
+     min(\u2026, 100%) \u4FDD\u8BC1\u6781\u7A84\u5C4F\u4E0B\u4E0D\u4F1A\u6491\u51FA\u6A2A\u5411\u6EDA\u52A8\u6761 */
+  .cfg-grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(min(var(--field-min), 100%), 1fr)); gap:var(--grid-gap); align-items:start; }
+  .cfg-field { min-width:0; }
+  .cfg-field.wide { grid-column:1 / -1; }
+  .cfg-field > label:not(.cfg-switch) { display:flex; align-items:center; gap:6px; margin:0 0 5px; font-size:12px; font-weight:500; color:var(--muted); }
+  /* \u8F93\u5165\u63A7\u4EF6\u7684\u5916\u89C2**\u4E0D\u5728\u8FD9\u91CC\u91CD\u5199**\u3002\u5168\u7AD9\u90A3\u6761 input/select/textarea \u89C4\u5219\u5DF2\u7ECF\u5B9A\u4E49\u4E86
+     \u80CC\u666F\u3001\u5706\u89D2\u3001\u5185\u8FB9\u8DDD\u3001\u5B57\u53F7\u548C\u805A\u7126\u63CF\u8FB9\uFF0C\u914D\u7F6E\u9875\u6CBF\u7528\u540C\u4E00\u5957\u624D\u53EF\u80FD\u548C\u522B\u7684\u9009\u9879\u5361\u957F\u5F97\u4E00\u6837
+     \u2014\u2014 \u4E4B\u524D\u8FD9\u91CC\u53C8\u6284\u4E86\u4E00\u4EFD\u7D27\u51D1\u7248\uFF08\u7070\u5E95\u6362\u6210\u767D\u5E95\u3001\u5185\u8FB9\u8DDD 8/10\u3001\u5B57\u53F7 13\uFF09\uFF0C
+     \u4E8E\u662F\u540C\u4E00\u9875\u91CC\u51FA\u73B0\u4E24\u79CD\u8F93\u5165\u6846\u3002\u8FD9\u91CC\u53EA\u8865\u4E24\u4EF6\u5168\u7AD9\u6CA1\u6709\u7684\u4E8B\uFF1A */
+  .cfg-field textarea { font-family:var(--font-mono); font-size:12px; line-height:1.7; resize:vertical; }
+  .cfg-field [data-dirty] { border-color:var(--accent); }
+  .cfg-hint { font-size:11px; color:var(--muted); line-height:1.7; margin:5px 0 0; }
+  /* \u5206\u6BB5\u5C0F\u6807\u9898\uFF1A\u4E00\u5F20\u8868\u5355\u91CC\u5B57\u6BB5\u8F83\u591A\u65F6\u6309\u8BED\u4E49\u5207\u5757\uFF0C\u907F\u514D 30 \u4E2A\u5B57\u6BB5\u5E73\u94FA\u6210\u4E00\u7247\u3002
+     \u5DE6\u4FA7\u7AD6\u7EBF\u6765\u81EA\u4E3B\u9898\u7684 --line\uFF0C\u8DDF\u968F\u4E3B\u9898\u6362\u80A4\uFF0C\u4E0D\u53E6\u7ACB\u4E00\u5957\u989C\u8272 */
+  .cfg-section { font-size:12px; font-weight:600; color:var(--txt); margin:var(--sp-3) 0 0; padding-left:8px; border-left:2px solid var(--accent); line-height:1.6; }
+  .cfg-section + .cfg-grid { margin-top:var(--sp-2); }
+  .cfg-num { position:relative; display:block; }
+  .cfg-num em { position:absolute; right:11px; top:50%; transform:translateY(-50%); font-style:normal; font-size:11px; color:var(--muted); pointer-events:none; }
+  /* \u53F3\u4FA7\u8981\u8BA9\u51FA\u300C\u5355\u4F4D\u300D\u540E\u7F00\u7684\u4F4D\u7F6E\uFF1B\u9009\u62E9\u5668\u6BD4\u5168\u7AD9\u90A3\u6761\u66F4\u5177\u4F53\uFF0C\u4E0D\u5FC5\u7528 !important */
+  .cfg-num input { padding-right:46px; }
+  .cfg-switch { display:inline-flex; align-items:center; gap:9px; cursor:pointer; user-select:none; padding:6px 0; }
+  .cfg-switch input { position:absolute; width:0; height:0; opacity:0; }
+  .cfg-switch .cfg-track { flex:none; position:relative; width:38px; height:22px; border-radius:999px; background:var(--line); border:1px solid var(--line); transition:background .18s, border-color .18s; }
+  .cfg-switch .cfg-track i { position:absolute; top:2px; left:2px; width:16px; height:16px; border-radius:50%; background:var(--card); box-shadow:var(--shadow); transition:left .18s; }
+  .cfg-switch input:checked + .cfg-track { background:var(--accent); border-color:var(--accent); }
+  .cfg-switch input:checked + .cfg-track i { left:18px; }
+  .cfg-switch input:focus-visible + .cfg-track { box-shadow:var(--ring); }
+  .cfg-switch-label { font-size:12px; color:var(--muted); }
+  .cfg-badge { font-size:10px; padding:1px 6px; border-radius:999px; background:var(--ok-bg); color:var(--ok); border:1px solid var(--line); }
+  .cfg-more { margin-top:var(--sp-3); border-top:1px dashed var(--line); padding-top:var(--sp-2); }
+  .cfg-more > summary, .cfg-tools > summary { cursor:pointer; font-size:12px; color:var(--muted); padding:2px 0; }
+  .cfg-more > summary:hover, .cfg-tools > summary:hover { color:var(--txt); }
+  .cfg-more .cfg-grid { margin-top:var(--sp-3); }
+  .cfg-actions { margin-top:var(--sp-3); align-items:center; }
+  .cfg-actions .msg { margin:0 0 0 2px; min-height:0; }
+  .cfg-tools { margin-top:var(--sp-3); border-top:1px solid var(--line); padding-top:var(--sp-2); }
+  .cfg-tool { padding:var(--sp-2) 0; }
+  .cfg-tool + .cfg-tool { border-top:1px solid var(--line); }
+  .cfg-tool-main { display:flex; align-items:center; justify-content:space-between; gap:var(--sp-2); flex-wrap:wrap; }
+  .cfg-tool-text { min-width:0; }
+  .cfg-tool-text b { font-size:13px; font-weight:600; }
+  .cfg-tool-desc { display:block; font-size:12px; color:var(--muted); line-height:1.7; margin-top:2px; }
+  .cfg-tool-params { margin-top:var(--sp-2); }
+  .cfg-result { margin-top:var(--sp-2); }
+  .cfg-result pre { margin:0; max-height:260px; overflow:auto; background:var(--input); border:1px solid var(--line); border-radius:var(--radius-xs); padding:10px; font-family:var(--font-mono); font-size:11.5px; line-height:1.7; color:var(--txt); white-space:pre-wrap; word-break:break-all; }
+`;export{M as ADMIN_PATHS,B as AUTHED_PATHS,W as CONFIG_CSS,Q as CONFIG_JS,N as KEEP_NAMES_SHIM,L as TAB_LABELS,w as kindOf,X as renderConfigPanels,z as renderSettingForm,A as renderToolItem,et as settingFormById,nt as toolItemsForTab};

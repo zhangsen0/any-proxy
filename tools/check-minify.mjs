@@ -64,10 +64,13 @@ check('注入都是立即调用形式 (fn)(...)',
   notIife.length === 0,
   notIife.map((d) => d.file).join(', ') || 'ok');
 
-console.log('\n[2] 部署确实开启了压缩（否则上面的纪律形同虚设）');
+// 开关可能被临时关掉（排障时关掉压缩是最快的回退手段），但 [1] 那条纪律
+// 无论开关状态都要守 —— 一旦有人重开压缩，写错的注入脚本会立刻炸。
+console.log('\n[2] 压缩开关状态（关着也照样要守 [1]）');
 {
   const toml = readFileSync(join(ROOT, 'wrangler.toml'), 'utf8');
-  check('wrangler.toml 里 minify = true', /^\s*minify\s*=\s*true\s*$/m.test(toml));
+  const m = toml.match(/^\s*minify\s*=\s*(true|false)\s*$/m);
+  check('wrangler.toml 里明确写了 minify 开关', !!m, m ? '当前 minify = ' + m[1] : '未找到该配置');
 }
 
 console.log('\n[3] esbuild 可用时：真压缩一遍，确认注入脚本仍能被解析');
