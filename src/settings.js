@@ -159,6 +159,19 @@ export const SETTINGS_SPEC = {
   // 这一组以前是写死在面板脚本里的五个数字（40 / 15 / 8 / 3500 / 9000）：改配置改不动，
   // 「订阅候选上限」调到 100 了浏览器还是只测 40 个 —— 属于「面板上有开关、实际不生效」。
   // 收进注册表之后，默认值与旧行为一致（改完行为不变），但终于能改了，且与服务端共用同一份。
+  sub_latency_max_probe: {
+    type: 'int', default: 12, min: 1, max: 100, env: 'SUB_LATENCY_MAX_PROBE',
+    group: 'preferred', label: '订阅每轮最多实测几个', unit: '个', level: 'advanced',
+    hint: '订阅里可能有几十上百个节点，一轮全测必然吃满预算；只测这么多，剩下的留到下一轮（缓存会逐渐补齐）',
+  },
+  // 事故背景：订阅里有 79 个 IP、且每次拉取集合还不一样，两步增强各自吃 8 秒预算（串行 16 秒），
+  // 加上引擎本身就撞上 Cloudflare 的墙钟上限 —— 客户端表现为「订阅下载不下来」（HTTP 503 / 1102）。
+  // 所以这 8 秒由**两步共用**，不是各用一份。
+  sub_enhance_budget_ms: {
+    type: 'int', default: 6000, min: 500, max: 25000, env: 'SUB_ENHANCE_BUDGET_MS',
+    group: 'preferred', label: '订阅增强总预算', unit: '毫秒',
+    hint: '给节点备注补国家 + 按延迟排序**两步共用**的时间上限。超了就原样返回节点——订阅是整个服务的入口，为了排序更好看把它拖挂，代价远大于收益',
+  },
   pick_scan_limit: {
     type: 'int', default: 40, min: 1, max: 200, env: 'PICK_SCAN_LIMIT',
     group: 'preferred', label: '浏览器一次最多测几个', unit: '个', level: 'advanced',

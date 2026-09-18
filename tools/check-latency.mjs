@@ -16,6 +16,8 @@ import { invalidateDoc } from '../src/config.js';
 
 let pass = 0;
 let fail = 0;
+import { readFileSync } from 'node:fs';
+
 function check(name, cond, extra) {
   if (cond) { pass++; console.log('  ✅ ' + name + (extra ? '  -> ' + extra : '')); }
   else { fail++; console.log('  ❌ ' + name + (extra ? '  -> ' + extra : '')); }
@@ -488,6 +490,71 @@ console.log('\n[17] 接口链路：/__api/pool-slow 算得出也读得到');
   check('阈值一并返回（面板要显示判据）', gd.thresholds && gd.thresholds.factor === 3, JSON.stringify(gd.thresholds));
   mem.delete('PICK_SPEED');
   mem.delete('SLOW_IPS');
+}
+
+console.log('\n[11] 订阅不能把自己拖挂：每轮限量实测 + 总预算兜底');
+{
+  // 真实事故：订阅里 79 个 IP、且每次拉取集合还不一样 → 一轮全测必然吃满预算，
+  // 预算耗尽后剩下的仍是「没测过」，下次又来一轮 —— 于是每次拉订阅都在重测，
+  // 单次 17 秒，偶发撞 Cloudflare 墙钟变成 503 / error 1102（客户端表现为订阅下载不下来）。
+  const { SETTINGS_SPEC } = await import('../src/settings.js');
+  const maxProbe = SETTINGS_SPEC.sub_latency_max_probe.default;
+
+  const many = [];
+  for (let i = 1; i <= 30; i++) many.push(node(`10.0.0.${i}`, 'N' + i));
+  const src = many.join('\n');
+  mem.delete('LATENCY_CACHE');   // 从「一个都没测过」起步，限量才是从 30 里切出来的
+
+  // 1) 每轮最多新测这么多，而不是把 30 个全测一遍
+  const calls = [];
+  const r = await reorderByLatency(src, { env: {}, host: HOST, measure: fakeMeasure({}, calls) });
+  check('每轮只测「订阅每轮最多实测几个」那么多',
+    calls.length === 1 && calls[0].length === maxProbe,
+    `实际 ${calls[0] && calls[0].length} 个 / 上限 ${maxProbe}`);
+  check('本轮实测数如实写进统计', r.stats && r.stats.measured === maxProbe, JSON.stringify(r.stats));
+
+  // 2) 限量是运行参数，调大就真的多测（存在但不生效 = 等于没这个开关）
+  //    注意：readSettings 走 config.js 的进程内文档缓存（TTL 3 秒），写完必须作废，
+  //    否则这里读到的是上一步的旧值 —— 表现出来就是「改了没生效」，而非代码有 bug。
+  mem.set('APP_CONFIG', JSON.stringify({ settings: { sub_latency_max_probe: 25 } }));
+  invalidateDoc();
+  // 上一轮测过的 12 个已经落进延迟缓存了，不清掉就只剩 18 个「没测过」，上限 25 也只会测 18
+  mem.delete('LATENCY_CACHE');
+  const calls2 = [];
+  await reorderByLatency(src, { env: {}, host: HOST, measure: fakeMeasure({}, calls2) });
+  check('把上限调大后确实多测了', calls2.length === 1 && calls2[0].length === 25,
+    `实际 ${calls2[0] && calls2[0].length} 个`);
+  mem.delete('APP_CONFIG');
+  mem.delete('LATENCY_CACHE');
+  invalidateDoc();
+
+  // 3) 预算到期：必须原样返回引擎内容，而不是让订阅请求挂在这里
+  const slowMeasure = async () => { await sleep(3000); return { items: [], ok: [] }; };
+  const origWait = Date.now();
+  const timedOut = await reorderByLatency(src, {
+    env: {}, host: HOST, measure: slowMeasure, deadlineMs: Date.now() + 50,
+  });
+  check('预算到期不再干等（快速返回）', Date.now() - origWait < 2500, `${Date.now() - origWait}ms`);
+  check('预算到期时顺序保持原样（不为排序牺牲可用）',
+    timedOut.text.split('\n').map((l) => (l.match(/#(.+)$/) || [, ''])[1]).join(',') === many.map((_, i) => 'N' + (i + 1)).join(','),
+    timedOut.text.slice(0, 60));
+
+  // 4) 两步增强共用一份总预算：源码里不许再各留一个写死的 8000
+  const routerSrc = readFileSync(new URL('../src/router.js', import.meta.url), 'utf8');
+  check('国家标注不再自带写死预算字串', !/NODE_TAG_BUDGET_MS/.test(routerSrc));
+  // 切片的终点必须是「起点之后」的下一段 routes —— 踩过一次：拿 'stranger' 当终点，
+  // 而它恰好排在订阅分支**前面**，于是 slice 出空串，两条判据全绿变全红却不报错。
+  // 所以这里先把「边界找对了」本身做成一条断言：边界不对就整段判据失效且明确指出。
+  const start = routerSrc.indexOf("path === '/sub'");
+  const end = routerSrc.indexOf("path === '/edt'", start);
+  check('订阅分支的切片边界找对了（判据本身要验）', start > -1 && end > start, `start=${start} end=${end}`);
+  const block = routerSrc.slice(start, end);
+  check('订阅出口拿闸门前的原文留了兜底副本', /clone\(\)/.test(block), `block 长度 ${block.length}`);
+  check('两步增强跑在同一个总预算里', /Promise\.race/.test(block), `block 长度 ${block.length}`);
+  // 只验「常量名不在」是不够的 —— 写成 `const budgetMs = 6000;` 照样是写死
+  check('预算从运行参数读，不是写死的字面量',
+    /budgetMs\s*=\s*(Number\(cfgSub\.sub_enhance_budget_ms\)|Number\(.*sub_enhance_budget_ms)/.test(block),
+    (block.match(/budgetMs\s*=\s*[^\n]*/) || ['（没找到赋值）'])[0]);
 }
 
 console.log(`\n=== ${fail === 0 ? '全部通过' : '存在失败'} ===`);

@@ -15,7 +15,7 @@ import {
 } from './disguise.js';
 import { subscriptionTaggingEnabled, styleFrom, tagSubscriptionResponse } from './nodetag.js';
 import { sortSubscriptionResponse } from './sublat.js';
-import { engineEnvFor, nodeIdentity } from './settings.js';
+import { engineEnvFor, nodeIdentity, readSettings, SETTINGS_SPEC } from './settings.js';
 import { check as rateLimitCheck } from './ratelimit.js';
 import { readShareConfig, resolve as resolveShare } from './share.js';
 import { notify as notifyAlert } from './alert.js';
@@ -75,18 +75,19 @@ async function dispatchShare(request, url, ctx, env, cfg) {
  * 标注参数。样式必须 await 注册表 —— 面板把样式存在 KV 里，
  * 早先这里同步读环境变量，于是「面板改了样式、订阅输出没变」。
  */
-async function tagOpts(env, ctx) {
+async function tagOpts(env, ctx, deadlineMs) {
+  // 墙钟兜底：GeoIP 是外部请求，网络抖动不能把订阅请求拖到 Worker 超时。
+  // 预算值一律来自运行参数（面板可改），这里不另写一个数字 ——
+  // 曾经写死 8000，而延迟排序还有它自己的 8000，两步串行 16 秒直接把订阅拖到下载不下来。
+  const cfg = await readSettings(env);
+  const budget = Number(cfg.sub_enhance_budget_ms) || SETTINGS_SPEC.sub_enhance_budget_ms.default;
   return {
     env,
     ctx,
     style: await styleFrom(env),
-    // 墙钟兜底：GeoIP 是外部请求，网络抖动不能把订阅请求拖到 Worker 超时。
-    deadline: Date.now() + NODE_TAG_BUDGET_MS,
+    deadline: deadlineMs || Date.now() + budget,
   };
 }
-
-/** 节点备注增强最多给多少毫秒（拿到就用，拿不到就原样返回节点）。 */
-const NODE_TAG_BUDGET_MS = 8000;
 
 // HTTP 入口路由： edgetunnel 端点 / 登录 / 管理 API / 管理页 / 反代通道
 //
@@ -183,15 +184,36 @@ async function handleRequest(request, env, ctx) {
     // 订阅出口的两层增强（都可以在面板关掉，关掉就是原样透传）：
     //   1. 给节点备注补 IP 归属国家；
     //   2. 把节点按实测延迟重排 —— 客户端通常拿第一个节点用，所以顺序就是速度。
-    const subOpts = await tagOpts(env, ctx);
-    let out = resp;
-    if (await subscriptionTaggingEnabled(env)) out = await tagSubscriptionResponse(out, subOpts);
-    // 探测目标域名：面板配置 → 环境变量 → 本次请求的 hostname（与面板「候选拉取」同一口径）
-    out = await sortSubscriptionResponse(out, {
-      ...subOpts,
-      host: (await resolveProxyHost(env, url.hostname)) || url.hostname,
-    });
-    return out;
+    //
+    // 两步**共用一个总预算**（不是各一份）：订阅是整个服务的入口，为了「顺序更好看」
+    // 把它拖到十几秒、甚至被平台直接杀掉（HTTP 503 / error 1102，客户端表现为订阅下载
+    // 不下来），代价远大于收益。超时或任一步出错就退回引擎原文 —— 宁可不排序，也要能用。
+    const cfgSub = await readSettings(env);
+    const budgetMs = Number(cfgSub.sub_enhance_budget_ms) || SETTINGS_SPEC.sub_enhance_budget_ms.default;
+    const deadlineMs = Date.now() + budgetMs;
+    // body 还没被读过才有 clone 可用，所以兜底必须在任何 await resp.text() 之前留一份
+    const plain = resp.clone();
+    const baseOpts = await tagOpts(env, ctx, deadlineMs);
+    let timer = null;
+    const enhance = (async () => {
+      let out = resp;
+      if (await subscriptionTaggingEnabled(env)) out = await tagSubscriptionResponse(out, baseOpts);
+      return await sortSubscriptionResponse(out, {
+        ...baseOpts,
+        deadlineMs,
+        host: (await resolveProxyHost(env, url.hostname)) || url.hostname,
+      });
+    })();
+    try {
+      const guardP = new Promise((_, rej) => {
+        timer = setTimeout(() => rej(new Error('sub enhance budget exceeded')), Math.max(200, deadlineMs - Date.now()));
+      });
+      return await Promise.race([enhance, guardP]);
+    } catch {
+      return plain;
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
   }
 
   // ---- 陌生人：只允许「一个普通网站该有的东西」，其余一律伪装 404 ----

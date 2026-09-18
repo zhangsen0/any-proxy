@@ -26,6 +26,38 @@ import { runtime } from './runtime.js';
 import { readSettings, SETTINGS_SPEC } from './settings.js';
 import { probeLatency } from './dns.js';
 
+/** 等到 deadline 之后resolve成 null。Promise.race 用它给任意一步套闸门。 */
+function budgetGuard(deadlineMs) {
+  const left = Math.max(0, deadlineMs - Date.now());
+  return new Promise((resolve) => { setTimeout(() => resolve(null), left); });
+}
+
+/**
+ * 给订阅里的缺失 IP 补测一轮，受 deadline 保护。
+ *
+ * 为什么闸门要落在这里而不是只放在 router 层：router 的 `Promise.race` 只能掐断
+ * 「整个订阅请求」，而这里是真正会干等的地方 —— 测量函数再慢，也必须到点就走，
+ * 剩下没收到的 IP 留到下一轮（缓存会一轮轮补齐）。少一次防护，单测直接调本函数
+ * 就没有任何预算可言，真实链路里也只能靠上层兜底，属于「检查覆盖了但没人受保护」。
+ *
+ * @returns {Promise<object|null>} null = 预算到了 / 测量失败，按「没测过」处理
+ */
+async function measureWithBudget(targets, opts) {
+  const run = opts.measure || ((t, o) => probeLatency(t, { host: opts.host, ...o }));
+  const call = run(targets, {
+    env: opts.env,
+    host: opts.host,
+    // 预算与墙钟都往下传：两步增强共用一份总预算，不能各用各的
+    deadlineMs: opts.deadlineMs,
+    budgetMs: opts.deadlineMs ? Math.max(500, opts.deadlineMs - Date.now()) : undefined,
+  });
+  try {
+    return await Promise.race([call, budgetGuard(opts.deadlineMs)]);
+  } catch {
+    return null;   // 测量整段失败：按「没测过」处理，顺序保持原样
+  }
+}
+
 const CACHE_KEY = 'LATENCY_CACHE';
 
 /** 读缓存。任何异常都当作「没有缓存」—— 重测一遍只是慢，读坏了才是事故。 */
@@ -104,14 +136,19 @@ export async function reorderByLatency(text, opts = {}) {
   }
 
   const missing = ips.filter((ip) => !(ip in known));
+  // 一轮最多新测这么多个：订阅里可能有 79 个 IP（见过真实case），一轮全测必然吃满预算、
+  // 而且预算耗尽后剩下的仍是「没测过」，下次又来一轮 —— 于是每次拉订阅都在重测。
+  // 限量之后每轮只补一小批，缓存几轮就补齐了；单次耗时也因此可控。
+  const maxProbe = Number(cfg.sub_latency_max_probe) || SETTINGS_SPEC.sub_latency_max_probe.default;
+  const toProbe = missing.length > maxProbe ? missing.slice(0, maxProbe) : missing;
   let measured = null;
-  if (missing.length) {
-    const run = opts.measure || ((targets, o) => probeLatency(targets, { host, ...o }));
-    try {
-      measured = await run(missing, { env: opts.env, host });
-    } catch {
-      measured = null;   // 测量整段失败：按「没测过」处理，顺序保持原样
+  if (toProbe.length) {
+    // 预算已经见底就别开新一轮了：跑也跑不完，只会把订阅请求拖到被平台杀掉
+    if (opts.deadlineMs && opts.deadlineMs - Date.now() <= 0) {
+      await writeCache(known);
+      return { ...empty, nodes: pos.length, skipped: 'budget', text: encodeWhole(body, encoded) };
     }
+    measured = await measureWithBudget(toProbe, opts);
     if (measured && Array.isArray(measured.items)) {
       for (const it of measured.items) {
         // 通的记毫秒，不通的记 null —— null 也要记，否则每次都重测到超时
@@ -142,7 +179,7 @@ export async function reorderByLatency(text, opts = {}) {
     skipped: '',
     stats: {
       cached,
-      measured: missing.length,
+      measured: toProbe.length,
       ranked,
       bad: pos.filter((i) => known[hostOf(i)] === null).length,
       fastest: (() => {

@@ -76,7 +76,21 @@ CF 边缘（workers.dev 与自定义域行为一致）会：① 改写入站 `Ac
 ## 7. 提交与部署纪律
 
 - 提交信息一律**中文**。
-- 提交前跑全套：`check-rewrite / check-disguise / check-nodetag / check-anycast / check-themes / check-compress / check-smoke / check-guard / check-configui / check-stats / check-cf-panel / check-single-source / check-settings / check-wrangler / check-preferred` + `node tools/gen-manual.mjs --check`。
+- 提交前跑全套：仓库里的 `tools/check-*.mjs` **一套都不能漏**（当前 21 套纯离线：
+  `check-rewrite / check-disguise / check-nodetag / check-anycast / check-themes / check-compress /
+  check-hls / check-media / check-path / check-heal / check-smoke / check-guard / check-stats /
+  check-configui / check-single-source / check-settings / check-preferred / check-cf-panel /
+  check-site-modes / check-latency / check-wrangler`）+ `node tools/gen-manual.mjs --check`。
+  一行搞定：`for f in tools/check-*.mjs; do node "$f" || echo "FAIL $f"; done`（`check-live` 需要参数会自动退出，忽略它的 usage 提示即可）。
+- **新增 check 脚本必须同时挂进 `.github/workflows/verify.yml` 的 unit job**，
+  否则它只在写它的那个人本机跑过 —— 本地跑过 ≠ 明天也被拦住。历史上一次性漏了三套
+  共 98 项（`check-preferred` / `check-cf-panel` / `check-site-modes`），其中 `check-preferred`
+  盯的正是「面板能改、行为却不变」，而它自己从没被 CI 盯着。详见 [07-踩坑记录](./docs/07-踩坑记录.md) 第 23 条。
+- **静态判据里的「看哪一段」必须是语义边界，且边界本身要有断言**：
+  用字符数（`slice(i, i+300)`）会越过 `);` 读到下一句；用「猜一个关键词当终点」更隐蔽 ——
+  猜错时机不报错，只会静默切出空串，于是好几条判据一起变红却不说明原因。
+  凡是 `.slice(a, b)` 都要配一条 `check('边界找对了', b > a)`，并把 `block.length` 打进失败详情。
+  详见 [07-踩坑记录](./docs/07-踩坑记录.md) 第 21、22 条。
 - 改 `api-catalog.js` 后必须跑 `gen-manual.mjs --write`，否则 `docs/09` 附录与代码脱节（CI 会卡住）。
 - push 到 master 触发自动部署 + 线上 e2e；部署后带 `ap_auth` cookie 抽查 `/__admin`（未登录应伪装 404）。
 - 统计（数据驾驶舱）默认**关闭**，`record_admin` 缺省 false——改配置面板时别把默认值写反。
