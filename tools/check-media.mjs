@@ -178,8 +178,9 @@ console.log('\n[9] 流媒体请求判定（isMediaRequest）：宁可宽不可�
   check('HLS 清单 Content-Type 判媒体', isMediaRequest(new Request('https://x/v.m3u8'), 'application/vnd.apple.mpegurl'));
   check('DASH 清单 Content-Type 判媒体', isMediaRequest(new Request('https://x/v.mpd'), 'application/dash+xml'));
   check('video Content-Type 判媒体', isMediaRequest(new Request('https://x/a.mp4'), 'video/mp4'));
+  check('image Content-Type 判媒体（海报墙缓存）', isMediaRequest(new Request('https://x/i/a.jpg'), 'image/jpeg'));
   check('普通页面不判媒体', !isMediaRequest(new Request('https://x/'), 'text/html'));
-  check('JSON 接口不判媒体', !isMediaRequest(new Request('https://x/api/data'), 'application/json'));
+  check('JSON 接口不判媒体（走文本分支短缓存）', !isMediaRequest(new Request('https://x/api/data'), 'application/json'));
 }
 
 console.log('\n[10] 媒体分片缓存 key：不绑 Range（cache.match 命中 200 完整响应时 CF 会按 Range 自动切 206），鉴权按开关绑定（防盗链）');

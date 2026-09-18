@@ -89,7 +89,9 @@ function mediaCacheKeyOf(targetUrl, request, authBind) {
  * 流媒体请求判定（流媒体模式的站点专用）：
  *   1. 带 Range / If-Range 头（分片请求，最可靠）；
  *   2. 路径含媒体特征（stream / play / segment / hls / dash）；
- *   3. Content-Type 为 video/*、audio/*、HLS 或 DASH 清单。
+ *   3. Content-Type 为 video/*、audio/*、image/*、HLS 或 DASH 清单。
+ * image/*（海报/缩略图）刻意归入：VidHub 首页海报墙的请求量远超视频流本身，
+ * 每张图都回源会让首页肉眼可见地慢；边缘缓存命中后海报秒出。
  * 判定过宽只会多走一条缓存分支（miss 时照常回源），不会破坏功能，宁可宽不可漏。
  */
 function isMediaRequest(request, ct) {
@@ -97,7 +99,7 @@ function isMediaRequest(request, ct) {
   if (request.headers.has('range') || request.headers.has('if-range')) return true;
   const path = new URL(request.url).pathname.toLowerCase();
   if (/(?:\/|^)(?:stream|play|segment|hls|dash)(?:\/|\.|$)/.test(path)) return true;
-  return /^(?:video|audio)\//.test(ct) || ct.includes('application/vnd.apple.mpegurl') || ct.includes('application/dash+xml');
+  return /^(?:video|audio|image)\//.test(ct) || ct.includes('application/vnd.apple.mpegurl') || ct.includes('application/dash+xml');
 }
 
 /**
@@ -421,9 +423,11 @@ async function proxyRequest(request, site, crossHost, ctx, env) {
   // HLS 清单是明文但不在 isText 白名单里，必须单独判定。漏掉这一条，清单会走进下面的
   // 「非文本直传」分支：分片地址与 AES 密钥 URI 原样透出，播放器按根路径去取 → 404 / 解密失败
   if (!isText(ct) && !isHls) {
-    // 流媒体模式（proxyMode=media）：媒体小响应（HLS/DASH 分片 .ts/.m4s 等 200 响应）
-    // 走分片边缘缓存，命中即免回源；MP4 等 206 Range 分片无法进 Cache API
-    // （平台限制：cache.put 拒绝 206），由零 CPU 透传满速转发，两者结合播放体感接近直连。
+    // 流媒体模式（proxyMode=media）：媒体小响应走分片边缘缓存，命中即免回源——
+    //   - HLS/DASH 分片 .ts/.m4s（200 响应）
+    //   - 海报/缩略图 image/*（VidHub 首页海报墙的主要请求，缓存后秒出）
+    // MP4 等 206 Range 分片无法进 Cache API（平台限制：cache.put 拒绝 206），
+    // 由零 CPU 透传满速转发，两者结合播放与浏览体感接近直连。
     // key 绑（可选）鉴权身份防盗链；体积闸门沿用 MAX_CACHE_BYTES（4MB），整片挡在缓存外。
     if (request.method === 'GET' && site.proxyMode === 'media' && isMediaRequest(request, ct) && cacheableSize(upstream) && upstream.status === 200) {
       return serveCached(ctx, mediaCacheKeyOf(targetUrl, request, !!site.mediaCacheAuthBind), () =>
@@ -511,6 +515,22 @@ async function proxyRequest(request, site, crossHost, ctx, env) {
   if (request.method === 'GET' && upstream.status === 200 && isFingerprinted(url.pathname)) {
     headersOut.set('Cache-Control', 'public, max-age=604800, immutable');
     headersOut.set('CDN-Cache-Control', 'public, max-age=604800, immutable');
+  }
+
+  // 流媒体模式：媒体库 JSON（/Views、/Items 等 GET 列表接口）短缓存。
+  // VidHub 每次进首页都要拉一批列表接口，边缘缓存命中后免回源，列表秒开；
+  // 只缓存 GET（登录、播放进度等 POST/PUT 不受影响），key 绑鉴权身份
+  // （同一用户自缓存，不跨用户串号）；删除 Set-Cookie（Cache API 拒绝缓存
+  // 带 Set-Cookie 的响应）；短 TTL 避免缓存住会变化的私有状态。
+  if (request.method === 'GET' && upstream.status === 200 && site.proxyMode === 'media'
+      && /^application\/json\b/i.test(ct) && rewritten && rewritten.length <= MAX_CACHE_BYTES) {
+    headersOut.set('Cache-Control', 'public, max-age=60, stale-while-revalidate=300');
+    headersOut.delete('set-cookie');
+    const resp = finalizeResponse(upstream.status, rewritten, headersOut);
+    try {
+      ctx.waitUntil(caches.default.put(new Request(mediaCacheKeyOf(targetUrl, request, !!site.mediaCacheAuthBind)), resp.clone()));
+    } catch {}
+    return resp;
   }
   return finalizeResponse(upstream.status, rewritten, headersOut);
 }

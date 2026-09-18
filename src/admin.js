@@ -677,7 +677,7 @@ async function adminPage(authed, origin, env) {
     listHtml = sites.length
       ? sites.map(s => `<div class="site">
       <div class="site-head">
-        <span class="site-name">${esc(s.name)} <span class="tag">${esc(s.id)}</span>${s.proxyMode === 'media' ? '<span class="tag" style="background:#dcfce7;color:#166534;border-color:#86efac;">流媒体</span>' : ''}</span>
+        <span class="site-name">${esc(s.name)} <span class="tag">${esc(s.id)}</span>${s.proxyMode === 'media' ? '<span class="tag badge-media">流媒体</span>' : '<span class="tag badge-normal">普通</span>'}</span>
         ${authed ? `<span style="display:inline-flex;gap:6px;"><button type="button" class="mini" data-edit="${esc(s.id)}">编辑</button><button type="button" class="danger mini" data-del="${esc(s.id)}">删除</button></span>` : ''}
       </div>
       <div class="site-target">目标：${esc(s.target)}${s.port ? `（端口 ${esc(s.port)}）` : ''} <span class="tag latency" data-id="${esc(s.id)}">上游测速中…</span></div>
@@ -793,6 +793,9 @@ async function adminPage(authed, origin, env) {
   .msg.ok { color:var(--ok); } .msg.err { color:var(--err); }
   .hint { font-size:12px; color:var(--muted); margin:6px 0 0; line-height:1.6; }
   .tag { font-family:ui-monospace,Menlo,Consolas,monospace; font-size:12px; color:var(--muted); background:var(--input); padding:2px 6px; border-radius:6px; border:1px solid var(--line); }
+  /* 站点代理类型徽标：流媒体（绿）/ 普通（灰），列表里一眼区分两种模式 */
+  .badge-media { background:#dcfce7; color:#166534; border-color:#86efac; }
+  .badge-normal { color:var(--muted); background:var(--input); border-color:var(--line); }
   .notice { color:var(--muted); font-size:13px; line-height:1.6; }
   .notice a { color:var(--accent); }
   @media (max-width:640px) {
@@ -1551,7 +1554,7 @@ async function load() {
   box.innerHTML = sites.map(s => \`
     <div class="site">
       <div class="site-head">
-        <span class="site-name">\${escapeHtml(s.name)} <span class="tag">\${escapeHtml(s.id)}</span></span>
+        <span class="site-name">\${escapeHtml(s.name)} <span class="tag">\${escapeHtml(s.id)}</span>\${s.proxyMode === 'media' ? '<span class="tag badge-media">流媒体</span>' : '<span class="tag badge-normal">普通</span>'}</span>
         \${AUTHED ? '<span style="display:inline-flex;gap:6px;"><button type="button" class="mini" data-edit="' + s.id + '">编辑</button><button type="button" class="danger mini" data-del="' + s.id + '">删除</button></span>' : ''}
       </div>
       <div class="site-target">目标：\${escapeHtml(s.target)}\${s.port ? '（端口 ' + escapeHtml(s.port) + '）' : ''} <span class="tag latency" data-id="\${s.id}">上游测速中…</span></div>
