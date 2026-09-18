@@ -410,6 +410,86 @@ console.log('\n[15] 「把当前池子写入 DNS」也要按浏览器测速排�
   invalidateDoc();
 }
 
+console.log('\n[16] 慢节点淘汰：判据只存在于一份，且不能把池子掏空');
+{
+  const { pickSlow, withoutSlow, readSlowIps, computeSlowIps } =
+    await import('../src/pickspeed.js');
+  // 最快 100ms、下限 300ms：阈值取两者较大 = 300；200ms 不慢、400ms 慢（严格大于阈值）
+  const r = pickSlow({ a: 100, b: 200, c: 400 }, { factor: 3, floorMs: 300, keepMin: 2 });
+  check('慢于「最快×倍数」的被判慢', r.slow.join(',') === 'c', JSON.stringify(r));
+  check('阈值取「倍数」与「绝对下限」的较大者', r.threshold === 300, String(r.threshold));
+  check('快的保留下来', r.kept.join(',') === 'a,b', JSON.stringify(r.kept));
+
+  // 绝对下限反过来压过倍数：最快 100ms × 3 = 300，但下限 600 更高，400ms 不算慢
+  const floored = pickSlow({ a: 100, b: 200, c: 400 }, { factor: 3, floorMs: 600, keepMin: 2 });
+  check('绝对下限更高时按下限判（400ms 不算慢）',
+    floored.slow.length === 0 && floored.threshold === 600, JSON.stringify(floored));
+
+  // 绝对下限的意义：30 / 60 / 90ms 三倍看着吓人，实际谁都一样快，不能淘汰
+  const fast = pickSlow({ a: 30, b: 60, c: 90 }, { factor: 3, floorMs: 600, keepMin: 2 });
+  check('都很快时不淘汰（绝对下限兜住相对倍数）', fast.slow.length === 0, JSON.stringify(fast));
+
+  const two = pickSlow({ a: 100, b: 900 }, { factor: 3, floorMs: 600, keepMin: 2 });
+  check('样本不足三个不判定', two.reason === 'too-few' && two.slow.length === 0, JSON.stringify(two));
+
+  // 至少留几个：1 快 4 慢，keepMin=2 时只能淘汰到剩 2 个
+  const keep = pickSlow({ a: 100, b: 700, c: 800, d: 900, e: 1000 }, { factor: 3, floorMs: 600, keepMin: 2 });
+  check('保留数不低于下限', keep.kept.length >= 2, JSON.stringify(keep));
+
+  const w = withoutSlow(['a', 'b', 'c'], ['b'], 2);
+  check('慢的被剔出候选', w.ips.join(',') === 'a,c' && w.removed.join(',') === 'b', JSON.stringify(w));
+  const w2 = withoutSlow(['a', 'b'], ['a', 'b'], 2);
+  check('剔完不够用就不剔（可用性优先）', w2.ips.join(',') === 'a,b' && w2.reason === 'keep-min', JSON.stringify(w2));
+  const w3 = withoutSlow(['a', 'b'], [], 2);
+  check('没有慢节点时原样返回', w3.ips.join(',') === 'a,b');
+
+  // 落盘与过期：名单不能靠一份已经作数的旧数据一直生效
+  mem.set('PICK_SPEED', JSON.stringify({ ts: Date.now(), ms: { '1.1.1.1': 100, '2.2.2.2': 200, '3.3.3.3': 900 } }));
+  const c = await computeSlowIps({}, { cfg: { hc_slow_evict: true, hc_slow_factor: 3, hc_slow_floor_ms: 600, hc_keep_min: 2, pick_speed_ttl_ms: 43200000 } });
+  check('算出慢节点并落盘', c.ok && c.slow.join(',') === '3.3.3.3', JSON.stringify(c));
+  check('读回来一致', (await readSlowIps({})).ips.join(',') === '3.3.3.3');
+  mem.set('PICK_SPEED', JSON.stringify({ ts: Date.now() - 86400000, ms: { '1.1.1.1': 100, '2.2.2.2': 200, '3.3.3.3': 900 } }));
+  const stale = await computeSlowIps({}, { cfg: { hc_slow_evict: true, pick_speed_ttl_ms: 3600000 } });
+  check('测速结果过期 → 清空名单（不用旧尺子淘汰）',
+    stale.reason === 'stale' && (await readSlowIps({})).ips.length === 0, JSON.stringify(stale));
+  const off = await computeSlowIps({}, { cfg: { hc_slow_evict: false } });
+  check('开关关闭 → 清空名单', off.reason === 'disabled' && (await readSlowIps({})).ips.length === 0);
+  mem.delete('PICK_SPEED');
+}
+
+console.log('\n[17] 接口链路：/__api/pool-slow 算得出也读得到');
+{
+  mem.delete('PICK_SPEED');
+  mem.delete('SLOW_IPS');
+  mem.delete('APP_CONFIG');
+  invalidateDoc();
+  const { handleRequest } = await import('../src/router.js');
+  const cookie = 'ap_auth=' + Buffer.from('dev').toString('base64');
+  globalThis.fetch = async () => new Response('ok', { status: 200 });
+  const post = await handleRequest(new Request('https://proxy.example.com/__api/pool-slow', {
+    method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/json' }, body: '{}',
+  }), {}, {});
+  const pd = await post.json().catch(() => ({}));
+  check('POST 返回 200', post.status === 200, 'HTTP ' + post.status + ' ' + String(pd.error || ''));
+  check('没有测速数据时明确说「样本不足」而不是假装判过', /样本不足|已过期/.test(pd.message || ''), String(pd.message));
+
+  mem.set('PICK_SPEED', JSON.stringify({ ts: Date.now(), ms: { '1.1.1.1': 80, '2.2.2.2': 120, '3.3.3.3': 1500, '4.4.4.4': 1600 } }));
+  const post2 = await handleRequest(new Request('https://proxy.example.com/__api/pool-slow', {
+    method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/json' }, body: '{}',
+  }), {}, {});
+  const pd2 = await post2.json().catch(() => ({}));
+  check('有数据后算出慢节点', Array.isArray(pd2.ips) && pd2.ips.includes('3.3.3.3'), JSON.stringify(pd2));
+  const get = await handleRequest(new Request('https://proxy.example.com/__api/pool-slow', {
+    headers: { Cookie: cookie },
+  }), {}, {});
+  const gd = await get.json().catch(() => ({}));
+  check('GET 能读到名单', Array.isArray(gd.ips) && gd.ips.join(',') === (pd2.ips || []).join(','),
+    JSON.stringify(gd.ips));
+  check('阈值一并返回（面板要显示判据）', gd.thresholds && gd.thresholds.factor === 3, JSON.stringify(gd.thresholds));
+  mem.delete('PICK_SPEED');
+  mem.delete('SLOW_IPS');
+}
+
 console.log(`\n=== ${fail === 0 ? '全部通过' : '存在失败'} ===`);
 console.log(`节点延迟实测：${pass} 项，失败 ${fail} 项\n`);
 process.exit(fail ? 1 : 0);

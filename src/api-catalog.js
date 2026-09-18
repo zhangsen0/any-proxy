@@ -358,6 +358,13 @@ export const API_CATALOG = [
         body: { items: [{ ip: '1.2.3.4', ms: 123 }] },
       },
       {
+        id: 'pool-slow', name: '慢节点名单', kind: 'setting', method: 'GET', path: '/__api/pool-slow', writeMethod: 'POST',
+        desc: '用户侧实测明显慢、因此不进本轮候选的 IP。GET 读名单，POST 按当前测速结果重算。'
+          + '判定只用浏览器测速的数字（服务端探测的快慢与用户网络无关，拿它淘汰会误杀最快的节点）；'
+          + '样本不足、结果过期、开关关闭时一律不判定并清空名单。阈值在「配置中心 → 优选与候选」里调',
+        auth: true,
+      },
+      {
         id: 'latency-probe', name: '延迟实测', kind: 'action', method: 'POST', path: '/__api/latency-probe',
         desc: '逐个实测候选 IP 的真实响应延迟、按快慢排好。不写任何配置，只回答「谁更快」；'
           + '不传 targets 时测当前优选池。取样次数与总预算在「配置中心 → 优选与候选」里调',

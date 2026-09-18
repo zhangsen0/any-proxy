@@ -3,7 +3,7 @@ import { b64, parseIpv4List, parseDomainList } from './util.js';
 import { fetchSubscriptionCandidates, resolveDomains } from './subs.js';
 import { SETTINGS_SPEC, readSettings } from './settings.js';
 import { measureTargets } from './latency.js';
-import { rankByPickSpeed } from './pickspeed.js';
+import { rankByPickSpeed, readSlowIps, withoutSlow } from './pickspeed.js';
 
 /**
  * 探活目标：伪装开启后任何 /__api/* 都要求登录，内部 fetch 必须自己带上登录态。
@@ -186,6 +186,15 @@ async function autoUpdatePreferredDns(env, opts = {}) {
     const basePool = Array.isArray(cfg.preferred_ips) ? cfg.preferred_ips : [];
     let candidates = [...new Set([...goodPool, ...basePool])];
     let note = '';
+
+    // 慢节点先出局：用户侧实测明显慢的那些不进本轮候选。
+    // 注意候选**不够时不剔**（withoutSlow 的 keep-min 兜底）—— 把池子清空只会让优选去现拉，更不可控。
+    const slow = await readSlowIps(env);
+    const dropped = withoutSlow(candidates, slow.ips, cfg.hc_keep_min || SETTINGS_SPEC.hc_keep_min.default);
+    if (dropped.removed.length) {
+      candidates = dropped.ips;
+      note = `已剔除 ${dropped.removed.length} 个慢节点`;
+    }
 
     if (candidates.length < 8 && Date.now() < deadlineMs) {
       try {

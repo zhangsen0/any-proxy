@@ -82,6 +82,14 @@ jobs:
           # 带会话的 GET（没会话时退化成匿名请求，行为与改造前一致）
           apiget() { if [ -n "$COOKIE" ]; then curl -s -m 15 -H "Cookie: $COOKIE" "$1"; else curl -s -m 15 "$1"; fi; }
 
+          # ---- 2.5) 先按当前测速结果重算「慢节点」名单 ----
+          # 判据只用浏览器测速的数字（服务端探测的快慢与用户网络无关，用它淘汰会误杀最快的节点）。
+          # 算不出来（没测过 / 已过期 / 开关关闭）时 Worker 会清空名单，这里照常往下走。
+          if [ -n "$COOKIE" ]; then
+            curl -s -m 15 -X POST -H "Content-Type: application/json" -H "Cookie: $COOKIE" \
+              -d '{}' "https://$HOST/__api/pool-slow" -o /dev/null || true
+          fi
+
           # ---- 3) 逐个真实验证（curl --resolve = SNI=域名，能暴露 1034）----
           # 探活目标用根路径而非 /__api/config：伪装开启后后者要求登录，
           # 而这里要验证的是「这个 IP 能不能正常服务」，任何 2xx/3xx 都是活的。
@@ -114,6 +122,13 @@ jobs:
           SUB_API=$(apiget "https://$HOST/__api/preferred-candidates?t=$TS" | python3 -c "import sys,json;d=json.load(sys.stdin);print(' '.join(d.get('ips',[])))" 2>/dev/null || true)
           CAND=$(echo "$GOOD_API $ADD_API $SUB_API" | tr ' ' '\n' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | sort -u | tr ' ' '\n')
           echo "优选 IP 池候选: $(echo $CAND | wc -w) 个（其中订阅候选 $(echo $SUB_API | wc -w) 个）"
+          # 慢节点不进候选：自愈的目的是换到更好的，换回一个「通但很慢」的节点等于没修
+          SLOW_API=$(apiget "https://$HOST/__api/pool-slow?t=$TS" | python3 -c "import sys,json;d=json.load(sys.stdin);print(' '.join(d.get('ips',[])))" 2>/dev/null || true)
+          if [ -n "$SLOW_API" ]; then
+            printf '%s\n' $SLOW_API | sort -u > /tmp/slow_ips.txt
+            CAND=$(echo "$CAND" | tr ' ' '\n' | grep -vxF -f /tmp/slow_ips.txt | tr ' ' '\n')
+            echo "已剔除慢节点: $(wc -l < /tmp/slow_ips.txt) 个，剩余候选: $(echo $CAND | wc -w) 个"
+          fi
           # 池不足时兜底：解析候选域名池得到动态 IP（不写死 IP 列表）。
           # 配置优先级：GitHub 仓库变量 PREF_DOMAINS（Settings→Variables）→ Worker 侧 PREF_DOMAINS（面板可配）
           if [ "$(echo $CAND | wc -w)" -lt 5 ]; then
@@ -144,7 +159,11 @@ jobs:
           done
           wait
           if [ -f /tmp/good_ips.txt ]; then
-            GOOD=$(sort -u /tmp/good_ips.txt | head -6 | tr ' ' '\n')
+            # 按**用户侧实测延迟**排序再取前 6 —— 原来是 sort -u（字典序），等于随机挑，
+            # 自愈很可能换到一个「通、但对你很慢」的节点。没测过的垫后（未知 ≠ 慢）。
+            # 顺序直接取 Worker 的 /__api/pick-speed（已按毫秒升序排好，判据只有那一份）。
+            PICK_ORDER=$(apiget "https://$HOST/__api/pick-speed?t=$TS" | python3 -c "import sys,json;print(' '.join(i['ip'] for i in json.load(sys.stdin).get('items',[])))" 2>/dev/null || true)
+            GOOD=$(sort -u /tmp/good_ips.txt | awk -v order="$PICK_ORDER" 'BEGIN{n=split(order,a," ");for(i=1;i<=n;i++) rank[a[i]]=i} {if($0 in rank) r=rank[$0]; else r=9999; print r "\t" $0}' | sort -n | cut -f2 | head -6)
           fi
           echo "扫描到可用 IP: ${GOOD:-无}"
           if [ -z "$GOOD" ]; then

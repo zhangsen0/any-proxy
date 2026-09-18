@@ -40,7 +40,7 @@ import { renderStatsPane, STATS_JS, STATS_CSS } from './stats-ui.js';
 import { renderCfPane, CF_JS, CF_CSS } from './cf-panel.js';
 import { cfAnalytics } from './cf-analytics.js';
 import { readTagSettings } from './nodetag.js';
-import { readPickSpeed, savePickSpeed, rankByPickSpeed, spread } from './pickspeed.js';
+import { readPickSpeed, savePickSpeed, rankByPickSpeed, readSlowIps, computeSlowIps, spread } from './pickspeed.js';
 
 /**
  * 输入是不是「一个字都没填」。
@@ -318,6 +318,34 @@ async function handleAdmin(request, url, env) {
       return json({
         ok: true, n: r.n, total: r.total || r.n, ts: r.ts,
         message: `已记住 ${r.n} 个 IP 的延迟，下次自动优选按它排序`,
+      });
+    }
+  }
+
+  // GET / POST /__api/pool-slow -> 慢节点名单（用户侧实测明显慢、不进候选的 IP）
+  //
+  // 健康检查以前只判通不通：一个 800ms 才响应的节点只要返回 200，就能一直占着 A 记录。
+  // 这里补上快慢这一维，但**只用浏览器测速的数字**（服务端探测的快慢跟用户网络无关，
+  // 拿它淘汰会把「对你最快」的节点误杀 —— 实测两个视角的排序近似零相关）。
+  if (path === '/__api/pool-slow') {
+    if (request.method === 'GET') {
+      const s = await readSlowIps(env);
+      const cfg = await readSettings(env);
+      return json({
+        ok: true, ts: s.ts, ips: s.ips, enabled: cfg.hc_slow_evict !== false,
+        thresholds: {
+          factor: cfg.hc_slow_factor, floor_ms: cfg.hc_slow_floor_ms, keep_min: cfg.hc_keep_min,
+        },
+      });
+    }
+    if (request.method === 'POST') {
+      const r = await computeSlowIps(env);
+      return json({
+        ok: true, ts: r.ts || 0, ips: r.slow || [], kept: r.kept || [],
+        threshold: r.threshold || 0, fastest: r.fastest, reason: r.reason,
+        message: r.reason === 'ok'
+          ? `判定 ${(r.slow || []).length} 个慢节点（快于 ${Math.round(r.threshold || 0)}ms 的保留 ${(r.kept || []).length} 个）`
+          : (r.reason === 'stale' ? '测速结果已过期，慢名单已清空' : (r.reason === 'disabled' ? '开关已关闭，慢名单已清空' : `样本不足，不判定（${r.reason}）`)),
       });
     }
   }

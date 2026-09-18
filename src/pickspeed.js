@@ -147,6 +147,118 @@ export async function rankByPickSpeed(env, ips, opts = {}) {
   return { ips: r.ips, applied: true, reason: 'ok', matched: r.matched, ts };
 }
 
+/** 被判定为「明显慢」的 IP 名单的存储键（同样是运行数据，不是配置项） */
+const SLOW_KEY = 'SLOW_IPS';
+export const SLOW_IPS_KEY = SLOW_KEY;
+
+/** 读慢名单。读不到就当没有 —— 少淘汰几个只是慢一点，误淘汰才是事故。 */
+export async function readSlowIps(env) {
+  try {
+    if (!runtime.KV || typeof runtime.KV.get !== 'function') return { ts: 0, ips: [] };
+    const raw = await runtime.KV.get(SLOW_KEY);
+    if (!raw) return { ts: 0, ips: [] };
+    const o = JSON.parse(raw);
+    const ips = Array.isArray(o && o.ips) ? o.ips.filter(isIpv4) : [];
+    return { ts: Number(o && o.ts) || 0, ips };
+  } catch {
+    return { ts: 0, ips: [] };
+  }
+}
+
+async function writeSlowIps(env, ips) {
+  try {
+    if (!runtime.KV || typeof runtime.KV.put !== 'function') return false;
+    await runtime.KV.put(SLOW_KEY, JSON.stringify({ ts: Date.now(), ips: ips || [] }));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * 从一批 IP 里剔除慢节点（纯函数）。
+ *
+ * 一条硬约束：**剔除之后不够用就不剔除**。「快的没人用」比「慢的还在用」糟得多 ——
+ * 池子空了，自动优选只能去订阅里现拉，反而更不可控。
+ */
+export function withoutSlow(ips, slow, keepMin = 2) {
+  const list = Array.isArray(ips) ? ips : [];
+  const set = new Set(Array.isArray(slow) ? slow : []);
+  if (!set.size) return { ips: list, removed: [], reason: 'none' };
+  const left = list.filter((ip) => !set.has(ip));
+  const floor = Math.max(1, Number(keepMin) || 1);
+  if (left.length < floor) return { ips: list, removed: [], reason: 'keep-min' };
+  return { ips: left, removed: list.filter((ip) => set.has(ip)), reason: 'ok' };
+}
+
+/**
+ * 判定「哪些明显慢」（纯函数，判据只此一份）。
+ *
+ * 三条约束：
+ *   1. **样本太少不判**：只有两三个样本时，「最慢」很可能只是没测准。
+ *   2. **有绝对下限**：最快 30ms、最慢 90ms —— 三倍看着吓人，实际谁都一样快，
+ *      这种淘汰纯属自伤。慢必须慢到能被人感觉到（`hc_slow_floor_ms`）。
+ *   3. **至少留几个**：宁可留着慢的，也不能把池子清空（见 withoutSlow）。
+ *
+ * @returns {{slow:string[], kept:string[], fastest:number|null, threshold:number, reason:string}}
+ */
+export function pickSlow(ms, opts = {}) {
+  const table = ms && typeof ms === 'object' ? ms : {};
+  const entries = Object.entries(table)
+    .filter(([, v]) => typeof v === 'number' && isFinite(v) && v >= 0)
+    .sort((a, b) => a[1] - b[1]);
+  const factor = Number(opts.factor) || SETTINGS_SPEC.hc_slow_factor.default;
+  const floorMs = Number(opts.floorMs) || SETTINGS_SPEC.hc_slow_floor_ms.default;
+  const keepMin = Number(opts.keepMin) || SETTINGS_SPEC.hc_keep_min.default;
+  const minSamples = Number(opts.minSamples) || 3;
+  if (entries.length < minSamples) {
+    return { slow: [], kept: entries.map((e) => e[0]), fastest: null, threshold: 0, reason: 'too-few' };
+  }
+  const fastest = entries[0][1];
+  const threshold = Math.max(fastest * factor, floorMs);
+  let slow = entries.filter((e) => e[1] > threshold);
+  let kept = entries.filter((e) => e[1] <= threshold);
+  if (kept.length < keepMin) {
+    // slow 已按延迟升序，补回来的是其中最接近阈值的那几个
+    const need = Math.min(keepMin - kept.length, slow.length);
+    kept = kept.concat(slow.slice(0, need));
+    slow = slow.slice(need);
+  }
+  return {
+    slow: slow.map((e) => e[0]),
+    kept: kept.map((e) => e[0]),
+    fastest, threshold, reason: 'ok',
+  };
+}
+
+/**
+ * 重算慢名单并落盘。健康检查与自动优选都读这份名单。
+ *
+ * 过期（换网络后旧数字不可信）或开关关闭时，一律**清空**名单而不是留着上一轮的 ——
+ * 留着就等于用一个已经不能作数的尺子继续淘汰节点。
+ */
+export async function computeSlowIps(env, opts = {}) {
+  let cfg = opts.cfg;
+  if (!cfg) {
+    try { cfg = await readSettings(env); } catch { return { ok: false, slow: [], reason: 'config-error' }; }
+  }
+  if (cfg.hc_slow_evict === false) {
+    await writeSlowIps(env, []);
+    return { ok: true, slow: [], kept: [], reason: 'disabled' };
+  }
+  const { ts, ms } = await readPickSpeed(env);
+  const ttl = Number(cfg.pick_speed_ttl_ms) || defaultTtl();
+  if (!ts || Date.now() - ts > ttl) {
+    await writeSlowIps(env, []);
+    return { ok: true, slow: [], kept: [], reason: 'stale' };
+  }
+  const r = pickSlow(ms, {
+    factor: cfg.hc_slow_factor, floorMs: cfg.hc_slow_floor_ms, keepMin: cfg.hc_keep_min,
+  });
+  await writeSlowIps(env, r.slow);
+  return { ok: true, ...r, ts };
+}
+
 /**
  * 区分度自检：一批延迟是不是「全挤在一起」。
  *

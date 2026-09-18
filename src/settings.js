@@ -154,6 +154,26 @@ export const SETTINGS_SPEC = {
     group: 'preferred', label: '浏览器测速结果有效期', unit: '毫秒', level: 'advanced',
     hint: '超过这个时间没重新测过就当作没测过，回到服务端顺序。换了网络（回家、出国）旧数字就是错的，所以宁可不用也不能一直信',
   },
+  hc_slow_evict: {
+    type: 'bool', default: true, env: 'HC_SLOW_EVICT',
+    group: 'preferred', label: '淘汰明显慢的节点',
+    hint: '健康检查以前只看通不通，慢到离谱的照样占着 A 记录。开着会把「你测出来明显慢」的节点剔出候选。只用浏览器测速的数字判定，不用服务端探测的（后者跟你的网络无关）',
+  },
+  hc_slow_factor: {
+    type: 'int', default: 3, min: 2, max: 10, env: 'HC_SLOW_FACTOR',
+    group: 'preferred', label: '慢于最快几倍算慢', unit: '倍', level: 'advanced',
+    hint: '相对判据：最快 100ms、这个节点 400ms 才算慢。倍数调越小淘汰越狠',
+  },
+  hc_slow_floor_ms: {
+    type: 'int', default: 600, min: 100, max: 5000, env: 'HC_SLOW_FLOOR_MS',
+    group: 'preferred', label: '慢的绝对下限', unit: '毫秒', level: 'advanced',
+    hint: '绝对判据：低于这个毫秒数一律不算慢。没有它的话，「最快 30ms、最慢 90ms」也会被判成三倍慢 —— 其实谁都一样快，淘汰纯属自伤',
+  },
+  hc_keep_min: {
+    type: 'int', default: 2, min: 1, max: 10, env: 'HC_KEEP_MIN',
+    group: 'preferred', label: '至少保留几个候选', unit: '个', level: 'advanced',
+    hint: '剔除慢节点后不够这个数就不剔了。「快的没人可用」比「慢的还在用」糟得多',
+  },
   dns_budget_ms: {
     type: 'int', default: 22000, min: 5000, max: 29000, env: 'DNS_BUDGET_MS',
     group: 'preferred', label: '优选总时间预算', unit: '毫秒',
