@@ -1,25 +1,26 @@
 // 订阅 & 候选 IP 的通用能力：订阅地址解析、节点抽取、边缘段判定、候选域名解析。
 //
 // 设计约束（重要）：本文件**不写死任何业务域名 / IP / IP 段**。
-// 一切取值按「环境变量 → KV（面板可配）」两级查找；取不到时降级为「不判定 / 明确报错」，
-// 而不是退回到硬编码常量——否则 fork 后自定义部署必然静默地操作到别人的域名上。
-// 唯一允许出现的 URL 是远端数据源的默认地址，且随时可用环境变量覆盖。
+// 一切取值按「面板配置 → 环境变量 → 规范默认值」三级查找（统一由 settings.js 给出）；
+// 取不到时降级为「不判定 / 明确报错」，而不是退回到硬编码常量——否则 fork 后自定义部署
+// 必然静默地操作到别人的域名上。
+// 远端数据源地址也不再写死在这里：默认值登记在 settings.js 的 SPEC 里，面板可改、改完即生效。
 
 import { runtime } from './runtime.js';
 import { b64, isIpv4, isDomain } from './util.js';
+import { SETTINGS_SPEC, readSettings } from './settings.js';
 
-// 远端边缘 IP 段数据源。可用 CF_IP_RANGES_URL 覆盖；返回形如 {"result":{"ipv4_cidrs":[...]}} 的 JSON。
-const DEFAULT_RANGES_URL = 'https://api.cloudflare.com/client/v4/ips';
-// 解析候选域名用的公共 DNS（DoH）。Workers 自身没有 DNS 解析能力，只能借道查询接口。
-const DEFAULT_DOH_URL = 'https://cloudflare-dns.com/dns-query';
-const RANGES_TTL_MS = 12 * 3600 * 1000;
+// 远端边缘 IP 段数据源 / 公共 DNS / 缓存时长的默认值：真源在 settings.js 的 SPEC，
+// 这里只取出来复用，避免同一个默认值在两处各写一份（AGENTS 第 1 节）。
+const DEFAULT_RANGES_URL = SETTINGS_SPEC.cf_ip_ranges_url.default;
+const DEFAULT_DOH_URL = SETTINGS_SPEC.doh_url.default;
 
 /**
- * 一次「拉取优选候选」最多返回多少个 IP。
+ * 一次「拉取优选候选」最多返回多少个 IP 的**默认值**。
  * 具名导出：面板侧（admin.js）调用时也要用同一个默认值，免得两处各写一个 40。
- * 仍可用环境变量 SUB_CANDIDATE_LIMIT 覆盖。
+ * 实际取值走 settings 的 candidate_limit（面板可改、实时生效）。
  */
-const CANDIDATE_LIMIT = 40;
+const CANDIDATE_LIMIT = SETTINGS_SPEC.candidate_limit.default;
 
 async function kvGet(key) {
   try {
@@ -84,21 +85,22 @@ function parseCidrList(text) {
 
 /**
  * 边缘 IP 段：用于把「订阅里混进来的第三方节点」挡在优选池之外。
- * 优先级：KV（面板可配 CF_IP_RANGES）→ 远端数据源（URL 可配）→ 缓存 → null（表示无法判定，调用方应不过滤）。
+ * 优先级：手工段（面板）→ 远端数据源（地址面板可配）→ 缓存 → null（表示无法判定，调用方应不过滤）。
  * 刻意不内置任何写死的 IP 段。
  */
 async function cloudflareRanges(env, opts = {}) {
-  const manual = parseCidrList(await kvGet('CF_IP_RANGES'));
-  if (manual.length) return { cidrs: manual, source: 'kv' };
+  const cfg = await readSettings(env);
+  const manual = parseCidrList(cfg.cf_ip_ranges);
+  if (manual.length) return { cidrs: manual, source: 'panel' };
 
   const cached = await kvGet('CF_RANGES_CACHE');
   const cachedTs = Number(await kvGet('CF_RANGES_TS')) || 0;
-  if (cached && Date.now() - cachedTs < RANGES_TTL_MS) {
+  if (cached && Date.now() - cachedTs < cfg.ranges_ttl_ms) {
     const cidrs = parseCidrList(cached);
     if (cidrs.length) return { cidrs, source: 'cache' };
   }
 
-  const url = String((env && (env.CF_IP_RANGES_URL || env.cf_ip_ranges_url)) || DEFAULT_RANGES_URL).trim();
+  const url = String(cfg.cf_ip_ranges_url || DEFAULT_RANGES_URL).trim();
   if (!url) return null;
   try {
     const r = await fetch(url, { signal: (opts.signal || AbortSignal.timeout(6000)) });
@@ -126,11 +128,12 @@ function parseCidrListStringArray(arr) {
 }
 
 /**
- * 订阅地址：面板配置（KV SUB_URL）优先，其次环境变量 SUB_URL。
+ * 订阅地址：统一走运行参数 sub_url（面板可改、立即生效）。
+ * 历史独立 KV 键 SUB_URL 由 settings.js 的 legacyKey 兜底，环境变量 SUB_URL 仍可作为部署种子。
  * 支持完整 URL 或以 / 开头的相对路径（拼origin），贴 /tsub/<id> 这类链接也能直接用。
  */
 async function subscriptionUrl(env, origin) {
-  const raw = String((await kvGet('SUB_URL')) || (env && (env.SUB_URL || env.sub_url)) || '').trim();
+  const raw = String((await readSettings(env)).sub_url || '').trim();
   if (!raw) return '';
   if (/^https?:\/\//i.test(raw)) return raw;
   if (raw.startsWith('/')) return String(origin || '').replace(/\/+$/, '') + raw;
@@ -248,6 +251,8 @@ function isSelfFetch(url, origin) {
  */
 async function fetchSubscriptionCandidates(env, opts = {}) {
   const origin = opts.origin || '';
+  const cfg = await readSettings(env);
+  const limit = opts.limit || cfg.candidate_limit || CANDIDATE_LIMIT;
   const url = (await subscriptionUrl(env, origin)) || (await fallbackSubscription(env, origin, opts.hostname));
   const empty = { ips: [], source: 'none', note: '', filtered: 0, addresses: 0 };
   if (!url) {
@@ -255,7 +260,8 @@ async function fetchSubscriptionCandidates(env, opts = {}) {
   }
   let text = '';
   try {
-    const headers = { 'User-Agent': String((env && env.SUB_UA) || 'Mozilla/5.0') };
+    // UA 同样走运行参数：默认 'Mozilla/5.0' 也在 SPEC 里，不在这里另写一份
+    const headers = { 'User-Agent': String(cfg.sub_ua || SETTINGS_SPEC.sub_ua.default) };
     // 同源自拉补凭据：伪装开启时，这个 fetch 对 Worker 来说是一个不带任何 cookie 的
     // 全新请求，会被首页伪装当成陌生人挡在伪装 404 上（表现为「订阅拉取失败: HTTP 404」）。
     // 这里以「已登录」身份补上 ap_auth 过门禁；外部订阅地址绝不带凭据，避免泄漏口令。
@@ -279,15 +285,17 @@ async function fetchSubscriptionCandidates(env, opts = {}) {
     return { ...empty, addresses: addresses.length, note: '订阅中没有可用的 IPv4 节点地址' };
   }
 
-  const strict = opts.strict === false ? false : true;
+  // 过滤开关的默认值来自运行参数 sub_strict（面板可改）；
+  // 显式传 opts.strict 的调用方（面板接口）优先，便于「用一次性的口径做诊断」
+  const strict = opts.strict === undefined ? cfg.sub_strict !== false : opts.strict !== false;
   if (!strict) {
-    return { ips: [...new Set(ipv4)].slice(0, opts.limit || CANDIDATE_LIMIT), source: 'sub', filtered: 0, addresses: addresses.length };
+    return { ips: [...new Set(ipv4)].slice(0, limit), source: 'sub', filtered: 0, addresses: addresses.length };
   }
   const ranges = await cloudflareRanges(env, { signal: opts.signal });
   if (!ranges) {
     // 拿不到边缘段就不过滤（比用写死的常量安全），但要如实标注，便于面板/日志排障
     return {
-      ips: [...new Set(ipv4)].slice(0, opts.limit || CANDIDATE_LIMIT),
+      ips: [...new Set(ipv4)].slice(0, limit),
       source: 'sub',
       filtered: 0,
       addresses: addresses.length,
@@ -296,7 +304,7 @@ async function fetchSubscriptionCandidates(env, opts = {}) {
   }
   const kept = [...new Set(ipv4)].filter(ip => ranges.cidrs.some(c => cidrMatch(ip, c)));
   return {
-    ips: kept.slice(0, opts.limit || CANDIDATE_LIMIT),
+    ips: kept.slice(0, limit),
     source: 'sub',
     filtered: ipv4.length - kept.length,
     addresses: addresses.length,

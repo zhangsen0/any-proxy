@@ -16,30 +16,58 @@
  *   - 账户 id 不要求额外配置：用 token 调 GET /accounts 自动取第一个（面板只展示用量，不改任何资源）。
  *
  * 降级纪律：
- *   - CF_API_TOKEN / CF_ZONE_ID 缺失 → enabled:false，面板给「去配置」引导，不报错；
+ *   - 缺 API Token / Zone ID → enabled:false，面板给「去配置」引导，不报错；
  *   - 单个数据源失败 → 该源置 null 并记入 errors，其余源照常返回；
- *   - 所有外部调用带超时（FETCH_TIMEOUT_MS），失败绝不拖慢面板请求。
+ *   - 所有外部调用带超时（面板可配），失败绝不拖慢面板请求。
  *
  * 缓存：模块级 Map + TTL。GraphQL 分析查询有配额，每次打开面板都打会被限流；
- * 5 分钟内同一 isolate 只查一次（面板手动刷新也吃缓存，符合「看个大概」的用途）。
+ * TTL 内同一 isolate 只查一次（面板手动刷新也吃缓存，符合「看个大概」的用途）。
+ *
+ * 凭据与端点全部来自统一运行参数注册表（面板「配置中心 → Cloudflare 接口」）；
+ * 环境变量 CF_API_TOKEN / CF_ZONE_ID / CF_API_BASE / WORKER_SCRIPT 等仍可作为部署种子。
+ * 配置一改就清空本模块缓存（onConfigChange），保证面板换 token 后立刻按新凭据查。
  */
 
-const GRAPHQL_ENDPOINT = 'https://api.cloudflare.com/client/v4/graphql';
-const REST_ROOT = 'https://api.cloudflare.com/client/v4';
-const FETCH_TIMEOUT_MS = 8000;
-/** 用量数据整体缓存时长：GraphQL 分析查询按次计费，宁可看 5 分钟前的数也不刷爆配额 */
-const ANALYTICS_TTL_MS = 5 * 60 * 1000;
+import { onConfigChange } from './runtime.js';
+import { SETTINGS_SPEC, readSettings } from './settings.js';
+
 const DAILY_DAYS = 30;
 const TOP_PATHS = 12;
-/** Worker 脚本名：wrangler.toml 的 name，可用 WORKER_SCRIPT 覆盖（同一账户常挂着多个脚本） */
-export const CF_DEFAULT_SCRIPT = 'any-proxy';
+/** Worker 脚本名的默认值：真源在 settings.js 的 SPEC（与 wrangler.toml 的 name 同一概念） */
+export const CF_DEFAULT_SCRIPT = SETTINGS_SPEC.worker_script.default;
 
 /** 模块级缓存：kind -> { at, data }。isolate 间不共享，但对单用户面板足够 */
 const cache = new Map();
 
-function cacheGet(kind) {
+// 换 token / 换 zone / 改缓存时长的下一个请求就该看到新数据，不能等 TTL 自然过期
+onConfigChange(() => { cache.clear(); });
+
+/**
+ * 一次读取本模块需要的全部凭据与端点。
+ * 集中在这里而不是散成 tokenOf/zoneIdOf/scriptOf 三个函数：这三个值必须同源同刻，
+ * 否则「面板刚换完 token」的瞬间可能读到新 token + 旧 zone。
+ */
+async function cfCfg(env) {
+  let raw = {};
+  try { raw = await readSettings(env); } catch { /* 读不到就按「未配置」处理，面板给引导而不是报错 */ }
+  const apiBase = String(raw.cf_api_base || SETTINGS_SPEC.cf_api_base.default).replace(/\/+$/, '');
+  const ttl = Number(raw.analytics_ttl_ms);
+  const timeout = Number(raw.cf_api_timeout_ms);
+  return {
+    token: String(raw.cf_api_token || ''),
+    zoneId: String(raw.cf_zone_id || ''),
+    accountId: String(raw.cf_account_id || ''),
+    script: String(raw.worker_script || CF_DEFAULT_SCRIPT),
+    apiBase,
+    graphqlEndpoint: apiBase + '/graphql',
+    ttlMs: Number.isFinite(ttl) && ttl >= 0 ? ttl : SETTINGS_SPEC.analytics_ttl_ms.default,
+    timeoutMs: Number.isFinite(timeout) && timeout > 0 ? timeout : SETTINGS_SPEC.cf_api_timeout_ms.default,
+  };
+}
+
+function cacheGet(cfg, kind) {
   const hit = cache.get(kind);
-  return hit && Date.now() - hit.at < ANALYTICS_TTL_MS ? hit.data : null;
+  return hit && Date.now() - hit.at < cfg.ttlMs ? hit.data : null;
 }
 function cacheSet(kind, data) {
   cache.set(kind, { at: Date.now(), data });
@@ -49,24 +77,14 @@ function utcDate(daysAgo) {
   return new Date(Date.now() - daysAgo * 86400000).toISOString().slice(0, 10);
 }
 
-function tokenOf(env) {
-  return (env && (env.CF_API_TOKEN || env.CLOUDFLARE_API_TOKEN)) || '';
-}
-function zoneIdOf(env) {
-  return (env && (env.CF_ZONE_ID || env.CLOUDFLARE_ZONE_ID)) || '';
-}
-function scriptOf(env) {
-  return (env && env.WORKER_SCRIPT) || CF_DEFAULT_SCRIPT;
-}
-
 /** GraphQL 请求：失败或返回 errors 一律抛错，由调用方按数据源收集降级 */
-async function graphql(env, query) {
-  const tok = tokenOf(env);
-  if (!tok) throw Object.assign(new Error('未配置 CF_API_TOKEN'), { code: 'NO_TOKEN' });
+async function graphql(env, cfg, query) {
+  const tok = cfg.token;
+  if (!tok) throw Object.assign(new Error('未配置 CF API Token'), { code: 'NO_TOKEN' });
   const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT_MS);
+  const timer = setTimeout(() => ctrl.abort(), cfg.timeoutMs);
   try {
-    const res = await fetch(GRAPHQL_ENDPOINT, {
+    const res = await fetch(cfg.graphqlEndpoint, {
       method: 'POST',
       headers: { Authorization: 'Bearer ' + tok, 'Content-Type': 'application/json' },
       body: JSON.stringify({ query }),
@@ -85,13 +103,13 @@ async function graphql(env, query) {
 }
 
 /** REST GET：解析 JSON，非 2xx 抛错 */
-async function restJson(env, path) {
-  const tok = tokenOf(env);
-  if (!tok) throw Object.assign(new Error('未配置 CF_API_TOKEN'), { code: 'NO_TOKEN' });
+async function restJson(env, cfg, path) {
+  const tok = cfg.token;
+  if (!tok) throw Object.assign(new Error('未配置 CF API Token'), { code: 'NO_TOKEN' });
   const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT_MS);
+  const timer = setTimeout(() => ctrl.abort(), cfg.timeoutMs);
   try {
-    const res = await fetch(REST_ROOT + path, { headers: { Authorization: 'Bearer ' + tok }, signal: ctrl.signal });
+    const res = await fetch(cfg.apiBase + path, { headers: { Authorization: 'Bearer ' + tok }, signal: ctrl.signal });
     const body = await res.json().catch(() => null);
     if (!res.ok || !body || body.success === false) {
       const msg = (body && body.errors && body.errors[0] && body.errors[0].message) || ('HTTP ' + res.status);
@@ -103,16 +121,16 @@ async function restJson(env, path) {
   }
 }
 
-/** 账户信息：优先 env.CF_ACCOUNT_ID（纯 id），否则用 token 列账户取第一个 */
+/** 账户信息：面板配了 Account ID 直接用，否则用 token 列账户取第一个 */
 let accountInflight = null; // 单飞：account 源与 worker 源会并行打这个函数，避免同一时刻重复请求
-async function accountInfo(env) {
-  if (env && env.CF_ACCOUNT_ID) return { id: env.CF_ACCOUNT_ID, name: null };
-  const cached = cacheGet('account');
+async function accountInfo(env, cfg) {
+  if (cfg.accountId) return { id: cfg.accountId, name: null };
+  const cached = cacheGet(cfg, 'account');
   if (cached) return cached;
   if (accountInflight) return accountInflight;
   accountInflight = (async () => {
     try {
-      const list = await restJson(env, '/accounts');
+      const list = await restJson(env, cfg, '/accounts');
       const first = Array.isArray(list) && list[0];
       if (first && first.id) {
         const info = { id: first.id, name: first.name || null };
@@ -126,13 +144,12 @@ async function accountInfo(env) {
 }
 
 /** Zone 信息：用 token 调 GET /zones/{id}，面板能显示「这个域名绑在哪个账户」 */
-async function zoneInfo(env) {
-  const zid = zoneIdOf(env);
-  if (!zid) return null;
-  const cached = cacheGet('zone');
+async function zoneInfo(env, cfg) {
+  if (!cfg.zoneId) return null;
+  const cached = cacheGet(cfg, 'zone');
   if (cached) return cached;
   try {
-    const zone = await restJson(env, '/zones/' + encodeURIComponent(zid));
+    const zone = await restJson(env, cfg, '/zones/' + encodeURIComponent(cfg.zoneId));
     if (zone && zone.id) {
       const info = { id: zone.id, name: zone.name || null };
       cacheSet('zone', info);
@@ -142,10 +159,10 @@ async function zoneInfo(env) {
   return null;
 }
 
-async function collectDaily(env) {
-  const zid = zoneIdOf(env);
-  if (!zid) throw Object.assign(new Error('未配置 CF_ZONE_ID'), { code: 'NO_ZONE' });
-  const data = await graphql(env,
+async function collectDaily(env, cfg) {
+  const zid = cfg.zoneId;
+  if (!zid) throw Object.assign(new Error('未配置 Zone ID'), { code: 'NO_ZONE' });
+  const data = await graphql(env, cfg,
     `query { viewer { zones(filter:{zoneTag:"${zid}"}) { ` +
     `httpRequests1dGroups(limit: ${DAILY_DAYS}, filter:{date_geq:"${utcDate(DAILY_DAYS - 1)}"}) { ` +
     `dimensions { date } sum { requests bytes cachedRequests cachedBytes } uniq { uniques } } } } }`);
@@ -162,12 +179,12 @@ async function collectDaily(env) {
 }
 
 /** 近 24h 状态码分布。自适应窗口 ≤1 天是硬限制（超过直接 quota 报错），这里取整 24h */
-async function collectStatus(env) {
-  const zid = zoneIdOf(env);
-  if (!zid) throw Object.assign(new Error('未配置 CF_ZONE_ID'), { code: 'NO_ZONE' });
+async function collectStatus(env, cfg) {
+  const zid = cfg.zoneId;
+  if (!zid) throw Object.assign(new Error('未配置 Zone ID'), { code: 'NO_ZONE' });
   const from = new Date(Date.now() - 86400000).toISOString();
   const to = new Date().toISOString();
-  const data = await graphql(env,
+  const data = await graphql(env, cfg,
     `query { viewer { zones(filter:{zoneTag:"${zid}"}) { ` +
     `httpRequestsAdaptiveGroups(limit: 30, filter:{datetime_geq:"${from}", datetime_leq:"${to}"}) { ` +
     `count dimensions { edgeResponseStatus } sum { edgeResponseBytes } } } } }`);
@@ -181,12 +198,12 @@ async function collectStatus(env) {
 }
 
 /** 近 24h Top 路径：回答「流量都打在哪条路由上」（排障时最有用的一屏） */
-async function collectPaths(env) {
-  const zid = zoneIdOf(env);
-  if (!zid) throw Object.assign(new Error('未配置 CF_ZONE_ID'), { code: 'NO_ZONE' });
+async function collectPaths(env, cfg) {
+  const zid = cfg.zoneId;
+  if (!zid) throw Object.assign(new Error('未配置 Zone ID'), { code: 'NO_ZONE' });
   const from = new Date(Date.now() - 86400000).toISOString();
   const to = new Date().toISOString();
-  const data = await graphql(env,
+  const data = await graphql(env, cfg,
     `query { viewer { zones(filter:{zoneTag:"${zid}"}) { ` +
     `httpRequestsAdaptiveGroups(limit: ${TOP_PATHS}, filter:{datetime_geq:"${from}", datetime_leq:"${to}"}) { ` +
     `count dimensions { clientRequestPath } sum { edgeResponseBytes } } } } }`);
@@ -200,11 +217,11 @@ async function collectPaths(env) {
 }
 
 /** 当前 Worker 脚本近 30 天调用：只统计本脚本，账户里别的脚本不掺进来 */
-async function collectWorker(env) {
-  const acct = await accountInfo(env);
-  if (!acct || !acct.id) throw Object.assign(new Error('无法确定 CF 账户（配置 CF_ACCOUNT_ID，或给 token 账号列表读权限）'), { code: 'NO_ACCOUNT' });
-  const script = scriptOf(env);
-  const data = await graphql(env,
+async function collectWorker(env, cfg) {
+  const acct = await accountInfo(env, cfg);
+  if (!acct || !acct.id) throw Object.assign(new Error('无法确定 CF 账户（在面板填 Account ID，或给 token 账户列表读权限）'), { code: 'NO_ACCOUNT' });
+  const script = cfg.script;
+  const data = await graphql(env, cfg,
     `query { viewer { accounts(filter:{accountTag:"${acct.id}"}) { ` +
     `workersInvocationsAdaptive(limit: ${DAILY_DAYS}, filter:{date_geq:"${utcDate(DAILY_DAYS - 1)}"}) { ` +
     `dimensions { date scriptName } sum { requests errors subrequests } } } } }`);
@@ -234,14 +251,15 @@ export function clearCfCache() {
 }
 
 /**
- * 汇总一次完整驾驶舱数据。整个结果按 ANALYTICS_TTL_MS 缓存：
- * 5 分钟内任何打开面板的请求都吃同一份，GraphQL 配额只花一份。
+ * 汇总一次完整驾驶舱数据。整个结果按配置的缓存时长缓存：
+ * TTL 内任何打开面板的请求都吃同一份，GraphQL 配额只花一份。
  */
 export async function cfAnalytics(env) {
-  const cached = cacheGet('all');
+  const cfg = await cfCfg(env);
+  const cached = cacheGet(cfg, 'all');
   if (cached) return cached;
 
-  const enabled = !!(tokenOf(env) && zoneIdOf(env));
+  const enabled = !!(cfg.token && cfg.zoneId);
   const out = {
     ok: true,
     enabled,
@@ -268,12 +286,12 @@ export async function cfAnalytics(env) {
 
   // 各数据源互不依赖，并行打；单源失败只记 errors，其余照常
   const [zone, account, daily, status, paths, worker] = await Promise.all([
-    safe('zone', () => zoneInfo(env)),
-    safe('account', () => accountInfo(env)),
-    safe('daily', () => collectDaily(env)),
-    safe('status', () => collectStatus(env)),
-    safe('paths', () => collectPaths(env)),
-    safe('worker', () => collectWorker(env)),
+    safe('zone', () => zoneInfo(env, cfg)),
+    safe('account', () => accountInfo(env, cfg)),
+    safe('daily', () => collectDaily(env, cfg)),
+    safe('status', () => collectStatus(env, cfg)),
+    safe('paths', () => collectPaths(env, cfg)),
+    safe('worker', () => collectWorker(env, cfg)),
   ]);
   out.zone = zone;
   out.account = account;

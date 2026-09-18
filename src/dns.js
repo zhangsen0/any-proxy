@@ -1,6 +1,7 @@
 import { runtime } from './runtime.js';
 import { b64, parseIpv4List, parseDomainList } from './util.js';
 import { fetchSubscriptionCandidates, resolveDomains } from './subs.js';
+import { SETTINGS_SPEC, readSettings } from './settings.js';
 
 /**
  * 探活目标：伪装开启后任何 /__api/* 都要求登录，内部 fetch 必须自己带上登录态。
@@ -17,45 +18,94 @@ function probeHeaders(host) {
 }
 // 存储统一走 runtime.KV（bindRuntime 按 STORAGE_BACKEND 选择 KV 或 D1），与本项目其余模块保持一致
 
-// 时间预算：Workers 单次 HTTP 请求的墙钟上限约 30s，超时会被平台直接杀掉，前端只看到「请求失败」。
-// 优选链路（拉候选 + 逐个探测 + 改 DNS + 自检）原先全串行且无预算，候选一多必然超时。
-// 这里给整条链路一个硬预算，每个阶段按剩余时间收敛，保证任何情况下都能返回可读结果。
-const TOTAL_BUDGET_MS = 22000;
-const PROBE_TIMEOUT_MS = 2500;
-const PROBE_CONCURRENCY = 12;
-const MAX_TARGETS = 2; // A 记录条数（多 A 记录由浏览器自动负载均衡）
-const DNS_SETTLE_MS = 2500; // 写完 A 记录后等它生效再自检
-const MAX_PROBE_LIMIT = 32; // 单轮最多探测多少个候选，防止池里塞满不可达 IP 时拖垮整次请求
+// ===================== 可运营参数的默认值 =====================
+//
+// 这一节原先全是裸常量：时间预算、探测并发、A 记录条数…改一个数字要改代码 + 重新部署，
+// 而 AGENTS 第 0 节要求「面向运营的数值必须可配置」。现在**默认值**仍然只在这里读一次
+// （从 settings.js 的 SPEC 取，不在本文件重抄一遍），**运行时取值**则一律走
+// readSettings(env) —— 面板改完立即生效。
+//
+// 时间预算：Workers 单次 HTTP 请求的墙钟上限约 30s，超时会被平台直接杀掉，
+// 前端只看到「请求失败」。优选链路（拉候选 + 逐个探测 + 改 DNS + 自检）原先全串行且无预算，
+// 候选一多必然超时。现在给整条链路一个硬预算，每个阶段按剩余时间收敛。
+const DEFAULT_SETTINGS = {
+  dns_budget_ms: SETTINGS_SPEC.dns_budget_ms.default,
+  probe_timeout_ms: SETTINGS_SPEC.probe_timeout_ms.default,
+  probe_concurrency: SETTINGS_SPEC.probe_concurrency.default,
+  max_targets: SETTINGS_SPEC.max_targets.default,
+  dns_settle_ms: SETTINGS_SPEC.dns_settle_ms.default,
+  max_probe_limit: SETTINGS_SPEC.max_probe_limit.default,
+  pool_limit: SETTINGS_SPEC.pool_limit.default,
+  domain_pool_limit: SETTINGS_SPEC.domain_pool_limit.default,
+  dns_interval_minutes: SETTINGS_SPEC.dns_interval_minutes.default,
+};
 
 /**
  * 自动优选频率（分钟）的默认值与允许区间。
  *
  * 为什么导出：这个值的「默认 720、区间 5~1440」曾经同时写在 dns.js（调度器）和
  * admin.js（面板接口）里，两边一旦改成不一致，就会出现「面板显示 12 小时、实际按别的间隔跑」
- * 这种查不出来的偏差。现在只在这里定义，面板侧引用同一份。
+ * 这种查不出来的偏差。现在只由 settings.js 的 SPEC 定义一次，两边引用同一份。
  */
-const DNS_INTERVAL = { default: 720, min: 5, max: 1440 };
+const DNS_INTERVAL = {
+  default: SETTINGS_SPEC.dns_interval_minutes.default,
+  min: SETTINGS_SPEC.dns_interval_minutes.min,
+  max: SETTINGS_SPEC.dns_interval_minutes.max,
+};
 
 /** 优选池（PREF_IPS）与已验证可用集（GOOD_IPS）各自最多保留多少条 —— 面板写入与运行时读取共用 */
-const POOL_LIMIT = 30;
+const POOL_LIMIT = SETTINGS_SPEC.pool_limit.default;
 
 /** 候选域名池最多用多少个域名（解析成本随条数上升，且 A 记录只留 MAX_TARGETS 条） */
-const DOMAIN_POOL_LIMIT = 12;
+const DOMAIN_POOL_LIMIT = SETTINGS_SPEC.domain_pool_limit.default;
+
+/** A 记录条数的默认值（多 A 记录由浏览器自动负载均衡），运行时取值见 readSettings */
+const MAX_TARGETS = SETTINGS_SPEC.max_targets.default;
 
 /**
  * 优选/自愈的目标域名 —— 不写死。
- * 优先级：环境变量 PROXY_HOST（Actions 变量注入）→ 当前请求的 hostname → 都没有则明确报错。
+ * 优先级：面板配置（运行参数 proxy_host）→ 环境变量 PROXY_HOST → 当前请求的 hostname → 都没有则明确报错。
  * 早期版本把 'proxy.520215.xyz' 硬编码在本文件六处，fork 后自选域名部署会静默地改到别人的 DNS 上。
+ *
+ * 拆成两个函数的原因：面板值要 await 才能读到（走配置文档），而 hostname 归一化是纯字符串处理。
+ * 归一化只有这一份实现，两个入口共用 —— 否则「面板填的域名」与「环境变量填的域名」会各有一套清洗规则。
  */
-function proxyHost(env, hostname) {
-  const raw = String((env && (env.PROXY_HOST || env.proxy_host)) || '').trim();
-  const cleaned = raw
+function normalizeHost(raw) {
+  return String(raw || '')
     .replace(/^https?:\/\//i, '')
     .replace(/\/.*$/, '')
     .split(':')[0]
+    .trim()
     .toLowerCase();
+}
+
+/** 同步版本：只认环境变量，保留给无法 await 的调用点 */
+function proxyHost(env, hostname) {
+  const cleaned = normalizeHost(env && (env.PROXY_HOST || env.proxy_host));
   if (cleaned) return cleaned;
   return String(hostname || '').trim().toLowerCase();
+}
+
+/** 面板优先版本：先读运行参数，再退回环境变量 / 本次请求的 hostname */
+async function resolveProxyHost(env, hostname) {
+  let fromPanel = '';
+  try {
+    fromPanel = normalizeHost((await readSettings(env)).proxy_host);
+  } catch { /* 读配置失败就退回环境变量，不让一次存储抖动把优选停掉 */ }
+  if (fromPanel) return fromPanel;
+  return proxyHost(env, hostname);
+}
+
+/**
+ * 一次读取全部运行参数，供本模块内部复用（一次调用只读一次存储）。
+ * 跨请求一律重新读 —— 面板保存会失效配置文档缓存，这里跟着拿到新值，保证「改完即生效」。
+ */
+async function readDnsSettings(env) {
+  try {
+    return await readSettings(env);
+  } catch {
+    return { ...DEFAULT_SETTINGS };
+  }
 }
 
 /**
@@ -70,9 +120,9 @@ async function rememberHost(host) {
   } catch {}
 }
 
-/** 目标域名的最终解析顺序：环境变量 → 本次请求 hostname → 上次访问过的 hostname。都拿不到才报错（绝不猜）。 */
+/** 目标域名的最终解析顺序：面板/环境变量 → 本次请求 hostname → 上次访问过的 hostname。都拿不到才报错（绝不猜）。 */
 async function targetHost(env, hostname) {
-  const direct = proxyHost(env, hostname);
+  const direct = await resolveProxyHost(env, hostname);
   if (direct) {
     await rememberHost(direct);
     return direct;
@@ -84,11 +134,11 @@ async function targetHost(env, hostname) {
   return '';
 }
 
-async function poolFrom(key, limit = POOL_LIMIT) {
+async function poolFrom(key, limit) {
   try {
     const v = await runtime.KV.get(key);
     if (!v) return [];
-    return parseIpv4List(v, limit);
+    return parseIpv4List(v, limit || POOL_LIMIT);
   } catch {
     return [];
   }
@@ -97,17 +147,12 @@ async function poolFrom(key, limit = POOL_LIMIT) {
 /**
  * 定时入口：每 5 分钟触发一次（细粒度守底），按用户配置的间隔（默认 720 分钟 = 12 小时）
  * 决定是否真正执行自动优选 DNS 更新，避免高频无谓刷新。
+ * 间隔本身走运行参数（面板可改），历史独立 KV 键 DNS_CONFIG 由 settings.js 兜底。
  */
 async function scheduledDnsCheck(env) {
   try {
-    let interval = DNS_INTERVAL.default;
-    try {
-      const c = await runtime.KV.get('DNS_CONFIG');
-      if (c) {
-        const v = parseInt(c, 10);
-        if (v >= DNS_INTERVAL.min && v <= DNS_INTERVAL.max) interval = v;
-      }
-    } catch {}
+    const cfg = await readDnsSettings(env);
+    const interval = cfg.dns_interval_minutes || DNS_INTERVAL.default;
     const now = Date.now();
     let last = 0;
     try {
@@ -115,7 +160,7 @@ async function scheduledDnsCheck(env) {
     } catch {}
     if (now - last < interval * 60000) return;
     await runtime.KV.put('DNS_LAST_RUN', String(now));
-    await autoUpdatePreferredDns(env, { deadlineMs: Date.now() + TOTAL_BUDGET_MS });
+    await autoUpdatePreferredDns(env, { deadlineMs: Date.now() + (cfg.dns_budget_ms || DEFAULT_SETTINGS.dns_budget_ms) });
   } catch (e) {}
 }
 
@@ -124,15 +169,18 @@ async function scheduledDnsCheck(env) {
  * 1. 候选来源（全部可配置，无硬编码）：已验证可用集 GOOD_IPS → 优选池 PREF_IPS → 订阅节点 → 候选域名池解析
  * 2. HTTP 并发探测过滤不可达 IP（受总预算约束）
  * 3. 取前 N 个写入 A 记录，写完用域名自检，不通过自动回滚
- * 需要 Secret：CF_API_TOKEN（DNS 编辑权限）、CF_ZONE_ID
+ * 需要 CF API 凭据：面板「配置中心 → Cloudflare 接口」可填（等价于环境变量 CF_API_TOKEN / CF_ZONE_ID）
  */
 async function autoUpdatePreferredDns(env, opts = {}) {
-  const deadlineMs = opts.deadlineMs || (Date.now() + TOTAL_BUDGET_MS);
+  const cfg = await readDnsSettings(env);
+  const deadlineMs = opts.deadlineMs || (Date.now() + (cfg.dns_budget_ms || DEFAULT_SETTINGS.dns_budget_ms));
+  // targetHost 内部走「面板/环境变量 → 本次 hostname → 上次访问过的 hostname」，
+  // cron 触发时没有请求上下文，靠的就是最后那层兜底 —— 不能在这里图省事直接读配置
   const host = await targetHost(env, opts.hostname);
-  if (!host) return { ok: false, error: '无法确定优选目标域名：请配置 PROXY_HOST' };
-  const zone = env && (env.CF_ZONE_ID || env.cf_zone_id);
-  const token = env && (env.CF_API_TOKEN || env.cf_api_token);
-  if (!zone || !token) return { ok: false, error: '缺少 CF_API_TOKEN / CF_ZONE_ID Secret' };
+  const zone = cfg.cf_zone_id || (env && (env.CF_ZONE_ID || env.cf_zone_id));
+  const token = cfg.cf_api_token || (env && (env.CF_API_TOKEN || env.cf_api_token));
+  if (!host) return { ok: false, error: '无法确定优选目标域名：请在「配置中心 → 代理与转发」填写优选目标域名' };
+  if (!zone || !token) return { ok: false, error: '缺少 CF API 凭据：请在「配置中心 → Cloudflare 接口」填写 API Token 与 Zone ID' };
 
   try {
     // 1. 候选优先级：GOOD_IPS（外部验证过的可用集，最安全）→ 优选池（浏览器测速保存）→ 订阅节点 → 域名池解析
@@ -148,7 +196,7 @@ async function autoUpdatePreferredDns(env, opts = {}) {
         const sub = await fetchSubscriptionCandidates(env, {
           origin: opts.origin,
           hostname: host,
-          limit: 40,
+          limit: cfg.candidate_limit || SETTINGS_SPEC.candidate_limit.default,
           signal: AbortSignal.timeout(Math.max(1000, Math.min(8000, deadlineMs - Date.now()))),
         });
         if (sub.ips.length) {
@@ -160,11 +208,11 @@ async function autoUpdatePreferredDns(env, opts = {}) {
 
     // 池子仍然为空时，按候选域名池动态解析出当前边缘 IP，而不是退回写死的 IP 列表
     if (!candidates.length && Date.now() < deadlineMs) {
-      const domains = await domainPool(env);
+      const domains = await domainPool(env, cfg.domain_pool_limit);
       if (domains.length) {
         try {
           const resolved = await resolveDomains(domains, {
-            dohUrl: env && (env.DOH_URL || env.doh_url),
+            dohUrl: cfg.doh_url,
             deadlineMs,
             signal: AbortSignal.timeout(Math.max(1000, Math.min(6000, deadlineMs - Date.now()))),
           });
@@ -187,7 +235,14 @@ async function autoUpdatePreferredDns(env, opts = {}) {
     //    说明：Worker 出站到边缘 IP 时 SNI=IP，无法用 HTTPS 复测 1034/可用；浏览器负责测延迟排序，
     //    服务端用 HTTP(80) 探测排除不可达 IP，写入后用「访问自己域名」自检，1034 立即回滚，绝不写坏。
     const budget = Math.max(2000, Math.min(12000, deadlineMs - Date.now() - 4000));
-    const usable = await filterUsableIps(candidates, { host, deadlineMs, budgetMs: budget });
+    const usable = await filterUsableIps(candidates, {
+      host,
+      deadlineMs,
+      budgetMs: budget,
+      maxProbeLimit: cfg.max_probe_limit,
+      probeTimeoutMs: cfg.probe_timeout_ms,
+      concurrency: cfg.probe_concurrency,
+    });
     const result = await applyDnsWithSelfCheck(env, usable, { host, deadlineMs });
     return {
       ok: result.ok,
@@ -204,10 +259,10 @@ async function autoUpdatePreferredDns(env, opts = {}) {
 }
 
 /** 候选域名池：KV（面板可配）优先，否则取环境变量 PREF_DOMAINS。都没有则返回空 —— 不内置写死列表。 */
-async function domainPool(env) {
+async function domainPool(env, limit) {
   const stored = await runtime.KV.get('PREF_DOMAINS').catch(() => null);
   const raw = stored || (env && (env.PREF_DOMAINS || env.pref_domains)) || '';
-  return parseDomainList(raw, DOMAIN_POOL_LIMIT);
+  return parseDomainList(raw, limit || DOMAIN_POOL_LIMIT);
 }
 
 /**
@@ -216,6 +271,7 @@ async function domainPool(env) {
  *
  * 原先「串行 + 每个 IP 等满 3s」，实测一批不可达候选就能吃掉 20s+，叠加后续步骤必然超出 Workers 墙钟；
  * 现改为并发 + 单次超时 + **总预算**：预算耗尽后立即返回已探到的结果。
+ * 并发数 / 超时 / 单轮上限都是运行参数（面板可改），这里只消费不再自己定值。
  */
 async function filterUsableIps(ips, opts = {}) {
   const host = opts.host || '';
@@ -223,7 +279,10 @@ async function filterUsableIps(ips, opts = {}) {
   const deadline = opts.deadlineMs || 0;
   const budgetEnd = Date.now() + (opts.budgetMs || 12000);
   const hardEnd = deadline ? Math.min(budgetEnd, deadline - 500) : budgetEnd;
-  const queue = [...new Set(ips)].slice(0, MAX_PROBE_LIMIT);
+  const maxProbe = opts.maxProbeLimit || DEFAULT_SETTINGS.max_probe_limit;
+  const probeTimeoutMs = opts.probeTimeoutMs || DEFAULT_SETTINGS.probe_timeout_ms;
+  const concurrency = opts.concurrency || DEFAULT_SETTINGS.probe_concurrency;
+  const queue = [...new Set(ips)].slice(0, maxProbe);
   if (!queue.length) return [];
 
   const good = [];
@@ -235,7 +294,7 @@ async function filterUsableIps(ips, opts = {}) {
         const r = await fetch('http://' + ip + PROBE_PATH, {
           headers: probeHeaders(host),
           redirect: 'manual',
-          signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
+          signal: AbortSignal.timeout(probeTimeoutMs),
         });
         if (r) good.push(ip);
       } catch {}
@@ -243,25 +302,34 @@ async function filterUsableIps(ips, opts = {}) {
   };
 
   await Promise.all(
-    Array.from({ length: Math.min(PROBE_CONCURRENCY, queue.length) }, () => probe().catch(() => {}))
+    Array.from({ length: Math.min(concurrency, queue.length) }, () => probe().catch(() => {}))
   );
   return good.length ? good : ips;
 }
 
-// Cloudflare DNS API 基础地址（平台地址，非业务数据，可用 CF_API_BASE 覆盖）
-function dnsApiBase(env, zone) {
-  const base = String((env && (env.CF_API_BASE || env.cf_api_base)) || 'https://api.cloudflare.com/client/v4').replace(/\/+$/, '');
+/** 取本模块需要的运行参数：调用方已经读过就复用（同一请求不重复读存储），没读就现读一次 */
+async function cfgOf(env, opts) {
+  if (opts && opts.cfg) return opts.cfg;
+  return await readDnsSettings(env);
+}
+
+// Cloudflare DNS API 基础地址（平台地址，非业务数据；面板「Cloudflare 接口」可改，环境变量 CF_API_BASE 作种子）
+function dnsApiBase(cfg, zone) {
+  const base = String((cfg && cfg.cf_api_base) || SETTINGS_SPEC.cf_api_base.default).replace(/\/+$/, '');
   return `${base}/zones/${zone}/dns_records`;
 }
 
 // 更新 DNS A 记录（DNS-only）：多了删、少了补。返回 {changed, error}，失败不再静默吞掉。
 async function updateDnsRecords(env, ips, opts = {}) {
-  const zone = env && (env.CF_ZONE_ID || env.cf_zone_id);
-  const token = env && (env.CF_API_TOKEN || env.cf_api_token);
+  const cfg = await cfgOf(env, opts);
+  const zone = cfg.cf_zone_id;
+  const token = cfg.cf_api_token;
   const host = opts.host;
-  if (!zone || !token) return { changed: 0, error: '缺少 CF_API_TOKEN / CF_ZONE_ID Secret' };
+  // A 记录条数上限是运行参数：面板写入的条数与运行时保留的条数必须同一口径，否则「面板显示 3 条、实际只留 2 条」
+  const maxTargets = cfg.max_targets || DEFAULT_SETTINGS.max_targets;
+  if (!zone || !token) return { changed: 0, error: '缺少 CF API 凭据（API Token / Zone ID）' };
   if (!host) return { changed: 0, error: '未指定目标域名' };
-  const base = dnsApiBase(env, zone);
+  const base = dnsApiBase(cfg, zone);
   const auth = { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' };
   let records = [];
   try {
@@ -298,7 +366,7 @@ async function updateDnsRecords(env, ips, opts = {}) {
       errors.push(e && e.message ? e.message : String(e));
     }
   }
-  for (let i = records.length; i < ips.length && i < MAX_TARGETS; i++) {
+  for (let i = records.length; i < ips.length && i < maxTargets; i++) {
     try {
       await fetch(base, {
         method: 'POST',
@@ -313,20 +381,21 @@ async function updateDnsRecords(env, ips, opts = {}) {
   return { changed, error: errors.length ? errors.join('; ') : '' };
 }
 
-// 读取当前 A 记录（id + content，最多 MAX_TARGETS 条）
+// 读取当前 A 记录（id + content，最多 max_targets 条）
 async function getARecords(env, opts = {}) {
-  const zone = env && (env.CF_ZONE_ID || env.cf_zone_id);
-  const token = env && (env.CF_API_TOKEN || env.cf_api_token);
+  const cfg = await cfgOf(env, opts);
+  const zone = cfg.cf_zone_id;
+  const token = cfg.cf_api_token;
   const host = opts.host;
   if (!zone || !token || !host) return [];
   try {
     const list = await (await fetch(
-      `${dnsApiBase(env, zone)}?name=${encodeURIComponent(host)}&type=A`,
+      `${dnsApiBase(cfg, zone)}?name=${encodeURIComponent(host)}&type=A`,
       { headers: { Authorization: `Bearer ${token}` } }
     )).json();
     return (list.result || [])
       .filter(r => r.type === 'A' && r.name === host)
-      .slice(0, MAX_TARGETS)
+      .slice(0, cfg.max_targets || DEFAULT_SETTINGS.max_targets)
       .map(r => ({ id: r.id, content: r.content }));
   } catch {
     return [];
@@ -339,14 +408,17 @@ async function getARecords(env, opts = {}) {
  * HTTP(80) 探测过滤不了域名维度的拒绝，只有域名访问（SNI=域名）能暴露。
  */
 async function applyDnsWithSelfCheck(env, ips, opts = {}) {
+  const cfg = await cfgOf(env, opts);
   const host = opts.host || '';
   if (!host) return { ok: false, error: '未指定目标域名' };
   const deadlineMs = opts.deadlineMs || 0;
-  const targets = ips.slice(0, MAX_TARGETS);
+  const maxTargets = cfg.max_targets || DEFAULT_SETTINGS.max_targets;
+  const settleMs = cfg.dns_settle_ms === undefined ? DEFAULT_SETTINGS.dns_settle_ms : cfg.dns_settle_ms;
+  const targets = ips.slice(0, maxTargets);
   if (!targets.length) return { ok: false, error: '没有可用 IP 可写入 A 记录' };
 
-  const old = await getARecords(env, { host });
-  const applied = await updateDnsRecords(env, targets, { host });
+  const old = await getARecords(env, { host, cfg });
+  const applied = await updateDnsRecords(env, targets, { host, cfg });
   if (applied.error) {
     return { ok: false, error: '更新 DNS 失败：' + applied.error, ips: targets, changed: 0, verified: false };
   }
@@ -359,7 +431,7 @@ async function applyDnsWithSelfCheck(env, ips, opts = {}) {
   }
 
   // 等 DNS 生效，但要留在预算内，绝不把请求拖过 Workers 墙钟
-  const wait = Math.min(DNS_SETTLE_MS, Math.max(0, (deadlineMs || Date.now() + DNS_SETTLE_MS) - Date.now() - 2000));
+  const wait = Math.min(settleMs, Math.max(0, (deadlineMs || Date.now() + settleMs) - Date.now() - 2000));
   if (wait > 0) await new Promise(r => setTimeout(r, wait));
 
   const checked = await selfCheck(host, deadlineMs);
@@ -367,7 +439,7 @@ async function applyDnsWithSelfCheck(env, ips, opts = {}) {
 
   // 新 IP 不可用 → 回滚旧记录，宁可保持原样也不写坏
   try {
-    await updateDnsRecords(env, old.map(x => x.content), { host });
+    await updateDnsRecords(env, old.map(x => x.content), { host, cfg });
   } catch {}
   return {
     ok: false,
@@ -394,6 +466,6 @@ async function selfCheck(host, deadlineMs) {
 
 export {
   scheduledDnsCheck, autoUpdatePreferredDns, filterUsableIps, updateDnsRecords, getARecords,
-  applyDnsWithSelfCheck, proxyHost, targetHost, rememberHost, MAX_TARGETS,
+  applyDnsWithSelfCheck, proxyHost, resolveProxyHost, targetHost, rememberHost, MAX_TARGETS,
   DNS_INTERVAL, POOL_LIMIT, DOMAIN_POOL_LIMIT,
 };

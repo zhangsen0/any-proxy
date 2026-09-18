@@ -217,11 +217,12 @@ section('6. 静态扫描（去注释后按文件白名单核对）');
   }
 
   const SRC = [
-    'worker.js', 'src/admin.js', 'src/alert.js', 'src/api-catalog.js', 'src/auth.js', 'src/compress.js',
-    'src/config-ui.js', 'src/config.js', 'src/disguise.js', 'src/dns.js', 'src/geoip.js', 'src/inject.js',
-    'src/nodetag.js', 'src/proxy.js', 'src/ratelimit.js', 'src/router.js', 'src/runtime.js', 'src/scopes.js',
-    'src/share.js', 'src/sites.js', 'src/stats-ui.js', 'src/stats.js', 'src/storage.js', 'src/subs.js',
-    'src/tempsubs.js', 'src/themes.js', 'src/url.js', 'src/util.js',
+    'worker.js', 'src/admin.js', 'src/alert.js', 'src/api-catalog.js', 'src/auth.js', 'src/cf-analytics.js',
+    'src/cf-panel.js', 'src/compress.js', 'src/config-ui.js', 'src/config.js', 'src/disguise.js', 'src/dns.js',
+    'src/geoip.js', 'src/inject.js', 'src/media-r2.js', 'src/nodetag.js', 'src/proxy.js', 'src/ratelimit.js',
+    'src/router.js', 'src/runtime.js', 'src/scopes.js', 'src/settings.js', 'src/share.js', 'src/site-modes.js',
+    'src/sites.js', 'src/stats-ui.js', 'src/stats.js', 'src/storage.js', 'src/subs.js', 'src/tempsubs.js',
+    'src/themes.js', 'src/url.js', 'src/util.js',
   ];
 
   // 每条规则：{ 说明, 特征, 允许出现的文件 }
@@ -239,13 +240,22 @@ section('6. 静态扫描（去注释后按文件白名单核对）');
     // 主机形态的 IPv4 正则；CIDR（末尾跟 /24）属于另一件事，不在此列
     { name: 'IPv4 正则', re: /\^\\d\{1,3\}\(\\\.\\d\{1,3\}\)\{3\}\$/, allow: ['src/util.js'] },
     { name: '域名正则', re: /\[a-z0-9\.-\]\*/, allow: ['src/util.js'] },
-    { name: '优选频率默认值 720', re: /\b720\b/, allow: ['src/dns.js'] },
+    // 下面四条的默认值真源已随「运行参数注册表」搬进 src/settings.js：
+    // 各业务模块只从中取用（re-export 或 derive），不再自己写一份数字
+    { name: '优选频率默认值 720', re: /\b720\b/, allow: ['src/settings.js'] },
     { name: '面板里写死频率下限', re: /min="5"|v < 5\b/, allow: [] },
     { name: '候选条数兜底字面量 || 40', re: /\|\|\s*40\b/, allow: [] },
     { name: '轮换间隔兜底字面量 || 60', re: /\|\|\s*60\b/, allow: [] },
     { name: '面板里写死轮换区间', re: /min="1"\s+max="10080"/, allow: [] },
     { name: '统计默认档位兜底字面量 || 7', re: /\|\|\s*7\b/, allow: [] },
     { name: '本地布尔词表', re: /ON_WORDS|OFF_WORDS/, allow: ['src/config.js'] },
+    // 运行参数统一走注册表：业务模块里不许再出现这些环境变量的直读。
+    // 读法只有一种 —— settings.js 的 readSetting / readSettings。
+    {
+      name: '运行参数直读环境变量',
+      re: /env(?:&&)?[^\n]{0,40}\b(SUB_STRICT|SUB_CANDIDATE_LIMIT|SUB_UA|CF_IP_RANGES_URL|CF_IP_RANGES|DOH_URL|DNS_BUDGET_MS|PROXY_HEDGE_MS|STATS_SALT|NODE_COUNTRY_ANYCAST|GEOIP_BATCH_SIZE|GEOIP_BATCH_URL|CF_NETS_URL|GH_ACTIONS_URL|WORKER_SCRIPT|CF_API_BASE|CF_ACCOUNT_ID|ANALYTICS_TTL_MS|PROBE_CONCURRENCY|PROBE_TIMEOUT_MS|MAX_PROBE_LIMIT|MAX_TARGETS|DNS_SETTLE_MS|POOL_LIMIT|DOMAIN_POOL_LIMIT)\b/,
+      allow: ['src/settings.js'],
+    },
   ];
 
   for (const rule of RULES) {
@@ -263,12 +273,15 @@ section('6. 静态扫描（去注释后按文件白名单核对）');
   // 少了这一组，把真源一起删掉就能让规则永远通过。
   const MUST_EXIST = [
     ['IPv4 正则', 'src/util.js', /\(\\\.\\d\{1,3\}\)\{3\}/],
-    ['优选频率默认值', 'src/dns.js', /\b720\b/],
+    ['优选频率默认值', 'src/settings.js', /dns_interval_minutes:[\s\S]{0,120}?default:\s*720\b/],
     ['布尔词表', 'src/config.js', /ON_WORDS|OFF_WORDS/],
-    ['候选条数常量', 'src/subs.js', /CANDIDATE_LIMIT\s*=\s*40\b/],
+    ['候选条数默认值', 'src/settings.js', /candidate_limit:[\s\S]{0,120}?default:\s*40\b/],
     ['轮换间隔默认值', 'src/themes.js', /rotate_interval_minutes:[\s\S]{0,120}?default:\s*60\b/],
     ['统计档位表', 'src/stats.js', /STATS_RANGES\s*=\s*\[/],
     ['统计默认档位 = 档位表首项', 'src/stats.js', /DEFAULT_RANGE_DAYS\s*=\s*STATS_RANGES\[0\]/],
+    // 运行参数注册表本身：字段表在、取值函数在，否则上面那条「别处不许直读」会变成永真
+    ['运行参数表', 'src/settings.js', /export const SETTINGS_SPEC\s*=\s*\{/],
+    ['运行参数读取入口', 'src/settings.js', /export async function readSetting\b/],
   ];
   for (const [name, file, re] of MUST_EXIST) {
     ok(`${name} 在 ${file} 里确实存在（防止检查被删空）`, re.test(codeOnly(file)));

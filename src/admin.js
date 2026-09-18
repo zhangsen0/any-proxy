@@ -6,10 +6,11 @@ import { DEFAULT_SITE_MODES, getSiteModes, saveSiteModes, resolveEngine, siteBad
 import { readR2Config, saveR2Config, R2_CACHE_SPEC, R2_PREFIX } from './media-r2.js';
 import { sweepMediaR2 } from './proxy.js';
 import {
-  autoUpdatePreferredDns, filterUsableIps, applyDnsWithSelfCheck, proxyHost, targetHost,
+  autoUpdatePreferredDns, filterUsableIps, applyDnsWithSelfCheck, resolveProxyHost, targetHost,
   DNS_INTERVAL, POOL_LIMIT, DOMAIN_POOL_LIMIT,
 } from './dns.js';
 import { subscriptionUrl, fetchSubscriptionCandidates, CANDIDATE_LIMIT } from './subs.js';
+import { SETTINGS_SPEC, readSettings, safeSettings, saveSettings, clearSetting, settingsSources, describeGroups } from './settings.js';
 import * as tempsubs from './tempsubs.js';
 import { readConfig, saveConfig, sanitize, isActive, renderHome, listTemplates } from './disguise.js';
 import { VISIT_SCOPES } from './scopes.js';
@@ -51,13 +52,15 @@ function minutesLabel(minutes) {
 
 /**
  * 从请求推导优选所需上下文（目标域名 + 总预算）。
- * 目标域名不再写死：PROXY_HOST 变量优先，否则用当前请求的 hostname。
+ * 目标域名不再写死：面板「优选目标域名」优先，其次 PROXY_HOST 环境变量，否则用当前请求的 hostname。
+ * 预算同样走运行参数（面板可调），默认值只在 settings.js 的 SPEC 里写一次。
  */
 async function dnsContext(request, url, env) {
+  const cfg = await readSettings(env);
   return {
     host: await targetHost(env, url.hostname),
     origin: url.origin,
-    deadlineMs: Date.now() + (Number(env && env.DNS_BUDGET_MS) || 22000),
+    deadlineMs: Date.now() + (cfg.dns_budget_ms || SETTINGS_SPEC.dns_budget_ms.default),
   };
 }
 
@@ -80,17 +83,52 @@ async function handleAdmin(request, url, env) {
     return json({ ok: true });
   }
 
+  // GET / POST /__api/settings -> 统一运行参数（配置中心）
+  //
+  // 这一块是「所有非部署形态的配置都能在页面改」的落点：字段表在 src/settings.js，
+  // 这里只负责读写与脱敏，不写任何字段名 —— 加一个参数只需要在 SPEC 里加一条。
+  // 返回里带 source（panel / env / legacy / default），面板据此说明「这个值现在从哪来」，
+  // 避免出现「我在环境变量里改过，怎么面板不显示」这类来回排查。
+  if (path === '/__api/settings') {
+    if (request.method === 'GET') {
+      const cfg = await readSettings(env);
+      return json({
+        ok: true,
+        config: await safeSettings(env),
+        groups: describeGroups(),
+        sources: await settingsSources(env),
+        effective: { proxy_host: cfg.proxy_host || '', sub_url: cfg.sub_url || '' },
+      });
+    }
+    if (request.method === 'POST') {
+      let body;
+      try { body = await request.json(); } catch { return json({ error: 'invalid json' }, 400); }
+      // 前端把整块表单一次提交：只取 SPEC 里认识的键，多传的字段不写进存储
+      const r = await saveSettings(env, body);
+      if (r && r.error) return json({ error: r.error }, 400);
+      return json({
+        ok: true,
+        config: r.safe,
+        saved: r.saved || [],
+        sources: await settingsSources(env),
+        message: '已保存并生效（无需重新部署）',
+      });
+    }
+  }
+
   // DNS 自动优选更新频率（分钟）：GET 读取（未登录可读）
-  // 默认值与允许区间都取 dns.js 的 DNS_INTERVAL —— 调度器用的是同一份，
-  // 不再在这里另写一个 720 / 5~1440（写两处就会有一天两边对不上）
+  // 默认值与允许区间都取 DNS_INTERVAL —— 调度器用的是同一份，
+  // 不再在这里另写一个 720 / 5~1440（写两处就会有一天两边对不上）；
+  // 值本身存进统一运行参数（历史独立键 DNS_CONFIG 由 settings.js 兜底迁移）
   if (path === '/__api/dns-config') {
     if (request.method === 'GET') {
-      let interval = DNS_INTERVAL.default;
-      try {
-        const c = await runtime.KV.get('DNS_CONFIG');
-        if (c) interval = parseInt(c, 10) || DNS_INTERVAL.default;
-      } catch {}
-      return json({ ok: true, interval_minutes: interval, min: DNS_INTERVAL.min, max: DNS_INTERVAL.max });
+      const cfg = await readSettings(env);
+      return json({
+        ok: true,
+        interval_minutes: cfg.dns_interval_minutes,
+        min: DNS_INTERVAL.min,
+        max: DNS_INTERVAL.max,
+      });
     }
     if (request.method === 'POST') {
       // 登录校验已由 router.js 统一拦截，此处不再重复判断
@@ -104,8 +142,9 @@ async function handleAdmin(request, url, env) {
       if (!interval || interval < DNS_INTERVAL.min || interval > DNS_INTERVAL.max) {
         return json({ error: `更新频率需在 ${DNS_INTERVAL.min} ~ ${DNS_INTERVAL.max} 分钟之间` }, 400);
       }
-      await runtime.KV.put('DNS_CONFIG', String(interval));
-      return json({ ok: true, interval_minutes: interval });
+      const r = await saveSettings(env, { dns_interval_minutes: interval });
+      if (r && r.error) return json({ error: r.error }, 400);
+      return json({ ok: true, interval_minutes: r.values.dns_interval_minutes });
     }
   }
 
@@ -130,13 +169,16 @@ async function handleAdmin(request, url, env) {
   // 解析与条数上限都走 util.js / POOL_LIMIT：面板存进去的必须是运行时认得的，
   // 否则会出现「提示保存成功、池子其实被过滤成空」（旧版校验只验段数，999.999.999.999 也能存）
   if (path === '/__api/preferred-ips') {
+    // 条数上限是运行参数：面板写入的截断与运行时读取的截断必须同一口径（见 check-single-source）
+    const cfg = await readSettings(env);
+    const poolLimit = cfg.pool_limit || POOL_LIMIT;
     if (request.method === 'GET') {
       let ips = [];
       try {
         const add = await runtime.KV.get('PREF_IPS');
-        if (add) ips = parseIpv4List(add, POOL_LIMIT);
+        if (add) ips = parseIpv4List(add, poolLimit);
       } catch {}
-      return json({ ok: true, ips, limit: POOL_LIMIT });
+      return json({ ok: true, ips, limit: poolLimit });
     }
     if (request.method === 'POST') {
       let body;
@@ -145,7 +187,7 @@ async function handleAdmin(request, url, env) {
       } catch {
         return json({ error: 'invalid json' }, 400);
       }
-      const uniq = parseIpv4List(body.ips, POOL_LIMIT);
+      const uniq = parseIpv4List(body.ips, poolLimit);
       if (!uniq.length) return json({ error: '没有有效的 IP（每行一个 IPv4 地址，每段需在 0~255）' }, 400);
       await runtime.KV.put('PREF_IPS', uniq.join('\n'));
       let updated = null;
@@ -165,21 +207,18 @@ async function handleAdmin(request, url, env) {
   }
 
   // GET /__api/preferred-candidates -> 从**订阅链接**拉取节点 IP 作为浏览器优选候选
-  // 来源优先级：面板配置（KV SUB_URL）→ 环境变量 SUB_URL → 自动推导的本机 /sub（token 口径与 edgetunnel 一致）。
+  // 来源优先级：面板「订阅链接」→ 环境变量 SUB_URL → 自动推导的本机 /sub（token 口径与 edgetunnel 一致）。
   // 默认只返回归属边缘网络的 IP：订阅里常混入第三方节点，不筛会让优选池被无用 IP 占满、
-  // 并让「立即更新优选 IP」逐个探测这些不可达地址直到超时。可用 SUB_STRICT=0 关闭筛选。
+  // 并让「立即更新优选 IP」逐个探测这些不可达地址直到超时。过滤开关与条数上限都是运行参数，面板可改。
   if (request.method === 'GET' && path === '/__api/preferred-candidates') {
-    // SUB_STRICT 走 config.js 的 toBool：与面板其它开关同一套词表（原来这里只认 '0'/'false'，
-    // 写 'off'/'no' 会被当成没配，于是「关了筛选却又在生效」）
-    const strict = toBool(env && env.SUB_STRICT, true);
-    const limit = Number(env && env.SUB_CANDIDATE_LIMIT) || CANDIDATE_LIMIT;
+    const cfg = await readSettings(env);
     let res;
     try {
       res = await fetchSubscriptionCandidates(env, {
         origin: url.origin,
-        hostname: proxyHost(env, url.hostname) || url.hostname,
-        limit,
-        strict,
+        hostname: (await resolveProxyHost(env, url.hostname)) || url.hostname,
+        limit: cfg.candidate_limit || CANDIDATE_LIMIT,
+        strict: cfg.sub_strict !== false,
         signal: AbortSignal.timeout(9000),
       });
     } catch (e) {
@@ -194,13 +233,16 @@ async function handleAdmin(request, url, env) {
     });
   }
 
-  // GET / POST /__api/sub-config -> 订阅链接配置（面板可填，存 KV；留空则回退环境变量 SUB_URL）
+  // GET / POST /__api/sub-config -> 订阅链接
+  //
+  // 这一项已经并入统一运行参数（settings.js 的 sub_url），接口保留只为兼容既有页面脚本
+  // 与外部调用方：读写都转发到同一份真源，历史独立 KV 键 SUB_URL 由 settings 兜底读取。
   if (path === '/__api/sub-config') {
     if (request.method === 'GET') {
-      const saved = await runtime.KV.get('SUB_URL').catch(() => null);
+      const cfg = await readSettings(env);
       return json({
         ok: true,
-        sub_url: saved || '',
+        sub_url: cfg.sub_url,
         env: String((env && (env.SUB_URL || env.sub_url)) || ''),
         effective: (await subscriptionUrl(env, url.origin)) || '',
       });
@@ -208,16 +250,20 @@ async function handleAdmin(request, url, env) {
     if (request.method === 'POST') {
       let body;
       try { body = await request.json(); } catch { return json({ error: 'invalid json' }, 400); }
-      const v = String(body.sub_url || '').trim();
-      if (!v) {
-        try { await runtime.KV.delete('SUB_URL'); } catch {}
-        return json({ ok: true, sub_url: '' });
-      }
-      if (!/^https?:\/\//i.test(v) && !v.startsWith('/')) {
+      const v = String(body.sub_url === undefined ? '' : body.sub_url).trim();
+      if (v && !/^https?:\/\//i.test(v) && !v.startsWith('/')) {
         return json({ error: '请填写完整 URL（http(s)://…）或以 / 开头的路径（如 /tsub/xxx）' }, 400);
       }
-      await runtime.KV.put('SUB_URL', v);
-      return json({ ok: true, sub_url: v });
+      // 空串在这里有明确语义 = 清空（回退到本机 /sub）：走 clearSetting，
+      // 而不是把空值塞进 saveSettings（后者是「留空保持不变」的防误删语义）
+      if (v) {
+        const r = await saveSettings(env, { sub_url: v });
+        if (r && r.error) return json({ error: r.error }, 400);
+      } else {
+        const r = await clearSetting(env, 'sub_url');
+        if (r && r.error) return json({ error: r.error }, 400);
+      }
+      return json({ ok: true, sub_url: (await readSettings(env)).sub_url });
     }
   }
 
@@ -393,7 +439,7 @@ async function handleAdmin(request, url, env) {
     }
   }
 
-  // ---- 主题：外观同产菲律宾统一由 src/themes.js 管理 ----
+  // ---- 主题：外观统一由 src/themes.js 管理 ----
   // 列表 + 默认主题（读写都需登录）：actors note 面板上有 10 套预设，也可自定义第 11 套。
   if (path === '/__api/themes') {
     if (request.method === 'GET') return json(await listThemes(env));
@@ -587,19 +633,24 @@ async function handleAdmin(request, url, env) {
 
   // GET /__api/pool-config -> 优选池 & 健康检查配置（GOOD_IPS / 候选域名池 / 上次健康检查时间），需登录
   // POST /__api/pool-config -> 保存候选域名池（PREF_DOMAINS）或写回 GOOD_IPS（healthcheck 自愈结果），需登录
-  // 解析器与条数上限统一来自 util.js / dns.js：面板读到的、运行时用的必须是同一口径
+  // 解析器与条数上限统一来自 util.js / settings.js：面板读到的、运行时用的必须是同一口径
   if (path === '/__api/pool-config') {
+    // 上限是运行参数（面板「配置中心 → 优选与候选」可改）：面板写入的截断长度必须等于
+    // 运行时读取的截断长度，否则人填多了会被静默丢掉 —— 这正是 check-single-source 盯着的那类事故
+    const cfg = await readSettings(env);
+    const poolLimit = cfg.pool_limit || POOL_LIMIT;
+    const domainLimit = cfg.domain_pool_limit || DOMAIN_POOL_LIMIT;
     if (request.method === 'GET') {
       const good = []; let domains = [];
-      try { good.push(...parseIpv4List(await runtime.KV.get('GOOD_IPS'), POOL_LIMIT)); } catch {}
+      try { good.push(...parseIpv4List(await runtime.KV.get('GOOD_IPS'), poolLimit)); } catch {}
       try {
         const d = await runtime.KV.get('PREF_DOMAINS');
         if (d) {
-          domains.push(...parseDomainList(d, DOMAIN_POOL_LIMIT));
+          domains.push(...parseDomainList(d, domainLimit));
         } else {
           // KV 无配置时用环境变量做种子（wrangler.toml / Actions 变量可配），而不是在代码里写死一份域名清单。
           // 都没配就返回空数组并带提示，由面板引导用户填写，保证 fork 后不会出现「改不到却又悄悄生效」的兜底行为。
-          const seed = parseDomainList(env && (env.PREF_DOMAINS || env.pref_domains), DOMAIN_POOL_LIMIT);
+          const seed = parseDomainList(env && (env.PREF_DOMAINS || env.pref_domains), domainLimit);
           domains.push(...seed);
           if (seed.length) {
             try { await runtime.KV.put('PREF_DOMAINS', seed.join('\n')); } catch {}
@@ -608,7 +659,7 @@ async function handleAdmin(request, url, env) {
       } catch {}
       let last = 0;
       try { const l = await runtime.KV.get('HC_LAST_RUN'); if (l) last = parseInt(l, 10) || 0; } catch {}
-      return json({ ok: true, good_ips: good, pref_domains: domains, last_run: last, limits: { ips: POOL_LIMIT, domains: DOMAIN_POOL_LIMIT } });
+      return json({ ok: true, good_ips: good, pref_domains: domains, last_run: last, limits: { ips: poolLimit, domains: domainLimit } });
     }
     if (request.method === 'POST') {
       let body;
@@ -616,13 +667,13 @@ async function handleAdmin(request, url, env) {
       const out = { ok: true };
       // 写回已验证可用集 GOOD_IPS（healthcheck 自愈结果，存后端由 runtime.KV 统一决定）；与 PREF_DOMAINS 可独立更新
       if (body.good_ips !== undefined) {
-        const ips = parseIpv4List(body.good_ips, POOL_LIMIT);
+        const ips = parseIpv4List(body.good_ips, poolLimit);
         if (!ips.length) return json({ error: '没有有效的 IP（每行一个 IPv4 地址，每段需在 0~255）' }, 400);
         await runtime.KV.put('GOOD_IPS', ips.join('\n'));
         out.good_ips = ips;
       }
       if (body.pref_domains !== undefined) {
-        const domains = parseDomainList(body.pref_domains, DOMAIN_POOL_LIMIT);
+        const domains = parseDomainList(body.pref_domains, domainLimit);
         if (!domains.length) return json({ error: '请输入有效域名（每行一个）' }, 400);
         await runtime.KV.put('PREF_DOMAINS', domains.join('\n'));
         out.pref_domains = domains;
@@ -858,7 +909,11 @@ async function adminPage(authed, origin, env) {
   } catch {}
   // 服务端直接渲染站点列表（首屏秒开，不依赖前端 fetch；前端 load() 仅用于增删/操作后刷新）
   // 页面上展示的「优选目标域名」由配置推导，不写死任何域名
-  const pageHost = proxyHost(env, String(origin || '').replace(/^https?:\/\//i, '').split(/[/?#]/)[0].split(':')[0]);
+  const pageHost = await resolveProxyHost(env, String(origin || '').replace(/^https?:\/\//i, '').split(/[/?#]/)[0].split(':')[0]);
+  // 统一运行参数：面板里的运维入口（健康检查按钮）与各处默认值都从这一份取，不再只认环境变量
+  let runCfg = {};
+  try { runCfg = await readSettings(env); } catch {}
+  const ghActionsUrl = String(runCfg.gh_actions_url || '');
   // 首页伪装配置：面板里展示当前状态；口令是否已设置只给出布尔，不把明文带上管理页 HTML
   let dgCfg = null;
   try { dgCfg = await readConfig(env); } catch {}
@@ -1219,7 +1274,7 @@ ${themeScript}
     <textarea id="poolDomains" rows="4" placeholder="www.cloudflare.com&#10;speed.cloudflare.com&#10;time.cloudflare.com" style="font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;"></textarea>
     <div class="row" style="margin-top:8px;">
       <button type="button" id="poolSaveBtn">保存域名池</button>
-      ${env && env.GH_ACTIONS_URL ? `<a class="ghost-link" href="${esc(env.GH_ACTIONS_URL)}" target="_blank" rel="noopener" style="padding:10px 14px;display:inline-block;">手动触发健康检查 →</a>` : ''}
+      ${ghActionsUrl ? `<a class="ghost-link" href="${esc(ghActionsUrl)}" target="_blank" rel="noopener" style="padding:10px 14px;display:inline-block;">手动触发健康检查 →</a>` : ''}
     </div>
     <div class="hint" style="margin-top:6px;">域名池用于健康检查兜底：当优选池不足时，解析这些域名得到当前 CF 泛播 IP 再扫描可用性。保存后即时生效，无需重新部署。</div>
     <div class="msg" id="poolMsg"></div>
@@ -1236,6 +1291,12 @@ ${themeScript}
   </div>
 
   ${authed ? `
+  <div class="card" data-pane="registry">
+    <h2>运行参数</h2>
+    <div class="hint" style="margin:-8px 0 4px;">全站唯一的一份可运营参数表：原先只能靠环境变量改（要重新部署）的取值，现在都在这里改，保存即生效。字段、取值范围与默认值来自 <span class="tag">src/settings.js</span>，界面与操作手册同源生成。</div>
+    ${settingFormById('settings-runtime')}
+  </div>
+
   <div class="card" data-pane="registry">
     <h2>站点模式（注册表）</h2>
     <div class="hint" style="margin:-8px 0 4px;">站点列表徽标与编辑弹窗的类型选项都来自这里。内置 normal / media / ai 三种不可删除、引擎不可修改；可自定义模式（自定义标签 / 徽标 / 说明 + 三选一执行引擎），自定义模式的站点按所选引擎执行，新增模式无需改代码。列表支持新增 / 查看 / 编辑 / 删除（仅自定义）。</div>

@@ -3,8 +3,22 @@ import { CROSS_PREFIX, mapAbsoluteUrl, rewriteContent, contentKind, isHlsManifes
 import { injectLinkFix, buildDocWritePage, rewriteLocations } from './inject.js';
 import { finalizeResponse } from './compress.js';
 import { readR2Config, R2_PREFIX } from './media-r2.js';
+import { readSetting } from './settings.js';
 
 // 反向代理核心：请求转发、响应重写、WebSocket 透传
+
+/**
+ * 转发竞速的对冲阈值（毫秒）：运行参数优先，环境变量作种子，默认 0 = 关闭。
+ * 读失败就按 0 走 —— 对冲只是长尾优化，不该因为一次配置读取抖动把转发链路带崩。
+ */
+async function readHedgeMs(env) {
+  try {
+    const v = Number(await readSetting(env, 'proxy_hedge_ms'));
+    return Number.isFinite(v) && v > 0 ? v : 0;
+  } catch {
+    return 0;
+  }
+}
 
 /**
  * HTML 重写结果缓存（通用，作用于任何站点）。
@@ -413,13 +427,14 @@ async function proxyRequest(request, site, crossHost, ctx, env) {
     }
   }
 
-  // 上游取一次。对冲阈值由环境变量给出，未配置即 0（关闭），默认行为与原先一致；
+  // 上游取一次。对冲阈值是运行参数（面板「配置中心 → 代理与转发」可改，环境变量作种子），
+  // 未配置即 0（关闭），默认行为与原先一致；
   // 突发 handful 场景下把隔 1200ms 的慢请求重发一次，能明显削掉长尾。
   //
   // 带 Range 的请求（视频/大文件分片）一律不对冲、不重试：分片本来就慢，必然触发对冲，
   // 于是每个分片都下两遍 —— 流量翻倍、带宽被自己吃掉、反而更慢，最后还是播不了。
   const wantsRange = request.headers.has('range') || request.headers.has('if-range');
-  const hedgeMs = wantsRange ? 0 : (Number(env && (env.PROXY_HEDGE_MS || env.proxy_hedge_ms)) || 0);
+  const hedgeMs = wantsRange ? 0 : await readHedgeMs(env);
   let upstream = await fetchUpstream(targetUrl, reqInit, hedgeMs, { noRetry: wantsRange });
 
   /**

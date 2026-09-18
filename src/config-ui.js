@@ -105,8 +105,32 @@ function fieldHtml(param, spec, uid) {
   </div>`;
 }
 
-function gridHtml(list, spec, uid) {
-  return `<div class="cfg-grid">${list.map(p => fieldHtml(p, spec, uid)).join('')}</div>`;
+/**
+ * 字段栅格。
+ * 字段可以带 `section`（分组名）：同一张表单里的字段按 section 切块，中间插一行小标题。
+ * 这是通用能力而不是给某一块配置开的后门 —— 任何参数表只要声明 section 就会自动分段，
+ * 不需要在界面层再写一套「大卡片套小卡片」的专用结构。
+ */
+function gridHtml(list, spec, uid, opts = {}) {
+  if (!opts.sections) return `<div class="cfg-grid">${list.map(p => fieldHtml(p, spec, uid)).join('')}</div>`;
+  const parts = [];
+  let current = null;
+  let bucket = [];
+  const flush = () => {
+    if (bucket.length) parts.push(`<div class="cfg-grid">${bucket.map(p => fieldHtml(p, spec, uid)).join('')}</div>`);
+    bucket = [];
+  };
+  for (const p of list) {
+    const section = p.section || '';
+    if (section !== current) {
+      flush();
+      current = section;
+      if (section) parts.push(`<div class="cfg-section">${esc(section)}</div>`);
+    }
+    bucket.push(p);
+  }
+  flush();
+  return parts.join('');
 }
 
 // ===================== 设置块 / 工具项 =====================
@@ -121,14 +145,16 @@ export function renderSettingForm(item, opts = {}) {
   const uid = opts.uid || item.id;
   const basic = params.filter(p => p.level !== 'advanced');
   const advanced = params.filter(p => p.level === 'advanced');
+  // 字段声明了 section 就分段渲染（分组小标题），没声明则维持一片平铺
+  const sectioned = params.some(p => p.section);
   return `<div class="cfg-set" data-setting data-uid="${esc(uid)}" data-path="${esc(item.path)}" data-method="${esc(writeMethodOf(item))}"${item.normalize ? ` data-normalize="${esc(item.normalize)}"` : ''}>
     <div class="cfg-set-head">
       <b>${esc(item.name)}</b>
       <span class="cfg-state" data-state></span>
     </div>
     ${item.desc ? `<div class="cfg-desc">${esc(item.desc)}</div>` : ''}
-    ${basic.length ? gridHtml(basic, item.spec, uid) : ''}
-    ${advanced.length ? `<details class="cfg-more"><summary>进阶选项（${advanced.length} 项，通常不用改）</summary>${gridHtml(advanced, item.spec, uid)}</details>` : ''}
+    ${basic.length ? gridHtml(basic, item.spec, uid, { sections: sectioned }) : ''}
+    ${advanced.length ? `<details class="cfg-more"><summary>进阶选项（${advanced.length} 项，通常不用改）</summary>${gridHtml(advanced, item.spec, uid, { sections: sectioned })}</details>` : ''}
     <div class="row cfg-actions">
       <button type="button" class="mini" data-act="save" disabled>保存</button>
       <button type="button" class="mini" data-act="revert" disabled>还原</button>
@@ -449,6 +475,10 @@ const CONFIG_CSS = `
   .cfg-field textarea { font-family:var(--font-mono); font-size:12px; line-height:1.7; resize:vertical; }
   .cfg-field [data-dirty] { border-color:var(--accent); }
   .cfg-hint { font-size:11px; color:var(--muted); line-height:1.7; margin:5px 0 0; }
+  /* 分段小标题：一张表单里字段较多时按语义切块，避免 30 个字段平铺成一片。
+     左侧竖线来自主题的 --line，跟随主题换肤，不另立一套颜色 */
+  .cfg-section { font-size:12px; font-weight:600; color:var(--txt); margin:var(--sp-3) 0 0; padding-left:8px; border-left:2px solid var(--accent); line-height:1.6; }
+  .cfg-section + .cfg-grid { margin-top:var(--sp-2); }
   .cfg-num { position:relative; display:block; }
   .cfg-num em { position:absolute; right:11px; top:50%; transform:translateY(-50%); font-style:normal; font-size:11px; color:var(--muted); pointer-events:none; }
   /* 右侧要让出「单位」后缀的位置；选择器比全站那条更具体，不必用 !important */

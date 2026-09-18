@@ -34,6 +34,7 @@ import { STATS_SPEC } from './stats.js';
 import { RATELIMIT_SPEC } from './ratelimit.js';
 import { ALERT_SPEC, ALERT_FORMATS, ALERT_EVENT_IDS } from './alert.js';
 import { SHARE_SPEC } from './share.js';
+import { SETTINGS_SPEC, panelSpec, panelParams } from './settings.js';
 
 /** 选项卡 id -> 显示名。跳转行与手册按它出文案，避免多处各写一遍中文 */
 export const TAB_LABELS = {
@@ -231,6 +232,17 @@ export const API_CATALOG = [
     tab: 'registry',
     items: [
       {
+        id: 'settings-runtime',
+        name: '运行参数',
+        kind: 'setting',
+        method: 'GET', path: '/__api/settings', writeMethod: 'POST',
+        desc: '全部「非部署形态」的可运营参数：字段表在 src/settings.js 一处声明，界面与文档都由它生成。'
+          + '三处取值优先级为「面板配置 → 环境变量种子 → 规范默认值」，保存后立即生效、无需重新部署。'
+          + '不在这里的只有部署形态项（存储后端与绑定、进站口令、代理引擎密钥）——它们必须与 wrangler.toml 一起改。',
+        spec: panelSpec(),
+        params: panelParams(),
+      },
+      {
         id: 'site-modes', name: '站点模式注册表', kind: 'setting', method: 'GET', path: '/__api/site-modes', writeMethod: 'POST',
         desc: '站点类型标签 / 徽标 / 说明 / 执行引擎（KV 可编辑，未配置用默认；内置 normal/media/ai 不可删、引擎不可改，自定义模式可增删改）', auth: true,
       },
@@ -252,7 +264,10 @@ export const API_CATALOG = [
       },
       {
         id: 'sub-config', name: '订阅链接', kind: 'setting', method: 'GET', path: '/__api/sub-config', writeMethod: 'POST',
-        desc: '浏览器优选从这里拉候选 IP；留空则用本机 /sub', auth: true,
+        desc: '浏览器优选从这里拉候选 IP；留空则用本机 /sub。（值与校验来自统一运行参数表，编辑入口就在本页，只此一处）',
+        auth: true,
+        spec: { sub_url: SETTINGS_SPEC.sub_url },
+        params: [{ key: 'sub_url', label: '订阅链接', wide: true }],
       },
       {
         id: 'node-tag', name: '节点国家标注', kind: 'setting', method: 'GET', path: '/__api/node-tag', writeMethod: 'POST',

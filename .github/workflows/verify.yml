@@ -87,6 +87,12 @@ jobs:
       # 优选频率两处各写一份、布尔词表两套词汇。
       - name: 配置单一真源校验
         run: node tools/check-single-source.mjs
+      # 运行参数注册表：防的是「参数只在环境变量里能改」——面板上根本没有入口，
+      # 用户以为改不到、只能重部署。这里端到端真跑一遍：渲染出的表单能改、保存后
+      # 立即生效（无需重部署）、密钥回显脱敏、清空能回到默认。已真实发生过：
+      # SUB_STRICT / PROXY_HEDGE_MS / CF_API_TOKEN 等 20+ 项此前只能靠环境变量。
+      - name: 运行参数统一配置校验
+        run: node tools/check-settings.mjs
       # 操作手册的速查表由目录生成。手抄的字段名与默认值必然过期，这里卡住不同步
       - name: 操作手册与代码同步校验
         run: node tools/gen-manual.mjs

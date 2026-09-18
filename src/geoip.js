@@ -10,14 +10,16 @@
 //
 // 失败的代价被刻意压到最低：拿不到国家就原样返回，绝不让订阅拉不出来。
 
-import { runtime } from './runtime.js';
+import { runtime, onConfigChange } from './runtime.js';
 import { toBool } from './config.js';
 import { isIpv4 } from './util.js';
+import { SETTINGS_SPEC, readSettings } from './settings.js';
 
 // 默认数据源：HTTPS、免密钥、单次 POST 支持 100 个 IP，数据来自 MaxMind GeoLite2。
-// 任何接受 JSON 数组并返回国家代码的批量端点都能替换，见 GEOIP_BATCH_URL。
-const DEFAULT_BATCH_URL = 'https://api.country.is/';
-const DEFAULT_BATCH_SIZE = 100;
+// 任何接受 JSON 数组并返回国家代码的批量端点都能替换 —— 默认值登记在 settings.js 的 SPEC，
+// 面板「配置中心 → 边缘段与外部数据源」可改，改完下一个订阅请求即生效。
+const DEFAULT_BATCH_URL = SETTINGS_SPEC.geoip_batch_url.default;
+const DEFAULT_BATCH_SIZE = SETTINGS_SPEC.geoip_batch_size.default;
 const KEY_PREFIX = 'geoip:';
 const NEGATIVE = '-';
 const EMPTY = '';
@@ -30,7 +32,7 @@ const EMPTY = '';
 //
 // 官方段列表由 CDN 厂商自己公开维护，一次拉取后长期缓存；
 // 之后每个 IP 的判定是纯内存的整数区间比较，零外部请求。
-const CF_NETS_URL = 'https://www.cloudflare.com/ips-v4';
+const CF_NETS_URL = SETTINGS_SPEC.cf_nets_url.default;
 const CF_NETS_KEY = KEY_PREFIX + 'cfnets';
 // 任播伪代号：故意用连字符，保证永远不会和任何 ISO 3166-1 alpha-2 撞车。
 // 不能用 'CF' —— 那是中非共和国的真实国家代码。
@@ -89,12 +91,28 @@ export function isCfIp(ip, nets) {
   return false;
 }
 
-/** 任播兜底的开关。默认开启，环境变量显式写否才关。 */
-export function anycastEnabled(env) {
-  return toggle(env && (env.NODE_COUNTRY_ANYCAST || env.node_country_anycast), true);
+/**
+ * 任播兜底的开关。默认开启，运行参数（面板）/环境变量显式写否才关。
+ * 取值统一走 settings.js —— 原先只认环境变量，改一次要重新部署。
+ */
+export async function anycastEnabled(env) {
+  const cfg = await readGeoipSettings(env);
+  return toggle(cfg.node_country_anycast, true);
+}
+
+/** 本模块用到的运行参数：读一次复用，避免国家查询链路里重复读存储 */
+async function readGeoipSettings(env) {
+  try {
+    return await readSettings(env);
+  } catch {
+    return {};
+  }
 }
 
 let cfNets = null;
+// 官方段是进程内快照，配置一改（换数据源 / 关掉兜底）必须丢掉，否则「保存了却还是老行为」
+onConfigChange(() => { cfNets = null; });
+
 /**
  * 取 Cloudflare 官方 IPv4 段。KV 缓存优先，拉不到就用上一次的结果；
  * 什么都拿不到时返回空数组——退化为「不做任播兜底」，节点照旧输出。
@@ -107,9 +125,10 @@ export async function loadCfNets(env, ctx) {
     const nets = parse(cached);
     if (nets.length) { cfNets = nets; return nets; }
   } catch { /* 读缓存失败不致命，继续走网络 */ }
-  if (!anycastEnabled(env)) { cfNets = []; return cfNets; }
+  if (!(await anycastEnabled(env))) { cfNets = []; return cfNets; }
+  const cfg = await readGeoipSettings(env);
   try {
-    const r = await fetch(String((env && (env.CF_NETS_URL || env.cf_nets_url)) || CF_NETS_URL).trim(), {
+    const r = await fetch(String(cfg.cf_nets_url || CF_NETS_URL).trim(), {
       headers: { Accept: 'text/plain' },
       signal: AbortSignal.timeout(5000),
     });
@@ -193,8 +212,10 @@ export async function saveTagSettings(patch = {}) {
   return await readTagSettings(patch.env);
 }
 
-function batchSize(env) {
-  const n = Number(env && (env.GEOIP_BATCH_SIZE || env.geoip_batch_size));
+/** 单次批量查询的条数上限：运行参数（面板）优先，环境变量作种子，默认值在 SPEC 里 */
+async function batchSize(env) {
+  const cfg = await readGeoipSettings(env);
+  const n = Number(cfg.geoip_batch_size);
   return Number.isInteger(n) && n > 0 ? Math.min(n, DEFAULT_BATCH_SIZE) : DEFAULT_BATCH_SIZE;
 }
 
@@ -214,7 +235,8 @@ function writeThrough(ip, cc, ctx) {
 
 /** 一次批量询问。返回 [{ip, cc}]，拿不到就抛出交给调用方降级。 */
 async function queryBatch(batch, env, opts) {
-  const url = String((env && (env.GEOIP_BATCH_URL || env.geoip_batch_url)) || DEFAULT_BATCH_URL).trim();
+  const cfg = await readGeoipSettings(env);
+  const url = String(cfg.geoip_batch_url || DEFAULT_BATCH_URL).trim();
   if (!url) return [];
   const r = await fetch(url, {
     method: 'POST',
@@ -270,8 +292,8 @@ export async function lookupCountries(ips, opts = {}) {
   if (!missing.length) return out;
 
   // 2) 未命中的分批问。任一批失败只影响这一批，其余照常返回。
-  const size = batchSize(env);
-  const useAnycast = anycastEnabled(env);
+  const size = await batchSize(env);
+  const useAnycast = await anycastEnabled(env);
   for (const batch of chunks(missing, size)) {
     if (opts.deadline && Date.now() > opts.deadline) break;
     try {

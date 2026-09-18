@@ -12,6 +12,7 @@
 
 import { runtime } from './runtime.js';
 import { readSection, writeSection } from './config.js';
+import { readSetting } from './settings.js';
 import { isAdminScope } from './scopes.js';
 
 const SECTION = 'stats';
@@ -302,8 +303,12 @@ async function prune(env, cfg) {
 
 /** 安装级盐值：只生成一次，用于在不知道原始 IP 的前提下区分不同来访者 */
 async function getSalt(env) {
-  const fromEnv = String((env && (env.STATS_SALT || env.stats_salt)) || '').trim();
-  if (fromEnv) return fromEnv;
+  // 面板「配置中心 → 运维与隐私」可显式指定；未指定时用历史键里已生成的，
+  // 都没有才生成一个新的 —— 生成后落盘，保证同一个安装的哈希口径长期稳定
+  try {
+    const fromPanel = String((await readSetting(env, 'stats_salt')) || '').trim();
+    if (fromPanel) return fromPanel;
+  } catch { /* 读配置失败就退回历史键，不让一次存储抖动把统计打停 */ }
   try {
     const saved = await runtime.KV.get(SALT_KEY);
     if (saved) return saved;

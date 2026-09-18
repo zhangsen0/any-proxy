@@ -12,7 +12,7 @@
 // 用法：每个功能模块自己声明一份 SCHEMA（放在模块内，读代码时一眼能看到），
 // 再调用 readSection / writeSection 读写。
 
-import { runtime } from './runtime.js';
+import { runtime, notifyConfigChange } from './runtime.js';
 
 /** 整份配置的存储键。集中在一个键里：每个请求最多读一次存储，而不是每个功能各读一次。 */
 const CONFIG_KEY = 'APP_CONFIG';
@@ -26,6 +26,10 @@ const CONFIG_KEY = 'APP_CONFIG';
  * 才看到新值。所以改完开关后短时间内可能新旧取值并存（最长 CACHE_TTL_MS），
  * 这是拿一点收敛延迟换掉「每个请求一次存储往返」的自觉取舍 —— 需要更快的收敛
  * 就调小这个值，别在业务代码里绕开它。
+ *
+ * 为什么这个值**不进面板**：它是这份配置自己读写的复用窗口，若再由这份配置决定，
+ * 就成了「用配置去改读配置的窗口」的自指。它属于 AGENTS 第 0 节允许的
+ * 「代码级具名常量」——只有这一处定义，不存在两份口径。
  */
 const CACHE_TTL_MS = 3000;
 
@@ -154,6 +158,36 @@ function invalidateDoc() {
   cachedTs = 0;
 }
 
+/**
+ * 只取「确实存在存储里」的原始分区，不叠加环境变量与默认值。
+ *
+ * 为什么需要它：判断某个字段「用户到底有没有显式配过」不能靠比较最终值 ——
+ * 用户把值显式改成与默认值相同，最终值看起来和「没配」一模一样。
+ * 历史遗留键（早期的独立 KV 键）迁移就靠这个区分：只有真没配过才去看遗留键，
+ * 否则会出现「面板显示新值、生效的是遗留旧值」。
+ */
+export async function readStoredSection(env, section) {
+  const doc = await readDoc(env);
+  const stored = doc[section];
+  return stored && typeof stored === 'object' && !Array.isArray(stored) ? { ...stored } : {};
+}
+
+/** 环境变量是否给了值（含大小写两种写法）。同样用于「有没有显式配过」的判断。 */
+export function readEnvValue(env, name) {
+  return envValue(env, name);
+}
+
+/**
+ * 取整份配置文档（含所有分区）的可写副本。
+ *
+ * 只给「删除某个字段」这类需要动原始结构的操作用 —— 常规读写请走 readSection / writeSection，
+ * 它们才会做归一化与脱敏。这里刻意不导出到业务模块之外。
+ */
+export async function readRawDoc(env) {
+  const doc = await readDoc(env);
+  return JSON.parse(JSON.stringify(doc || {}));
+}
+
 // ===================== 分区 API =====================
 
 /**
@@ -208,6 +242,9 @@ export async function writeSection(env, section, spec, patch) {
   doc[section] = next;
   await runtime.KV.put(CONFIG_KEY, JSON.stringify(doc));
   invalidateDoc();
+  // 广播给各模块清掉自己的进程内快照（geoip 的段表、CF 用量的缓存等），
+  // 让「面板保存」在下一个请求就生效，而不是等各模块自己的 TTL 过期
+  notifyConfigChange(section);
   const values = await readSection(env, section, spec);
   return { values, safe: sanitize(spec, values) };
 }
