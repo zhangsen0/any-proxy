@@ -6,6 +6,7 @@
  * 用法：node tools/check-rewrite.mjs
  */
 import { rewriteContent, mapAbsoluteUrl, isSchemeRelative } from '../src/url.js';
+import { injectHomeButton } from '../src/inject.js';
 
 const site = { id: 'demo', host: 'demo.com', scheme: 'https', target: 'https://demo.com' };
 const P = '/p/demo';
@@ -97,6 +98,82 @@ t('CSS 注释不被改写', () => {
 t('无 URL 内容原样返回（快速通道）', () => {
   const src = 'body{color:#fff}';
   return rewriteContent(src, site, P, base, 'css') === src ? null : 'fast path';
+});
+
+// ---- 「返回主页」按钮：塞进 HTML 还不够，面板是 SPA，一重绘就把按钮抹掉 ----
+// 真人反馈过「按钮没了」，而此前没有任何一条检查覆盖它。这里不但验注入结果，
+// 还把附带的保活脚本抠出来在最小 DOM 桩上真跑一遍：按钮被移除后必须能自己补回来。
+const BTN = 'ap-home-btn';
+const withHeader = '<html><body><div class="header-buttons"><a href="/x">x</a></div></body></html>';
+const plainBody = '<html><body><p>panel</p></body></html>';
+const noBody = '<html><p>fragment</p></html>';
+
+t('返回主页按钮：有顶部导航时注入到导航里', () => {
+  const out = injectHomeButton(withHeader);
+  return ok(out.includes(BTN) && /<div class="header-buttons"><a id="ap-home-btn"/.test(out), 'nav inject', out.slice(0, 120));
+});
+t('返回主页按钮：无导航时退回 body 末尾悬浮', () => {
+  const out = injectHomeButton(plainBody);
+  return ok(out.includes(BTN) && out.includes('position:fixed'), 'fixed inject');
+});
+t('返回主页按钮：连 body 标签都没有也要注入', () => {
+  return ok(injectHomeButton(noBody).includes(BTN), 'fragment inject');
+});
+t('返回主页按钮：三种形态都附带保活脚本', () => {
+  const miss = [withHeader, plainBody, noBody].filter((h) => !/ap-home-btn[\s\S]*<script>/.test(injectHomeButton(h)));
+  return ok(!miss.length, 'keepalive script');
+});
+
+// 把保活脚本抠出来，在最小 DOM 桩上真跑
+function runKeepAlive(html, hasHeader) {
+  const m = html.match(/<script>\s*\(function\(\)\{[\s\S]*?\}\)\(\);\s*<\/script>/);
+  if (!m) return null;
+  const code = m[0].replace(/^<script>/, '').replace(/<\/script>$/, '');
+  const nodes = new Map();
+  let inserts = 0;
+  let cb = null;
+  function MO(fn) { cb = fn; }
+  MO.prototype.observe = function () {};
+  const header = { firstChild: null, insertBefore(el) { nodes.set(el.id, el); inserts++; } };
+  const body = { appendChild(el) { nodes.set(el.id, el); inserts++; } };
+  const doc = {
+    getElementById: (id) => nodes.get(id) || null,
+    querySelector: (sel) => (sel === '.header-buttons' && hasHeader ? header : null),
+    createElement: () => ({ id: '', href: '', textContent: '', style: {}, setAttribute() {} }),
+    body,
+    documentElement: {},
+  };
+  const win = { MutationObserver: MO, addEventListener() {} };
+  // eslint-disable-next-line no-new-func
+  new Function('window', 'document', code)(win, doc);
+  return { nodes, cb, inserts: () => inserts };
+}
+
+t('返回主页按钮：保活脚本初次就能把按钮挂上', () => {
+  const r = runKeepAlive(injectHomeButton(plainBody), false);
+  return ok(r && r.nodes.has(BTN), 'initial mount');
+});
+t('返回主页按钮：被 SPA 重绘抹掉后能补回来', () => {
+  const r = runKeepAlive(injectHomeButton(plainBody), false);
+  if (!r) return 'no script';
+  r.nodes.clear(); // 模拟整块 DOM 被重绘替换
+  if (typeof r.cb !== 'function') return 'observer 未注册';
+  r.cb();
+  return ok(r.nodes.has(BTN), 'remount after repaint');
+});
+t('返回主页按钮：补回时仍然回到顶部导航（有导航就不悬浮）', () => {
+  const r = runKeepAlive(injectHomeButton(withHeader), true);
+  if (!r) return 'no script';
+  r.nodes.clear();
+  r.cb();
+  return ok(r.nodes.has(BTN), 'remount into nav');
+});
+t('返回主页按钮：保活是幂等的（按钮在就不重复插入）', () => {
+  const r = runKeepAlive(injectHomeButton(plainBody), false);
+  if (!r) return 'no script';
+  const before = r.inserts();
+  r.cb(); r.cb(); r.cb();
+  return ok(r.inserts() === before, 'idempotent', `${before} -> ${r.inserts()}`);
 });
 
 let failed = 0;

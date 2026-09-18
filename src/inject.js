@@ -2,21 +2,65 @@ import { CROSS_PREFIX, hostOf, SCHEME_RELATIVE_RE } from './url.js';
 
 // 注入到被代理页面 / edgetunnel 面板的 HTML 片段（返回主页按钮、前端 URL 映射脚本）
 
+// 按钮的样子只定义一次：HTML 版注入与保活脚本运行时创建的节点共用这两条样式，
+// 免得「一开始的按钮」和「重绘后补回来的按钮」长得不一样。
+const HOME_BTN_ID = 'ap-home-btn';
+const HOME_BTN_TEXT = '← 返回主页';
+const HOME_BTN_FONT = "font-family:system-ui,-apple-system,'PingFang SC','Microsoft YaHei',sans-serif";
+const HOME_BTN_INLINE_CSS = 'display:inline-flex;align-items:center;background:rgba(15,23,42,.9);color:#fff;'
+  + 'border:1px solid rgba(255,255,255,.28);border-radius:8px;padding:8px 16px;font-size:13px;'
+  + 'text-decoration:none;margin-right:8px;box-shadow:0 2px 8px rgba(0,0,0,.3);white-space:nowrap;' + HOME_BTN_FONT;
+const HOME_BTN_FIXED_CSS = 'position:fixed;left:14px;bottom:14px;z-index:2147483000;background:rgba(15,23,42,.88);color:#fff;'
+  + 'border:1px solid rgba(255,255,255,.28);border-radius:999px;padding:8px 16px;font-size:13px;'
+  + 'text-decoration:none;box-shadow:0 2px 10px rgba(0,0,0,.35);backdrop-filter:blur(6px);' + HOME_BTN_FONT;
+
 /**
  * 为 edgetunnel 管理面板 / 登录页注入「返回主页」入口，方便回到统一入口。
- * 优先注入到面板顶部导航（header-buttons），避免被页面 JS 重绘移除；登录页无导航则退回 body 末尾。
+ * 优先注入到面板顶部导航（header-buttons），登录页无导航则退回 body 末尾悬浮。
+ *
+ * 光把 <a> 塞进 HTML 是不够的：面板是 SPA，它一重绘 DOM 就把按钮抹掉（表现就是
+ * 「刚进去还在、切一下就没了」）。所以每次注入都附带一段保活脚本 —— 按钮不在就补回来，
+ * 并用 MutationObserver 盯住后续重绘。这段逻辑自己也要幂等：按钮在就不动，否则会陷入循环。
  */
 function injectHomeButton(html) {
   if (!html) return html;
-  const btn = `<a href="/" onclick="location.href='/';return false;" style="display:inline-flex;align-items:center;background:rgba(15,23,42,.9);color:#fff;border:1px solid rgba(255,255,255,.28);border-radius:8px;padding:8px 16px;font-size:13px;text-decoration:none;font-family:system-ui,-apple-system,'PingFang SC','Microsoft YaHei',sans-serif;margin-right:8px;box-shadow:0 2px 8px rgba(0,0,0,.3);white-space:nowrap;">← 返回主页</a>\n`;
+  const btn = `<a id="${HOME_BTN_ID}" href="/" onclick="location.href='/';return false;" style="${HOME_BTN_INLINE_CSS}">${HOME_BTN_TEXT}</a>\n`;
+  const fixed = `<a id="${HOME_BTN_ID}" href="/" onclick="location.href='/';return false;" style="${HOME_BTN_FIXED_CSS}">${HOME_BTN_TEXT}</a>\n`;
+  const keepAlive = `<script>
+(function(){
+  var ID=${JSON.stringify(HOME_BTN_ID)}, T=${JSON.stringify(HOME_BTN_TEXT)};
+  var INLINE=${JSON.stringify(HOME_BTN_INLINE_CSS)}, FIXED=${JSON.stringify(HOME_BTN_FIXED_CSS)};
+  function mk(){
+    var a=document.createElement('a');
+    a.id=ID; a.href='/'; a.textContent=T;
+    try{ a.setAttribute('style', INLINE); }catch(e){}
+    a.onclick=function(){ location.href='/'; return false; };
+    return a;
+  }
+  function ensure(){
+    try{
+      if(document.getElementById(ID)) return;
+      var a=mk();
+      var host=document.querySelector('.header-buttons');
+      if(host && host.insertBefore){ host.insertBefore(a, host.firstChild||null); return; }
+      if(!host){ try{ a.setAttribute('style', FIXED); }catch(e){} }
+      if(document.body) document.body.appendChild(a);
+    }catch(e){}
+  }
+  ensure();
+  var MO=(window.MutationObserver||window.WebKitMutationObserver);
+  if(MO&&document.documentElement){ try{ new MO(ensure).observe(document.documentElement,{childList:true,subtree:true}); }catch(e){} }
+  if(window.addEventListener){ window.addEventListener('load', ensure); window.addEventListener('DOMContentLoaded', ensure); }
+})();
+<\/script>`;
+  const withKeepAlive = (s) => (/<\/body>/i.test(s) ? s.replace(/<\/body>/i, keepAlive + '\n</body>') : s + keepAlive);
   if (/<div class="header-buttons">/i.test(html)) {
-    return html.replace(/<div class="header-buttons">/i, '<div class="header-buttons">' + btn);
+    return withKeepAlive(html.replace(/<div class="header-buttons">/i, '<div class="header-buttons">' + btn));
   }
   if (/<\/body>/i.test(html)) {
-    const fixed = `<a href="/" onclick="location.href='/';return false;" style="position:fixed;left:14px;bottom:14px;z-index:2147483000;background:rgba(15,23,42,.88);color:#fff;border:1px solid rgba(255,255,255,.28);border-radius:999px;padding:8px 16px;font-size:13px;text-decoration:none;font-family:system-ui,-apple-system,'PingFang SC','Microsoft YaHei',sans-serif;box-shadow:0 2px 10px rgba(0,0,0,.35);backdrop-filter:blur(6px);">← 返回主页</a>\n`;
-    return html.replace(/<\/body>/i, fixed + '</body>');
+    return withKeepAlive(html.replace(/<\/body>/i, fixed + '</body>'));
   }
-  return html + btn;
+  return withKeepAlive(html + fixed);
 }
 
 /**
