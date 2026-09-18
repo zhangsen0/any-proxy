@@ -191,8 +191,12 @@ export async function writeSection(env, section, spec, patch) {
   const next = { ...cur };
   const forValidation = {};
   for (const [key, field] of Object.entries(spec)) {
+    // 「留空保持不变」：未传 / 空值（null、空字符串）一律不覆盖原值，只有显式有效值才写入。
+    // 例外：字段声明 allowEmpty 时，空字符串是它的合法取值（如告警 events 空 = 订阅全部）
     if (!(key in (patch || {}))) continue;
     const raw = patch[key];
+    if (raw === undefined || raw === null) continue;
+    if (String(raw).trim() === '' && !field.allowEmpty) continue;
     let value = coerceField(field, raw);
     if (field.validate) {
       const err = field.validate(value);

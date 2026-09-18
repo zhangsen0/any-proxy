@@ -41,7 +41,8 @@ const SPEC = {
   max_per_hour: { type: 'int', default: 20, min: 1, max: 1000, env: 'ALERT_MAX_PER_HOUR' },
   timeout_ms: { type: 'int', default: 4000, min: 500, max: 25000, env: 'ALERT_TIMEOUT_MS' },
   // 订阅哪些事件：留空 = 全部订阅（默认行为最省心，也便于首次部署直接生效）
-  events: { type: 'str', default: '', maxLen: 1000, env: 'ALERT_EVENTS' },
+  // allowEmpty：空字符串是合法取值（清空 = 订阅全部），不受「留空保持不变」影响
+  events: { type: 'str', default: '', maxLen: 1000, env: 'ALERT_EVENTS', allowEmpty: true },
 };
 
 // ===================== 进程内节流 =====================

@@ -332,49 +332,48 @@ async function handleAdmin(request, url, env) {
       let body;
       try { body = await request.json(); } catch { return json({ error: 'invalid json' }, 400); }
       const patch = {};
-      if (body.uuid !== undefined) {
+      // 「留空保持不变」：下面每个字段只在「有值」时才处理，空字符串/未传一律跳过
+      if (body.uuid !== undefined && String(body.uuid).trim() !== '') {
         const v = String(body.uuid).trim();
         if (!/^[0-9a-fA-F-]{32,}$/.test(v.replace(/-/g, ''))) return json({ error: 'UUID 格式不正确（应为 32 位十六进制）' }, 400);
         patch.UUID = v;
       }
-      if (body.host !== undefined) {
+      if (body.host !== undefined && String(body.host).trim() !== '') {
         const v = String(body.host).trim();
-        if (!v) return json({ error: '节点地址不能为空' }, 400);
         patch.HOST = v;
       }
-      if (body.path !== undefined) {
+      if (body.path !== undefined && String(body.path).trim() !== '') {
         const v = String(body.path).trim();
         if (!v.startsWith('/')) return json({ error: '节点路径必须以 / 开头' }, 400);
         patch.PATH = v;
       }
-      if (body.protocol !== undefined) {
+      if (body.protocol !== undefined && String(body.protocol).trim() !== '') {
         const v = String(body.protocol).trim();
         if (!['vless', 'trojan', 'ss'].includes(v)) return json({ error: '协议类型仅支持 vless / trojan / ss' }, 400);
         patch['协议类型'] = v;
       }
-      if (body.transport !== undefined) {
+      if (body.transport !== undefined && String(body.transport).trim() !== '') {
         const v = String(body.transport).trim();
         if (!['ws', 'grpc'].includes(v)) return json({ error: '传输协议仅支持 ws / grpc' }, 400);
         patch['传输协议'] = v;
       }
-      if (body.fingerprint !== undefined) {
+      if (body.fingerprint !== undefined && String(body.fingerprint).trim() !== '') {
         const v = String(body.fingerprint).trim();
-        if (v) patch.Fingerprint = v;
+        patch.Fingerprint = v;
       }
       // 订阅生成区（嵌套对象整体合并，保留兄弟字段如 local / 本地IP库 / SUB）
       const cur = await readConfig(env);
       const sg = { ...(cur['优选订阅生成'] || {}) };
-      if (body.sub_name !== undefined) {
+      if (body.sub_name !== undefined && String(body.sub_name).trim() !== '') {
         const v = String(body.sub_name).trim();
-        if (!v) return json({ error: '订阅名称不能为空' }, 400);
         sg.SUBNAME = v;
       }
-      if (body.sub_update !== undefined) {
+      if (body.sub_update !== undefined && String(body.sub_update).trim() !== '') {
         const v = parseInt(body.sub_update, 10);
         if (!v || v < 1 || v > 1440) return json({ error: '更新间隔需在 1 ~ 1440 分钟之间（1 天）' }, 400);
         sg.SUBUpdateTime = v;
       }
-      if (body.sub_token !== undefined) {
+      if (body.sub_token !== undefined && String(body.sub_token).trim() !== '') {
         const v = String(body.sub_token).trim();
         sg.TOKEN = v;
       }
@@ -740,10 +739,10 @@ async function handleAdmin(request, url, env) {
         await runtime.KV.delete(kvKey(id));
         keyId = ns;
       }
-      if (body.name !== undefined) site.name = String(body.name).trim();
+      if (body.name !== undefined && String(body.name).trim() !== '') site.name = String(body.name).trim();
       // 站点模式字段（编辑弹窗新增）：模式键白名单 = 注册表（含自定义键），
       // 并把「键 → 执行引擎」解析结果冗余进 site.engine（proxy.js 运行期零 KV 依赖）
-      if (body.proxyMode !== undefined) {
+      if (body.proxyMode !== undefined && String(body.proxyMode).trim() !== '') {
         const mode = String(body.proxyMode);
         const all = await getSiteModes().catch(() => DEFAULT_SITE_MODES);
         if (Object.prototype.hasOwnProperty.call(all, mode)) {
@@ -754,12 +753,14 @@ async function handleAdmin(request, url, env) {
       if (body.mediaCacheAuthBind !== undefined) site.mediaCacheAuthBind = !!body.mediaCacheAuthBind;
       if (body.mediaSkipDetailLog !== undefined) site.mediaSkipDetailLog = !!body.mediaSkipDetailLog;
       if (site.proxyMode === 'ai') {
-        if (body.aiKey !== undefined) site.aiKey = String(body.aiKey).trim();
-        if (body.aiKeys !== undefined) site.aiKeys = String(body.aiKeys).trim();
+        if (body.aiKey !== undefined && String(body.aiKey).trim() !== '') site.aiKey = String(body.aiKey).trim();
+        if (body.aiKeys !== undefined && String(body.aiKeys).trim() !== '') site.aiKeys = String(body.aiKeys).trim();
       }
-      const wantTarget = body.target !== undefined || body.port !== undefined;
+      const wantTarget = (body.target !== undefined && String(body.target).trim() !== '') || (body.port !== undefined && String(body.port).trim() !== '');
       if (wantTarget) {
-        const built = buildTarget(body.target !== undefined ? body.target : site.target, body.port !== undefined ? body.port : site.port);
+        const built = buildTarget(
+          (body.target !== undefined && String(body.target).trim() !== '') ? body.target : site.target,
+          (body.port !== undefined && String(body.port).trim() !== '') ? body.port : site.port);
         if (!built) return json({ error: '网址不合法' }, 400);
         site.target = built.url;
         site.host = built.host;
@@ -1573,18 +1574,32 @@ if (r2TtlBtn) {
     const ttl = document.getElementById('r2TtlDays');
     const mx = document.getElementById('r2MaxMB');
     const tot = document.getElementById('r2MaxTotal');
-    const v = parseInt(ttl.value, 10);
-    const m = parseInt(mx.value, 10);
-    const t = parseInt(tot.value, 10);
-    // 区间从输入框自身读（服务端按 R2_CACHE_SPEC 渲染的 min/max），浏览器不重复抄默认值
-    if (!v || v < Number(ttl.min) || v > Number(ttl.max)) { setMsg('r2Msg', '保留天数需在 ' + ttl.min + ' ~ ' + ttl.max + ' 之间', true); return; }
-    if (!m || m < Number(mx.min) || m > Number(mx.max)) { setMsg('r2Msg', '单分片上限需在 ' + mx.min + ' ~ ' + mx.max + ' MB 之间', true); return; }
-    if (Number.isNaN(t) || t < Number(tot.min) || t > Number(tot.max)) { setMsg('r2Msg', '总量上限需在 ' + tot.min + ' ~ ' + tot.max + ' MB 之间（0 表示不限）', true); return; }
+    // 「留空保持不变」：空输入框不提交对应字段；区间校验只针对填了的字段
+    const body = {};
+    if (en) body.enabled = en.value === 'true';
+    const v = ttl ? ttl.value.trim() : '';
+    const m = mx ? mx.value.trim() : '';
+    const t = tot ? tot.value.trim() : '';
+    if (v !== '') {
+      const n = parseInt(v, 10);
+      if (!n || n < Number(ttl.min) || n > Number(ttl.max)) { setMsg('r2Msg', '保留天数需在 ' + ttl.min + ' ~ ' + ttl.max + ' 之间', true); return; }
+      body.ttlDays = n;
+    }
+    if (m !== '') {
+      const n = parseInt(m, 10);
+      if (!n || n < Number(mx.min) || n > Number(mx.max)) { setMsg('r2Msg', '单分片上限需在 ' + mx.min + ' ~ ' + mx.max + ' MB 之间', true); return; }
+      body.maxObjectMB = n;
+    }
+    if (t !== '') {
+      const n = parseInt(t, 10);
+      if (Number.isNaN(n) || n < Number(tot.min) || n > Number(tot.max)) { setMsg('r2Msg', '总量上限需在 ' + tot.min + ' ~ ' + tot.max + ' MB 之间（0 表示不限）', true); return; }
+      body.maxTotalMB = n;
+    }
     setMsg('r2Msg', '正在保存…');
     r2TtlBtn.disabled = true;
     try {
-      const r = await api('/__api/r2-cache', { method: 'POST', body: JSON.stringify({ enabled: en.value === 'true', ttlDays: v, maxObjectMB: m, maxTotalMB: t }) });
-      setMsg('r2Msg', r.ok ? '已保存：' + (en.value === 'true' ? '开启' : '关闭') + '，保留 ' + v + ' 天，单分片上限 ' + m + ' MB，总量上限 ' + (t === 0 ? '不限' : t + ' MB') : (r.data.error || '保存失败'), !r.ok);
+      const r = await api('/__api/r2-cache', { method: 'POST', body: JSON.stringify(body) });
+      setMsg('r2Msg', r.ok ? '已保存' : (r.data.error || '保存失败'), !r.ok);
     } catch (e) {
       setMsg('r2Msg', '请求失败：' + String(e && e.message || e), true);
     }
@@ -1611,6 +1626,8 @@ if (dnsBtn) {
   dnsBtn.onclick = async () => {
     const inp = document.getElementById('dnsInterval');
     const v = parseInt(inp.value, 10);
+    // 「留空保持不变」：不填频率 = 不改频率（如需立即更新用旁边按钮）
+    if (!inp.value.trim()) { setMsg('dnsMsg', '未填写频率，保持原值未修改', false); return; }
     // 区间从输入框自己身上读（服务端按 DNS_INTERVAL 渲染的 min/max），
     // 不在浏览器里再抄一份 5/1440 —— 抄一份就会有一天前后端判断不一致
     const min = Number(inp.min) || 0;
@@ -1906,18 +1923,24 @@ if (sgSaveBtn) {
   sgSaveBtn.onclick = async function () {
     sgSaveBtn.disabled = true;
     setMsg('sgMsg', '保存中…', false);
-    const v = function (id) { const el = document.getElementById(id); return el ? el.value : ''; };
-    const body = {
-      uuid: v('sgUuid'),
-      host: v('sgHost'),
-      path: v('sgPath'),
-      protocol: v('sgProtocol'),
-      transport: v('sgTransport'),
-      sub_name: v('sgName'),
-      sub_update: parseInt(v('sgUpdate'), 10) || 3,
+    // 「留空保持不变」：只把非空字段提交，空输入框不改原值（服务端同样忽略空值）
+    const body = {};
+    const take = function (id, key) {
+      const el = document.getElementById(id);
+      const val = el ? el.value.trim() : '';
+      if (val !== '') body[key] = val;
     };
-    const tk = v('sgToken');
-    if (tk) body.sub_token = tk;
+    take('sgUuid', 'uuid');
+    take('sgHost', 'host');
+    take('sgPath', 'path');
+    take('sgProtocol', 'protocol');
+    take('sgTransport', 'transport');
+    take('sgName', 'sub_name');
+    take('sgToken', 'sub_token');
+    const upd = document.getElementById('sgUpdate');
+    const uv = upd ? upd.value.trim() : '';
+    if (uv !== '') body.sub_update = parseInt(uv, 10);
+    if (!Object.keys(body).length) { setMsg('sgMsg', '没有填写任何要修改的字段（留空 = 保持不变）', true); sgSaveBtn.disabled = false; return; }
     try {
       const r = await api('/__api/sub-gen', { method: 'POST', body: JSON.stringify(body) });
       if (!r.ok) setMsg('sgMsg', r.data.error || '保存失败', true);
@@ -2213,15 +2236,19 @@ if (editModal) {
     const target = document.getElementById('editTarget').value.trim();
     const port = document.getElementById('editPort').value.trim();
     const slug = document.getElementById('editSlug').value.trim();
-    if (!name || !target) { document.getElementById('editMsg').textContent = '请填写名称和网址'; document.getElementById('editMsg').style.color = 'var(--err)'; return; }
+    // 名称是站点标识必须填写；网址/端口留空 = 保持不变（服务端同样忽略空值）
+    if (!name) { document.getElementById('editMsg').textContent = '请填写名称'; document.getElementById('editMsg').style.color = 'var(--err)'; return; }
     const body = {
-      name, target, port, slug,
+      name,
       proxyMode: document.getElementById('editProxyMode').value,
       mediaCacheAuthBind: document.getElementById('editMediaAuthBind').checked,
       mediaSkipDetailLog: document.getElementById('editMediaSkipLog').checked,
       aiKey: document.getElementById('editAiKey').value,
       aiKeys: document.getElementById('editAiKeys').value,
     };
+    if (target) body.target = target;
+    if (port) body.port = port;
+    if (slug) body.slug = slug;
     const btn = document.getElementById('editSave');
     btn.disabled = true;
     try {

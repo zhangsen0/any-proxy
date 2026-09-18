@@ -140,7 +140,12 @@ export function isActive(cfg) {
 
 export async function saveConfig(env, patch) {
   const cur = await readConfig(env);
-  const next = normalize({ ...cur, ...(patch && typeof patch === 'object' ? patch : {}), configured: true });
+  // 「留空保持不变」：patch 里的空值（undefined/null/空字符串）不覆盖原值
+  const p = { ...(patch && typeof patch === 'object' ? patch : {}) };
+  for (const k of Object.keys(p)) {
+    if (p[k] === undefined || p[k] === null || String(p[k]).trim() === '') delete p[k];
+  }
+  const next = normalize({ ...cur, ...p, configured: true });
 
   // 入口校验：防止把中间件已占用的路径设成入口，导致面板不可达
   if (next.path) {

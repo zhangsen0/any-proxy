@@ -45,7 +45,12 @@ export async function readR2Config() {
 
 export async function saveR2Config(patch) {
   const cur = await readR2Config();
-  const next = sanitizeR2Config({ ...cur, ...patch });
+  // 「留空保持不变」：patch 里的空值（undefined/null/空字符串）不覆盖原值
+  const p = { ...(patch && typeof patch === 'object' ? patch : {}) };
+  for (const k of Object.keys(p)) {
+    if (p[k] === undefined || p[k] === null || String(p[k]).trim() === '') delete p[k];
+  }
+  const next = sanitizeR2Config({ ...cur, ...p });
   await runtime.KV.put(KV_KEY, JSON.stringify(next));
   return next;
 }
