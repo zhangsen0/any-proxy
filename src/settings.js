@@ -144,6 +144,16 @@ export const SETTINGS_SPEC = {
     group: 'preferred', label: '延迟缓存有效期', unit: '毫秒', level: 'advanced',
     hint: '缓存期内复用上次实测结果，不重复探测。调大省时间但跟不上网络变化，调小更准但每次拉订阅都要实测一遍',
   },
+  pick_speed_enabled: {
+    type: 'bool', default: true, env: 'PICK_SPEED_ENABLED',
+    group: 'preferred', label: '自动优先用浏览器测速的顺序',
+    hint: '服务端只能从 Cloudflare 自己的网络探测，那个「最快」跟你的网络基本无关（实测两个视角的排序近似零相关）。开着就用你在面板「浏览器自动优选」测出来的快慢来排；关着则回到服务端探测的顺序。服务端始终只负责把不通的 IP 剔掉',
+  },
+  pick_speed_ttl_ms: {
+    type: 'int', default: 43200000, min: 600000, max: 172800000, env: 'PICK_SPEED_TTL_MS',
+    group: 'preferred', label: '浏览器测速结果有效期', unit: '毫秒', level: 'advanced',
+    hint: '超过这个时间没重新测过就当作没测过，回到服务端顺序。换了网络（回家、出国）旧数字就是错的，所以宁可不用也不能一直信',
+  },
   dns_budget_ms: {
     type: 'int', default: 22000, min: 5000, max: 29000, env: 'DNS_BUDGET_MS',
     group: 'preferred', label: '优选总时间预算', unit: '毫秒',

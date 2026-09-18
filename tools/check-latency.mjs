@@ -277,6 +277,98 @@ console.log('\n[11] 响应出口：开关关着就原样透传，非节点内容
   check('节点行之间完成重排', names(out[1])[0] === 'B' && names(out[3])[0] === 'A', out[1] + ' | ' + out[3]);
 }
 
+// ===================== 浏览器测速：让「你的网络」的快慢走到 A 记录上 =====================
+//
+// 服务端只能从 Cloudflare 自己的网络往外探，那个「最快」跟用户的网络基本无关
+// （实测两个视角的排序近似零相关）。所以顺序必须由浏览器那边定 —— 但前提是这个顺序
+// **真的被用上**。这一段防的退化是：测完了、也存了，自动优选却还是按服务端探测的顺序写。
+
+const { readPickSpeed, savePickSpeed, orderByPickSpeed, rankByPickSpeed, spread } =
+  await import('../src/pickspeed.js');
+
+console.log('\n[12] 浏览器测速表：存取与排序');
+{
+  mem.delete('PICK_SPEED');
+  const saved = await savePickSpeed({}, [
+    { ip: '1.1.1.1', ms: 300 }, { ip: '2.2.2.2', ms: 100 },
+    { ip: 'not-an-ip', ms: 5 }, { ip: '3.3.3.3', ms: -1 },
+  ]);
+  check('只收合法 IPv4 + 非负毫秒（脏数据不进表）', saved.ok && saved.n === 2, JSON.stringify(saved));
+  const t = await readPickSpeed({});
+  check('存进去能原样读出来', t.ms['1.1.1.1'] === 300 && t.ms['2.2.2.2'] === 100 && !('not-an-ip' in t.ms),
+    JSON.stringify(t.ms));
+  check('带时间戳（过期判定靠它）', typeof t.ts === 'number' && t.ts > 0, String(t.ts));
+
+  const r = orderByPickSpeed(['1.1.1.1', '2.2.2.2', '9.9.9.9', '8.8.8.8'], t.ms);
+  check('测过的按毫秒升序在前，没测过的垫后且保持原顺序',
+    r.ips.join(',') === '2.2.2.2,1.1.1.1,9.9.9.9,8.8.8.8', r.ips.join(','));
+  check('命中数如实回报（0 命中要能被发现）', r.matched === 2, String(r.matched));
+}
+{
+  const ips = ['1.1.1.1', '2.2.2.2'];
+  mem.set('PICK_SPEED', JSON.stringify({ ts: Date.now(), ms: { '1.1.1.1': 300, '2.2.2.2': 100 } }));
+  const off = await rankByPickSpeed({}, ips, { cfg: { pick_speed_enabled: false, pick_speed_ttl_ms: 43200000 } });
+  check('开关关闭 → 不排序，且说清原因',
+    off.applied === false && off.reason === 'disabled' && off.ips.join(',') === ips.join(','), JSON.stringify(off));
+  const on = await rankByPickSpeed({}, ips, { cfg: { pick_speed_enabled: true, pick_speed_ttl_ms: 43200000 } });
+  check('开关开启 → 最快的排到最前', on.applied === true && on.ips.join(',') === '2.2.2.2,1.1.1.1', JSON.stringify(on));
+
+  // 换网络（回家 / 出国）之后旧数字就是错的，宁可不用也不能一直信
+  mem.set('PICK_SPEED', JSON.stringify({ ts: Date.now() - 86400000, ms: { '1.1.1.1': 300, '2.2.2.2': 100 } }));
+  const stale = await rankByPickSpeed({}, ips, { cfg: { pick_speed_enabled: true, pick_speed_ttl_ms: 3600000 } });
+  check('结果过期 → 不用它', stale.applied === false && stale.reason === 'stale', JSON.stringify(stale));
+
+  mem.delete('PICK_SPEED');
+  const empty = await rankByPickSpeed({}, ips, { cfg: { pick_speed_enabled: true } });
+  check('压根没测过 → 原样并说清原因', empty.applied === false && empty.reason === 'empty', JSON.stringify(empty));
+
+  // 表里全是别的批次的 IP：不能因为「查了表」就宣称排过序
+  mem.set('PICK_SPEED', JSON.stringify({ ts: Date.now(), ms: { '5.5.5.5': 10 } }));
+  const nomatch = await rankByPickSpeed({}, ips, { cfg: { pick_speed_enabled: true, pick_speed_ttl_ms: 43200000 } });
+  check('一个都没命中 → 不算排过', nomatch.applied === false && nomatch.reason === 'no-match', JSON.stringify(nomatch));
+  mem.delete('PICK_SPEED');
+}
+
+console.log('\n[13] 区分度自检：代理状态下测出来的「全挤在一起」必须被识破');
+{
+  check('全挤在一起 → 判定无区分度', spread([730, 731, 729, 732]).ok === false, JSON.stringify(spread([730, 731, 729, 732])));
+  check('差距明显 → 判定有效', spread([80, 200, 500]).ok === true, JSON.stringify(spread([80, 200, 500])));
+  check('样本不足三个不妄下结论', spread([10, 20]).ok === false);
+}
+
+console.log('\n[14] 接口链路：/__api/pick-speed 存得进去也读得回来');
+{
+  mem.delete('PICK_SPEED');
+  mem.delete('APP_CONFIG');
+  invalidateDoc();
+  const { handleRequest } = await import('../src/router.js');
+  const cookie = 'ap_auth=' + Buffer.from('dev').toString('base64');
+  const post = await handleRequest(new Request('https://proxy.example.com/__api/pick-speed', {
+    method: 'POST',
+    headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ items: [{ ip: '1.1.1.1', ms: 300 }, { ip: '2.2.2.2', ms: 100 }] }),
+  }), {}, {});
+  const pd = await post.json().catch(() => ({}));
+  check('POST 返回 200', post.status === 200, 'HTTP ' + post.status + ' ' + String(pd.error || ''));
+  check('记住了 2 个 IP 的延迟', pd.n === 2, JSON.stringify(pd));
+
+  const get = await handleRequest(new Request('https://proxy.example.com/__api/pick-speed', {
+    headers: { Cookie: cookie },
+  }), {}, {});
+  const gd = await get.json().catch(() => ({}));
+  check('GET 读回来且按快慢排好', gd.items && gd.items[0].ip === '2.2.2.2' && gd.items[0].ms === 100,
+    JSON.stringify(gd.items));
+  check('刚存的不算过期', gd.stale === false, JSON.stringify({ ts: gd.ts, ttl: gd.ttl }));
+
+  const bad = await handleRequest(new Request('https://proxy.example.com/__api/pick-speed', {
+    method: 'POST',
+    headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ items: [{ ip: 'x', ms: 1 }] }),
+  }), {}, {});
+  check('全是脏数据时明确报错（不假装保存成功）', bad.status === 400, 'HTTP ' + bad.status);
+  mem.delete('PICK_SPEED');
+}
+
 console.log(`\n=== ${fail === 0 ? '全部通过' : '存在失败'} ===`);
 console.log(`节点延迟实测：${pass} 项，失败 ${fail} 项\n`);
 process.exit(fail ? 1 : 0);

@@ -350,6 +350,14 @@ export const API_CATALOG = [
         params: panelParamsOf('pool-config'),
       },
       {
+        id: 'pick-speed', name: '浏览器测速结果', kind: 'setting', method: 'GET', path: '/__api/pick-speed', writeMethod: 'POST',
+        desc: '存「IP → 毫秒」这张表：面板「浏览器自动优选」从你的网络实测后写入，自动优选据此排序。'
+          + '服务端只能从 Cloudflare 自己的网络探测，那个快慢跟你的网络基本无关，所以顺序必须由浏览器这边定；'
+          + '服务端只负责剔掉不通的。有效期在「配置中心 → 优选与候选」里调',
+        auth: true,
+        body: { items: [{ ip: '1.2.3.4', ms: 123 }] },
+      },
+      {
         id: 'latency-probe', name: '延迟实测', kind: 'action', method: 'POST', path: '/__api/latency-probe',
         desc: '逐个实测候选 IP 的真实响应延迟、按快慢排好。不写任何配置，只回答「谁更快」；'
           + '不传 targets 时测当前优选池。取样次数与总预算在「配置中心 → 优选与候选」里调',

@@ -3,6 +3,7 @@ import { b64, parseIpv4List, parseDomainList } from './util.js';
 import { fetchSubscriptionCandidates, resolveDomains } from './subs.js';
 import { SETTINGS_SPEC, readSettings } from './settings.js';
 import { measureTargets } from './latency.js';
+import { rankByPickSpeed } from './pickspeed.js';
 
 /**
  * 探活目标：伪装开启后任何 /__api/* 都要求登录，内部 fetch 必须自己带上登录态。
@@ -242,14 +243,23 @@ async function autoUpdatePreferredDns(env, opts = {}) {
       latencySamples: cfg.latency_samples,
       latencyBudgetMs: cfg.latency_budget_ms,
     });
-    const result = await applyDnsWithSelfCheck(env, usable, { host, deadlineMs });
+    // 顺序交给「测速的人」：服务端能判的只有「通不通」（它只能从 Cloudflare 自己的网络
+    // 往外探，那个快慢跟用户的网络基本无关）；快慢用浏览器从**用户网络**实测的结果来排。
+    // 只重排已经探通的 IP —— 用户侧再快，服务端判不通的也不能上位。
+    const ranked = await rankByPickSpeed(env, usable, { cfg });
+    let pickNote = '';
+    if (ranked.applied) pickNote = `按浏览器测速排序（命中 ${ranked.matched}/${usable.length} 个）`;
+    else if (ranked.reason === 'stale') pickNote = '浏览器测速结果已过期，本次按服务端探测顺序';
+    else if (ranked.reason === 'empty') pickNote = '还没有浏览器测速结果（去「优选 IP」页点一次）';
+
+    const result = await applyDnsWithSelfCheck(env, ranked.ips, { host, deadlineMs });
     return {
       ok: result.ok,
       ips: result.ips || [],
       pool: usable.length,
       changed: result.changed || 0,
       verified: result.verified,
-      note: note || result.note || '',
+      note: [pickNote, note || result.note || ''].filter(Boolean).join('｜'),
       error: result.error,
     };
   } catch (e) {

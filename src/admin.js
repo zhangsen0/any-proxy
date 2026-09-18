@@ -40,6 +40,7 @@ import { renderStatsPane, STATS_JS, STATS_CSS } from './stats-ui.js';
 import { renderCfPane, CF_JS, CF_CSS } from './cf-panel.js';
 import { cfAnalytics } from './cf-analytics.js';
 import { readTagSettings } from './nodetag.js';
+import { readPickSpeed, savePickSpeed, spread } from './pickspeed.js';
 
 /**
  * 输入是不是「一个字都没填」。
@@ -277,6 +278,38 @@ async function handleAdmin(request, url, env) {
       note: res.note || '',
       stats: { addresses: res.addresses || 0, filtered: res.filtered || 0, ranges: res.ranges || '' },
     });
+  }
+
+  // GET / POST /__api/pick-speed -> 浏览器测速结果（{ip: 毫秒}）的读写
+  //
+  // 为什么要单独存一份：浏览器自动优选是全局唯一能从**用户网络**出发测量的入口，
+  // 但它测完只把 IP 名单填进优选池，延迟数字当场丢掉 —— 服务端自动优选走二值判定，
+  // 顺序又变回「谁先探到谁在前」，用户测出来的快慢等于白测。
+  // 存下这张表之后，自动优选在**通断过滤之后**用它重排一次，快慢才真的落到 A 记录上。
+  // 这是运行数据而非配置项，所以不进运行参数注册表（与 HC_LAST_RUN 同一类）。
+  if (path === '/__api/pick-speed') {
+    if (request.method === 'GET') {
+      const { ts, ms } = await readPickSpeed(env);
+      const cfg = await readSettings(env);
+      const ttl = Number(cfg.pick_speed_ttl_ms) || SETTINGS_SPEC.pick_speed_ttl_ms.default;
+      const items = Object.entries(ms).map(([ip, msec]) => ({ ip, ms: msec })).sort((a, b) => a.ms - b.ms);
+      return json({
+        ok: true, ts, ttl, items,
+        enabled: cfg.pick_speed_enabled !== false,
+        stale: !ts || Date.now() - ts > ttl,
+        spread: spread(items.map((x) => x.ms)),
+      });
+    }
+    if (request.method === 'POST') {
+      let body;
+      try { body = await request.json(); } catch { return json({ error: 'invalid json' }, 400); }
+      const r = await savePickSpeed(env, body.items);
+      if (!r.ok) return json({ error: '没有有效条目：需要 [{ip, ms}]，ip 为 IPv4、ms 为非负数' }, 400);
+      return json({
+        ok: true, n: r.n, total: r.total || r.n, ts: r.ts,
+        message: `已记住 ${r.n} 个 IP 的延迟，下次自动优选按它排序`,
+      });
+    }
   }
 
   // GET / POST /__api/sub-config -> 订阅链接
@@ -1215,7 +1248,10 @@ ${themeScript}
     ${settingFormById('preferred-ips')}
     <div class="row" style="margin-top:8px;">
       <button type="button" id="autoBtn" class="ghost">浏览器自动优选</button>
-      <span class="hint" style="margin:0;">从订阅链接拉候选并测速（约 5~15 秒），最快的自动填入上面的优选池，再点「保存」。</span>
+      <span class="hint" style="margin:0;">从订阅链接拉候选，在<b>你的浏览器</b>里测速（约 5~15 秒）；最快的自动写入上面的优选池，
+        延迟数字一并存下来 —— 自动优选按它排序（服务端只负责剔掉不通的）。测速时请<b>不要开着代理访问本页</b>，
+        否则测到的是「出口节点 → CF」，不是「你 → CF」。</span>
+      <div class="hint" style="margin:4px 0 0;">上次测速：<b id="pickLast">—</b></div>
     </div>
     <div class="msg" id="autoMsg"></div>
     ${settingFormById('pool-config')}
@@ -1615,6 +1651,23 @@ if (poolLastEl) {
     poolLastEl.textContent = r.data.last_run ? new Date(r.data.last_run * 1000).toLocaleString() : '从未';
   }).catch(() => {});
 }
+// 上次「浏览器自动优选」的结果摘要：没有它，自动优选就只能按服务端视角的快慢排
+// （而那个排序跟你的网络基本无关）。过期/区分度不足都要直接说，别让人以为优选过了。
+const pickLastEl = document.getElementById('pickLast');
+if (pickLastEl) {
+  api('/__api/pick-speed').then(r => {
+    if (!r.ok || !r.data) { pickLastEl.textContent = '—'; return; }
+    const d = r.data;
+    if (!d.ts || !d.items.length) { pickLastEl.textContent = '从未（自动优选按服务端探测顺序）'; return; }
+    const mins = Math.round((Date.now() - d.ts) / 60000);
+    const ago = mins < 60 ? mins + ' 分钟前' : Math.round(mins / 60) + ' 小时前';
+    const parts = [ago + '，' + d.items.length + ' 个 IP，最快 ' + Math.round(d.items[0].ms) + 'ms'];
+    if (d.stale) parts.push('已过期，本次优选将不用它');
+    else if (d.spread && d.spread.ok === false) parts.push('区分度不足（可能是在代理状态下测的）');
+    if (d.enabled === false) parts.push('开关已关闭');
+    pickLastEl.textContent = parts.join('｜');
+  }).catch(() => {});
+}
 // 确认制测速：no-cors 计时近似「你网络→节点」延迟。
 // 首测 2 次取最短；resolve 快（<200ms）的 IP 可能隐藏 1034/假快（TLS 成功但 HTTP 被拒），
 // 自动复测 2 次取中位数；波动大（>150ms）的降权，避免抖动假快污染排序。
@@ -1709,8 +1762,36 @@ if (autoBtn) {
     } else {
       field.value = best.map(r => r.ip).join('\\n');
       field.dispatchEvent(new Event('input', { bubbles: true }));
-      setMsg('autoMsg', '优选完成：测 ' + cands.length + ' 个，最快 ' + Math.round(best[0].t) + 'ms，前 ' + best.length + ' 个已填入优选池'
-        + (note ? '｜' + note : '') + '，点该表单的「保存」写入优选池（不自动改 DNS，可再点「立即更新优选 IP」应用）', false);
+      // 1) 池子直接落库（以前只填进输入框，忘了点「保存」就等于白测）
+      let savedNote = '';
+      try {
+        const sr = await api('/__api/preferred-ips', {
+          method: 'POST', body: JSON.stringify({ preferred_ips: best.map(r => r.ip) }),
+        });
+        savedNote = sr.ok ? '优选池已保存' : ('保存失败：' + ((sr.data && sr.data.error) || sr.status));
+      } catch (e) { savedNote = '保存失败：' + String((e && e.message) || e); }
+      // 2) 延迟数值存回服务端 —— 这一步才是「优选」的本体。
+      //    只存 IP 名单的话，服务端自动优选走二值判定（谁先探到谁在前），
+      //    用户侧测出来的快慢会在那一步被丢掉，最后写进 A 记录的跟测的结果无关。
+      let pickNote = '';
+      try {
+        const pr = await api('/__api/pick-speed', {
+          method: 'POST',
+          body: JSON.stringify({ items: results.map(r => ({ ip: r.ip, ms: Math.round(r.t) })) }),
+        });
+        pickNote = pr.ok ? '延迟已记录（' + pr.data.n + ' 个，自动优选按它排序）'
+          : ('延迟记录失败：' + ((pr.data && pr.data.error) || pr.status));
+      } catch (e) { pickNote = '延迟记录失败：' + String((e && e.message) || e); }
+      // 3) 区分度自检：全部挤在一起说明这次测量没有信息量 ——
+      //    最常见的成因是**开着代理访问本页**，此时测的是「出口节点 → CF」而不是「你 → CF」。
+      const vs = best.map(r => r.t).sort((a, b) => a - b);
+      const range = vs.length ? vs[vs.length - 1] - vs[0] : 0;
+      const flatNote = vs.length >= 3 && (range < 20 || (vs[vs.length - 1] > 0 && range / vs[vs.length - 1] < 0.1))
+        ? '⚠️ 这批结果几乎没有区分度（极差 ' + Math.round(range) + 'ms）：如果你现在开着代理访问本页，测到的是「出口节点→CF」而非「你→CF」，请断开代理后重测'
+        : '';
+      setMsg('autoMsg', '优选完成：测 ' + cands.length + ' 个，最快 ' + Math.round(best[0].t) + 'ms，前 ' + best.length + ' 个已填入优选池｜'
+        + savedNote + '｜' + pickNote + (flatNote ? '｜' + flatNote : '')
+        + (note ? '｜' + note : '') + '，点「立即更新优选 IP」写入 A 记录', false);
     }
     btn.disabled = false;
     btn.textContent = '浏览器自动优选';
