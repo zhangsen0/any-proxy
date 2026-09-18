@@ -349,6 +349,12 @@ export const API_CATALOG = [
         spec: panelSpecOf('pool-config'),
         params: panelParamsOf('pool-config'),
       },
+      {
+        id: 'latency-probe', name: '延迟实测', kind: 'action', method: 'POST', path: '/__api/latency-probe',
+        desc: '逐个实测候选 IP 的真实响应延迟、按快慢排好。不写任何配置，只回答「谁更快」；'
+          + '不传 targets 时测当前优选池。取样次数与总预算在「配置中心 → 优选与候选」里调',
+        auth: true,
+      },
     ],
   },
   {

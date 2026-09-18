@@ -119,6 +119,21 @@ export const SETTINGS_SPEC = {
     type: 'int', default: 2500, min: 500, max: 20000, env: 'PROBE_TIMEOUT_MS',
     group: 'preferred', label: '单次探测超时', unit: '毫秒', level: 'advanced',
   },
+  latency_enabled: {
+    type: 'bool', default: false, env: 'LATENCY_ENABLED',
+    group: 'preferred', label: '按实测延迟排序',
+    hint: '关着的时候优选只挑「能通的」，顺序是谁先探到谁在前；开着会逐个实测延迟再按快慢排。多花几秒，通常换来明显更快的节点',
+  },
+  latency_samples: {
+    type: 'int', default: 2, min: 1, max: 5, env: 'LATENCY_SAMPLES',
+    group: 'preferred', label: '每个目标取样次数', unit: '次', level: 'advanced',
+    hint: '取中位数，抵消单次抖动。次数越多越准、也越耗时（会挤占总预算）',
+  },
+  latency_budget_ms: {
+    type: 'int', default: 8000, min: 1000, max: 25000, env: 'LATENCY_BUDGET_MS',
+    group: 'preferred', label: '延迟实测总预算', unit: '毫秒', level: 'advanced',
+    hint: '预算耗尽就按已测到的结果排序，绝不把整个请求拖过 Workers 的墙钟',
+  },
   dns_budget_ms: {
     type: 'int', default: 22000, min: 5000, max: 29000, env: 'DNS_BUDGET_MS',
     group: 'preferred', label: '优选总时间预算', unit: '毫秒',

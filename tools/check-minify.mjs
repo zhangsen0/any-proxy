@@ -108,6 +108,10 @@ console.log('\n[3] esbuild 可用时：真压缩一遍，确认注入脚本仍�
         let why = '';
         try { new Function(script); } catch (e) { okSyntax = false; why = e.message; }
         check(file + ' 压缩后 ' + key + ' 语法正确', okSyntax, why || script.length + ' 字符');
+        // 语法对不代表数据还在：如果实参没传进去，函数体拿到的就是 undefined，
+        // 注入的脚本照样能解析、照样能跑，只是表格空空如也 —— 比报错更难发现。
+        const marker = { 'cf-panel.js': '"requests"', 'stats-ui.js': '"hits"' }[file];
+        if (marker) check(file + ' 压缩后数据仍在实参里', script.includes(marker), marker);
       } catch (e) {
         check(file + ' 压缩后 ' + key, false, String(e && e.message).slice(0, 80));
       } finally {

@@ -7,7 +7,7 @@ import { readR2Config, saveR2Config, R2_CACHE_SPEC, R2_PREFIX } from './media-r2
 import { sweepMediaR2 } from './proxy.js';
 import {
   autoUpdatePreferredDns, filterUsableIps, applyDnsWithSelfCheck, resolveProxyHost, targetHost,
-  DNS_INTERVAL,
+  probeLatency, DNS_INTERVAL,
 } from './dns.js';
 import { subscriptionUrl, fetchSubscriptionCandidates, CANDIDATE_LIMIT } from './subs.js';
 import {
@@ -172,6 +172,37 @@ async function handleAdmin(request, url, env) {
       ok: true, ips: result.ips, pool: result.pool, changed: result.changed, verified: result.verified,
       host: ctx.host, note: result.note || '',
       message: result.note ? msg + `｜${result.note}` : msg,
+    });
+  }
+
+  // POST /__api/latency-probe -> 逐个实测候选 IP 的真实延迟、按快慢排序（需登录）
+  // 只测量、不写任何配置 —— 想让「自动优选」按延迟挑，去「配置中心 → 优选与候选」
+  // 打开「按实测延迟排序」。故意分成两步：先让人看清「谁快」，再决定要不要据此改规则。
+  if (request.method === 'POST' && path === '/__api/latency-probe') {
+    const ctx = await dnsContext(request, url, env);
+    if (!ctx.host) return json({ error: '无法确定探测目标域名：请配置 PROXY_HOST' }, 500);
+    let body = {};
+    try { body = await request.json(); } catch { /* 允许空 body：默认测当前优选池 */ }
+    let targets = Array.isArray(body.targets)
+      ? body.targets.map((x) => String(x || '').trim()).filter(Boolean)
+      : [];
+    if (!targets.length) {
+      const cfg = await readSettings(env);
+      targets = [...new Set([...(cfg.pool_good_ips || []), ...(cfg.preferred_ips || [])])];
+    }
+    if (!targets.length) {
+      return json({ error: '没有可测的目标：先在优选池里填 IP，或在请求里给 targets' }, 400);
+    }
+    const r = await probeLatency(targets, { ...ctx, env });
+    if (r.error) return json({ error: r.error }, 500);
+    const s = r.stats || {};
+    const msg = s.good
+      ? `实测 ${s.total} 个：通 ${s.good} 个（最快 ${s.fastest} ms，最慢 ${s.slowest} ms）`
+        + (s.bad ? `，不通 ${s.bad} 个` : '')
+        + (s.stoppedEarly ? '｜预算用尽，只测了部分' : '')
+      : `实测 ${s.total} 个：没有一个连通`;
+    return json({
+      ok: true, host: ctx.host, items: r.items, ranked: r.ok, stats: s, message: msg,
     });
   }
 

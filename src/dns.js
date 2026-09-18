@@ -2,6 +2,7 @@ import { runtime } from './runtime.js';
 import { b64, parseIpv4List, parseDomainList } from './util.js';
 import { fetchSubscriptionCandidates, resolveDomains } from './subs.js';
 import { SETTINGS_SPEC, readSettings } from './settings.js';
+import { measureTargets } from './latency.js';
 
 /**
  * 探活目标：伪装开启后任何 /__api/* 都要求登录，内部 fetch 必须自己带上登录态。
@@ -236,6 +237,10 @@ async function autoUpdatePreferredDns(env, opts = {}) {
       maxProbeLimit: cfg.max_probe_limit,
       probeTimeoutMs: cfg.probe_timeout_ms,
       concurrency: cfg.probe_concurrency,
+      // 延迟排序是**可选增强**：关着的时候走的还是原来那条二值判定的路。
+      sortByLatency: cfg.latency_enabled === true,
+      latencySamples: cfg.latency_samples,
+      latencyBudgetMs: cfg.latency_budget_ms,
     });
     const result = await applyDnsWithSelfCheck(env, usable, { host, deadlineMs });
     return {
@@ -250,6 +255,47 @@ async function autoUpdatePreferredDns(env, opts = {}) {
   } catch (e) {
     return { ok: false, error: '自动优选执行异常：' + (e && e.message ? e.message : e) };
   }
+}
+
+/**
+ * 生成「探一个 IP 要多久」的探测函数。**探测口径全项目只有这一份**：
+ * 二值判定的 filterUsableIps 和带延迟的 probeLatency 都用它，免得两边分叉成
+ * 「同一次优选里两个 IP 用不同的标准测」。
+ *
+ * ⚠️ 刻意**不看状态码**：伪装开启时未登录访问 /__api/config 拿到的是 404，
+ * 但那恰恰说明这个 IP 是通的。判定标准只有一个：连不连得上。
+ */
+function latencyProbe(host, probeTimeoutMs) {
+  return async (ip, timeoutMs) => {
+    await fetch('http://' + ip + PROBE_PATH, {
+      headers: probeHeaders(host),
+      redirect: 'manual',
+      signal: AbortSignal.timeout(timeoutMs || probeTimeoutMs),
+    });
+  };
+}
+
+/**
+ * 对外：手动触发一次延迟实测（面板「延迟实测」按钮走这里）。
+ * 目标列表由调用方给；不填则由接口侧用当前优选池兜底。
+ * 并发 / 取样次数 / 预算全部取自注册表，这里不自己定值。
+ */
+export async function probeLatency(targets, opts = {}) {
+  const host = opts.host || '';
+  if (!host) {
+    return { items: [], ok: [], stats: { total: 0, good: 0, bad: 0, stoppedEarly: false }, error: '缺少目标域名（无法探测）' };
+  }
+  const cfg = await cfgOf(opts.env, opts);
+  const probeTimeoutMs = opts.probeTimeoutMs || cfg.probe_timeout_ms || DEFAULT_SETTINGS.probe_timeout_ms;
+  return await measureTargets(targets, {
+    probe: latencyProbe(host, probeTimeoutMs),
+    concurrency: opts.concurrency || cfg.probe_concurrency || DEFAULT_SETTINGS.probe_concurrency,
+    samples: opts.samples || cfg.latency_samples || SETTINGS_SPEC.latency_samples.default,
+    maxTargets: opts.maxTargets || cfg.max_probe_limit || DEFAULT_SETTINGS.max_probe_limit,
+    timeoutMs: probeTimeoutMs,
+    budgetMs: opts.budgetMs || cfg.latency_budget_ms || SETTINGS_SPEC.latency_budget_ms.default,
+    deadlineMs: opts.deadlineMs,
+  });
 }
 
 /**
@@ -271,6 +317,22 @@ async function filterUsableIps(ips, opts = {}) {
   const concurrency = opts.concurrency || DEFAULT_SETTINGS.probe_concurrency;
   const queue = [...new Set(ips)].slice(0, maxProbe);
   if (!queue.length) return [];
+
+  // 延迟实测：同一套探测口径，只是每个目标多测几次，把「多快」也量出来。
+  // 只在调用方显式要求时走这条路（由注册表里的 latency_enabled 控制），
+  // 默认仍走下面的二值判定 —— 行为与加这个功能之前完全一致。
+  if (opts.sortByLatency) {
+    const r = await measureTargets(queue, {
+      probe: latencyProbe(host, probeTimeoutMs),
+      concurrency,
+      samples: opts.latencySamples || SETTINGS_SPEC.latency_samples.default,
+      maxTargets: maxProbe,
+      timeoutMs: probeTimeoutMs,
+      budgetMs: opts.latencyBudgetMs || SETTINGS_SPEC.latency_budget_ms.default,
+      deadlineMs: hardEnd,
+    });
+    return r.ok.length ? r.ok : ips;
+  }
 
   const good = [];
   const probe = async () => {
