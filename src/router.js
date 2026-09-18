@@ -14,9 +14,24 @@ import {
   renderHome, renderNotFound, renderRobots, emptyFavicon,
 } from './disguise.js';
 import { subscriptionTaggingEnabled, styleFrom, tagSubscriptionResponse } from './nodetag.js';
+import { engineEnvFor, nodeIdentity } from './settings.js';
 import { check as rateLimitCheck } from './ratelimit.js';
 import { readShareConfig, resolve as resolveShare } from './share.js';
 import { notify as notifyAlert } from './alert.js';
+
+/**
+ * 调用代理引擎时用的运行环境。
+ *
+ * 引擎（vendor/vless.js）每次请求都会用环境变量与请求上下文覆盖它自己那份
+ * config.json 里的 UUID / HOSTS / PATH，所以面板上改「节点 ID / 节点地址 / 路径」
+ * 曾经保存成功却完全不生效。这里把面板值回灌成引擎认的环境变量，
+ * 让「面板 → 存储 → 引擎」成为一条链（详见 settings.js 的 engineEnvFor）。
+ *
+ * 默认值与环境变量种子相同，所以没在面板上改过的部署行为与改动前一致。
+ */
+function engineEnv(env, extra = {}) {
+  return engineEnvFor(env, { KV: runtime.KV, ...extra });
+}
 
 /** 被限流 / 被封禁时的统一响应：状态码与文案都取自配置，不在这里写死 */
 function rateLimitedResponse(rl) {
@@ -55,11 +70,15 @@ async function dispatchShare(request, url, ctx, env, cfg) {
 }
 
 /** 给节点备注增强用的参数：统一收敛在这儿，两个订阅出口共用同一口径。 */
-function tagOpts(env, ctx) {
+/**
+ * 标注参数。样式必须 await 注册表 —— 面板把样式存在 KV 里，
+ * 早先这里同步读环境变量，于是「面板改了样式、订阅输出没变」。
+ */
+async function tagOpts(env, ctx) {
   return {
     env,
     ctx,
-    style: styleFrom(env),
+    style: await styleFrom(env),
     // 墙钟兜底：GeoIP 是外部请求，网络抖动不能把订阅请求拖到 Worker 超时。
     deadline: Date.now() + NODE_TAG_BUDGET_MS,
   };
@@ -104,7 +123,7 @@ async function handleRequest(request, env, ctx) {
   // 一旦被伪装拦截，客户端会直接断连（且很难从客户端日志定位到这里）。
   if ((request.headers.get('Upgrade') || '').toLowerCase() === 'websocket') {
     if (path === '/' || path === '/edt' || path.startsWith('/edt/')) {
-      return await vlessHandler.fetch(request, { ...env, KV: runtime.KV }, ctx);
+      return await vlessHandler.fetch(request, await engineEnv(env), ctx);
     }
   }
 
@@ -158,12 +177,12 @@ async function handleRequest(request, env, ctx) {
     if (fmt === 'clash' || fmt === 'clashyaml') { url.searchParams.set('clash', '1'); subReq = new Request(url.toString(), request); }
     else if (fmt === 'singbox' || fmt === 'sing-box' || fmt === 'sing') { url.searchParams.set('singbox', '1'); subReq = new Request(url.toString(), request); }
     else if (fmt === 'base64' || fmt === 'b64') { url.searchParams.set('b64', '1'); subReq = new Request(url.toString(), request); }
-    const resp = await vlessHandler.fetch(subReq, { ...env, KV: runtime.KV }, ctx);
+    const resp = await vlessHandler.fetch(subReq, await engineEnv(env), ctx);
     if (fmt === 'clash' || fmt === 'clashyaml' || fmt === 'singbox' || fmt === 'sing-box' || fmt === 'sing') return resp;
     // 订阅出口：给每个节点的备注补上 IP 归属国家。
     // 开关关闭时这里一次都不会触发，不产生任何外部请求或存储读取。
     if (!(await subscriptionTaggingEnabled(env))) return resp;
-    return await tagSubscriptionResponse(resp, tagOpts(env, ctx));
+    return await tagSubscriptionResponse(resp, await tagOpts(env, ctx));
   }
 
   // ---- 陌生人：只允许「一个普通网站该有的东西」，其余一律伪装 404 ----
@@ -195,7 +214,7 @@ async function handleRequest(request, env, ctx) {
     u.pathname = path === '/edt' ? '/' : path.slice(4);
     const req = new Request(u.toString(), request);
     // edgetunnel 依赖 env.KV（登录/日志/ADD.txt），注入为我们的 SITES 绑定
-    const resp = await vlessHandler.fetch(req, { ...env, KV: runtime.KV }, ctx);
+    const resp = await vlessHandler.fetch(req, await engineEnv(env), ctx);
     // edgetunnel 内部跳转是根路径（/admin /login），补上前缀，保证登录/跳转正常
     if (resp.status >= 300 && resp.status < 400) {
       const loc = resp.headers.get('Location');
@@ -236,7 +255,7 @@ async function handleRequest(request, env, ctx) {
       h.append('Location', '/');
       return new Response('<!DOCTYPE html><meta charset="utf-8"><script>location.href="/"</script>已登出', { status: 302, headers: h });
     }
-    const resp = await vlessHandler.fetch(request, { ...env, KV: runtime.KV }, ctx);
+    const resp = await vlessHandler.fetch(request, await engineEnv(env), ctx);
     // 面板登录成功（Set-Cookie auth）时同步种 ap_auth，保证站点管理子系统也是登录态
     if (path === '/login' && request.method === 'POST' && (resp.headers.get('Set-Cookie') || '').includes('auth=')) {
       const h = new Headers(resp.headers);
@@ -330,19 +349,22 @@ async function dispatchTempSub(request, url, env, ctx) {
     // 404 而非带明文原因的 403：不向探测者解释失败原因，也不暴露这是订阅端点
     return renderNotFoundFallback();
   }
-  // 与主订阅同一口径计算 token：MD5MD5(host + uuid)，host 取请求 hostname。
-  const token = await tempSubToken(url.hostname, rec.uuid);
+  // 与主订阅同一口径计算 token：MD5MD5(host + uuid)。host 取「面板配的节点地址优先，
+  // 否则本次请求的 hostname」—— 引擎拿到的身份由 engineEnv() 注入，两边必须同源，
+  // 否则面板一配节点地址，临时订阅链接就会 404。
+  const id = await nodeIdentity(env, url.hostname);
+  const token = await tempSubToken(id.host, rec.uuid);
   const subUrl = new URL(request.url);
   subUrl.pathname = '/sub';
   subUrl.searchParams.set('token', token);
   const subReq = new Request(subUrl.toString(), request);
-  const resp = await vlessHandler.fetch(subReq, { ...env, KV: runtime.KV, UUID: rec.uuid }, ctx);
+  const resp = await vlessHandler.fetch(subReq, await engineEnv(env, { UUID: rec.uuid }), ctx);
   // 临时订阅同样支持多格式输出：/tsub/<id>?fmt=clash|singbox|base64 → 引擎原生参数
   const fmt = String(url.searchParams.get('fmt') || '').toLowerCase();
   if (fmt === 'clash' || fmt === 'clashyaml' || fmt === 'singbox' || fmt === 'sing-box' || fmt === 'sing') return resp;
   // 临时订阅同样是订阅输出，备注规则与主订阅保持一致
   if (!(await subscriptionTaggingEnabled(env))) return resp;
-  return await tagSubscriptionResponse(resp, tagOpts(env, ctx));
+  return await tagSubscriptionResponse(resp, await tagOpts(env, ctx));
 }
 
 function renderNotFoundFallback() {

@@ -74,9 +74,21 @@ async function call(path, { method = 'GET', body, authed = true } = {}) {
   return { status: res.status, data, html: text };
 }
 
+/**
+ * 整数控件的 min/max 必须来自 SPEC —— 界面里另写一份区间就是又一处「改了这里、那里不生效」。
+ * 返回区间与 SPEC 对不上的字段名。
+ */
+function intControlMismatch(html, keys) {
+  const spec = panelSpec();
+  return keys.filter(k => {
+    const f = spec[k];
+    if (!f || f.type !== 'int') return false;
+    return !new RegExp(`data-key="${k}"[^>]*min="${f.min}" max="${f.max}"`).test(html);
+  });
+}
+
 // ===================== 1. 注册表本身 =====================
-section('1. 注册表结构（字段表是唯一真源）');
-{
+section('1. 注册表结构（字段表是唯一真源）');{
   const specKeys = Object.keys(panelSpec());
   const paramKeys = panelParams().map(p => p.key);
   ok('面板字段与 SPEC 一一对应（不多不少）',
@@ -109,7 +121,16 @@ section('2. 面板渲染（每个字段都有控件）');
   const sections = [...new Set(panelParams().map(p => p.section))];
   ok('分组名渲染成了小标题', sections.every(s => html.includes(`>${s}</div>`)), `${sections.length} 段`);
   ok('整数控件带 SPEC 的区间（面板与运行时同一份约束）',
-    html.includes('min="5" max="1440"') && html.includes('min="1" max="500"'));
+    intControlMismatch(html, panelParams().map(p => p.key)).length === 0,
+    intControlMismatch(html, panelParams().map(p => p.key)).join(',') || `${panelParams().filter(p => panelSpec()[p.key].type === 'int').length} 个整数控件`);
+
+  // 搬到专属表单的字段同样不能例外：自动优选频率现在只在 dns-config 表单里改，
+  // 那张表单的 min/max 也必须来自 SPEC —— 否则「面板显示 12 小时、实际按别的区间夹」会复活。
+  const dnsItem = flatCatalog().find(i => i.id === 'dns-config');
+  const dnsHtml = renderSettingForm(dnsItem);
+  ok('专属表单（dns-config）的整数控件同样带 SPEC 区间',
+    /data-key="dns_interval_minutes"[^>]*min="5" max="1440"/.test(dnsHtml),
+    (dnsHtml.match(/data-key="dns_interval_minutes"[^>]*>/) || ['未渲染'])[0].replace(/\s+/g, ' '));
   ok('敏感字段用密码框', /type="password"[\s\S]{0,200}data-key="cf_api_token"/.test(html));
 
   // 页面里真的挂着这张表单（不是只在单元层面渲染了一下）
@@ -150,11 +171,16 @@ section('3. 保存 → 立即生效（无需重新部署）');
   ok('布尔值写入后被归一化成 boolean', (await readSetting(env, 'sub_strict')) === false);
   await call('/__api/settings', { method: 'POST', body: { sub_strict: true } });
 
-  // ---- 不认识的字段不许写进存储 ----
+  // ---- 不认识的字段必须当场报错，不能静默忽略 ----
+  //
+  // 这里原先写的是「400 或者 200 但没写进库」——两种都算过，等于没查：
+  // 静默忽略正是「字段名写错也提示已保存、值却没变」的成因，必须堵成硬失败。
   const junk = await call('/__api/settings', { method: 'POST', body: { not_a_real_key: 'x' } });
-  ok('目录外的字段被拒绝而不是静默写库',
-    junk.status === 400 || (junk.data && junk.data.ok && !('not_a_real_key' in (junk.data.config || {}))),
-    `HTTP ${junk.status}`);
+  ok('目录外的字段被拒绝（400），不是静默忽略',
+    junk.status === 400 && /未知配置项/.test(String(junk.data && junk.data.error || '')),
+    `HTTP ${junk.status} ${JSON.stringify(junk.data && junk.data.error)}`);
+  ok('报错里点名是哪个字段（否则等于没说）',
+    /not_a_real_key/.test(String(junk.data && junk.data.error || '')));
   const rawDoc = JSON.parse(mem.get('APP_CONFIG') || '{}');
   ok('存储里没有多出目录外的键', !(rawDoc.settings && 'not_a_real_key' in rawDoc.settings),
     Object.keys((rawDoc.settings) || {}).join(','));

@@ -28,6 +28,9 @@
 - 只有**部署形态**项留在 wrangler.toml / 环境变量：`STORAGE_BACKEND / DB / SITES / MEDIA_R2`（改它等于换存储，必须与绑定同改）与 `PASSWORD / KEY`（凭据，不进 KV）。
 - 面板 HTML 的 `min/max/value` 必须从 SCHEMA/常量插值，不许手写。
 - 运行参数改完**必须即时生效**：写库后由 `notifyConfigChange(section)` 广播，各模块在 `onConfigChange` 里清掉自己的进程内快照（见 `cf-analytics.js` 的 `cache.clear()`、`geoip.js` 的 `cfNets = null`）。新增模块级缓存，就要同时挂一个清缓存的钩子。
+- **写入侧不许静默忽略**：`saveSettings` 遇到 `SETTINGS_SPEC` 之外的键直接报 400 并点名是哪个字段。静默忽略会让「字段名写错 / 调用方还在用旧别名」表现为「提示保存成功、值却没变」——不报错、日志干净，只能人肉比对。同理，新增接口时别再造一层 `{别名} → 注册表字段名` 的翻译。
+- **校验要拦在写入前**：面板值若不能被引擎接受（如 `uuid` 必须是 v4 形态，否则 `vendor/vless.js` 会静默改用派生值），必须在注册表字段的 `validate` 里拦住，而不是等引擎默默丢弃。
+- **接口必须进目录**：`admin.js` 里新增 `/__api/*` 就要在 `api-catalog.js` 加条目，否则面板不渲染、手册不收录，而且什么都不报错。刻意不进目录的（内部探活、预览类）要登记进 `check-configui` 第 7 段的 `OFF_CATALOG` 白名单并写明理由。
 - 强制检查：`node tools/check-single-source.mjs` + `node tools/check-settings.mjs`（均已入 CI）。
 
 ## 2. 浏览器端 `api()` 返回包装结构
@@ -79,5 +82,6 @@ CF 边缘（workers.dev 与自定义域行为一致）会：① 改写入站 `Ac
 ## 8. 项目结构速查
 
 - `worker.js` — 入口路由 / 伪装 / 字节计数；`src/admin.js` — 管理页与服务端接口（页面脚本内联在模板里）；`src/scopes.js` — 访问渠道注册表（新增渠道只改这里 + 补 check-stats 第 9 段用例）；`src/config.js` — SPEC 与环境变量种子；`src/settings.js` — 运行参数注册表（面向运营的参数唯一真源，面板表单与运行时共同消费）；`src/api-catalog.js` — 接口目录（面板渲染与手册的共同来源）。
-- 管理页的配置表单**不手写**：`api-catalog.js` 的目录项带 `spec/params`，`config-ui.js` 的 `renderSettingForm` 按注册表渲染（`gridHtml` 支持按 `section` 分段）。加一个可配置项 = 注册表加一条，界面自动多一个输入框。
+- 管理页的配置表单**不手写**：`api-catalog.js` 的目录项带 `spec/params`，`admin.js` 的页面模板只写 `settingFormById('<目录项 id>')`，`config-ui.js` 的 `renderSettingForm` 按注册表渲染（`gridHtml` 支持按 `section` 分段）。加一个可配置项 = 注册表加一条，界面自动多一个输入框。
+- 功能选项卡自己的**动作 / 查询**同样不手写：`toolItemsForTab('<tab id>')` 从目录渲染（归属该选项卡的非设置项）。目录项声明的固定请求体写在 `item.body`，由 `renderToolItem` 挂到元素的 `data-body`，浏览器侧与用户填写的字段合并 —— 别在页面脚本里另写一份参数。
 - 自检入口 `node tools/check-*.mjs`（无 package.json，不走 npm）。

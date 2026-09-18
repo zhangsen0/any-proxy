@@ -134,16 +134,6 @@ async function targetHost(env, hostname) {
   return '';
 }
 
-async function poolFrom(key, limit) {
-  try {
-    const v = await runtime.KV.get(key);
-    if (!v) return [];
-    return parseIpv4List(v, limit || POOL_LIMIT);
-  } catch {
-    return [];
-  }
-}
-
 /**
  * 定时入口：每 5 分钟触发一次（细粒度守底），按用户配置的间隔（默认 720 分钟 = 12 小时）
  * 决定是否真正执行自动优选 DNS 更新，避免高频无谓刷新。
@@ -177,8 +167,10 @@ async function autoUpdatePreferredDns(env, opts = {}) {
   // targetHost 内部走「面板/环境变量 → 本次 hostname → 上次访问过的 hostname」，
   // cron 触发时没有请求上下文，靠的就是最后那层兜底 —— 不能在这里图省事直接读配置
   const host = await targetHost(env, opts.hostname);
-  const zone = cfg.cf_zone_id || (env && (env.CF_ZONE_ID || env.cf_zone_id));
-  const token = cfg.cf_api_token || (env && (env.CF_API_TOKEN || env.cf_api_token));
+  // 凭据取值就走注册表（面板 → 环境变量种子 → 默认），不在这里再兜一次环境变量 ——
+  // 那样同一个变量会有两处读法，迟早出现「面板填了却用了环境变量的值」
+  const zone = cfg.cf_zone_id;
+  const token = cfg.cf_api_token;
   if (!host) return { ok: false, error: '无法确定优选目标域名：请在「配置中心 → 代理与转发」填写优选目标域名' };
   if (!zone || !token) return { ok: false, error: '缺少 CF API 凭据：请在「配置中心 → Cloudflare 接口」填写 API Token 与 Zone ID' };
 
@@ -186,8 +178,10 @@ async function autoUpdatePreferredDns(env, opts = {}) {
     // 1. 候选优先级：GOOD_IPS（外部验证过的可用集，最安全）→ 优选池（浏览器测速保存）→ 订阅节点 → 域名池解析
     //    （1034 Edge IP Restricted 状态会变，服务端无法自行验证，只有外部 HTTPS 访问（SNI=域名）能区分，
     //    因此自动优选优先用「已验证可用集」，避免把 1034 IP 写进 A 记录。）
-    const goodPool = await poolFrom('GOOD_IPS');
-    const basePool = await poolFrom('PREF_IPS');
+    // 两个池直接取注册表解析后的值：截断长度与面板显示、与面板写入完全一致
+    // （旧版这里读 KV 时用的是代码里的默认上限，面板把上限改大之后运行时只取前 30 条）
+    const goodPool = Array.isArray(cfg.pool_good_ips) ? cfg.pool_good_ips : [];
+    const basePool = Array.isArray(cfg.preferred_ips) ? cfg.preferred_ips : [];
     let candidates = [...new Set([...goodPool, ...basePool])];
     let note = '';
 
@@ -208,7 +202,7 @@ async function autoUpdatePreferredDns(env, opts = {}) {
 
     // 池子仍然为空时，按候选域名池动态解析出当前边缘 IP，而不是退回写死的 IP 列表
     if (!candidates.length && Date.now() < deadlineMs) {
-      const domains = await domainPool(env, cfg.domain_pool_limit);
+      const domains = Array.isArray(cfg.pref_domains) ? cfg.pref_domains : [];
       if (domains.length) {
         try {
           const resolved = await resolveDomains(domains, {
@@ -256,13 +250,6 @@ async function autoUpdatePreferredDns(env, opts = {}) {
   } catch (e) {
     return { ok: false, error: '自动优选执行异常：' + (e && e.message ? e.message : e) };
   }
-}
-
-/** 候选域名池：KV（面板可配）优先，否则取环境变量 PREF_DOMAINS。都没有则返回空 —— 不内置写死列表。 */
-async function domainPool(env, limit) {
-  const stored = await runtime.KV.get('PREF_DOMAINS').catch(() => null);
-  const raw = stored || (env && (env.PREF_DOMAINS || env.pref_domains)) || '';
-  return parseDomainList(raw, limit || DOMAIN_POOL_LIMIT);
 }
 
 /**

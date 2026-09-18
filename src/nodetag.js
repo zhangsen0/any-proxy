@@ -11,11 +11,11 @@
 
 import {
   lookupCountries, enabled as geoipEnabled, isIpv4, flagEmoji, regionName, toggle,
-  readTagSettings, saveTagSettings, STYLE_DEFAULT,
+  readTagSettings, STYLE_DEFAULT,
   ANYCAST, ANYCAST_LABEL, ANYCAST_CODE,
 } from './geoip.js';
 
-export { readTagSettings, saveTagSettings };
+export { readTagSettings };
 
 const NODE_RE = /^(vless|vmess|trojan|ss|ssr|tuic|hysteria2?|http|https|socks5?):\/\//i;
 const SEP = ' | ';
@@ -251,13 +251,20 @@ export async function tagSubscriptionResponse(resp, opts = {}) {
   }
 }
 
-/** 备注后缀的样式：cn-code（默认）/ flag-name / name / code / flag。可用环境变量 NODE_COUNTRY_STYLE 覆盖。 */
-function styleFrom(env) {
-  const raw = String((env && (env.NODE_COUNTRY_STYLE || env.node_country_style)) || '').trim().toLowerCase();
-  return raw || DEFAULT_STYLE;
+/**
+ * 备注后缀的样式：cn-code（默认）/ flag-name / name / code / flag。
+ *
+ * 取值统一走注册表（面板 → 环境变量 → 默认），**不再自己读环境变量**。
+ * 这里曾经是一份「只认 NODE_COUNTRY_STYLE 环境变量」的实现，而面板把样式写进 KV ——
+ * 于是面板上改了样式、订阅输出一直没变，且因为函数是同步的、调用点看不出问题，
+ * 这个 bug 躲过了所有单测。样式词表与默认值的真源都在 settings.js 的 node_tag_style。
+ */
+export async function styleFrom(env) {
+  const t = await readTagSettings(env);
+  return t.style || DEFAULT_STYLE;
 }
 
 export {
-  styleFrom, DEFAULT_STYLE, NODE_RE, SEP, decodeWhole,
+  DEFAULT_STYLE, NODE_RE, SEP, decodeWhole,
   lineHost, lineRemark, tagText, toggle, MAX_SUB_BYTES,
 };

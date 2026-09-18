@@ -13,7 +13,7 @@
 import { runtime, onConfigChange } from './runtime.js';
 import { toBool } from './config.js';
 import { isIpv4 } from './util.js';
-import { SETTINGS_SPEC, readSettings } from './settings.js';
+import { SETTINGS_SPEC, readSettings, settingsSource } from './settings.js';
 
 // 默认数据源：HTTPS、免密钥、单次 POST 支持 100 个 IP，数据来自 MaxMind GeoLite2。
 // 任何接受 JSON 数组并返回国家代码的批量端点都能替换 —— 默认值登记在 settings.js 的 SPEC，
@@ -171,46 +171,44 @@ export function regionName(cc) {
   }
 }
 
-/** 是否给节点备注补国家：KV（面板）→ 环境变量 → 默认开启。 */
+/** 是否给节点备注补国家。取值统一走注册表：面板（独立 KV 键）→ 环境变量 → 默认开启。 */
 export async function enabled(env) {
-  const kv = await kvGet('NODE_COUNTRY_TAG');
-  if (kv !== null && kv !== undefined && String(kv).trim() !== '') return toggle(kv, true);
-  const raw = env && (env.NODE_COUNTRY_TAG || env.node_country_tag);
-  if (raw !== undefined && raw !== null && String(raw).trim() !== '') return toggle(raw, true);
-  return true;
+  const cfg = await readSettings(env);
+  return cfg.node_tag_enabled !== false;
 }
 
-const KEY_ON = 'NODE_COUNTRY_TAG';
-const KEY_STYLE = 'NODE_COUNTRY_STYLE';
-// 备注后缀的默认样式：中文名 + ISO 代号，例如 英国【GB】
-const STYLE_DEFAULT = 'cn-code';
+// 备注后缀的默认样式：中文名 + ISO 代号，例如 英国【GB】。
+// 真源在注册表（node_tag_style），这里取出来给 nodetag 复用 —— 样式词表只允许有一份。
+const STYLE_DEFAULT = SETTINGS_SPEC.node_tag_style.default;
 
-/** 备注后缀样式的默认值，由这里单点定义，nodetag 与面板都从这里取。 */
+/** 备注后缀样式的默认值，由注册表单点定义，nodetag 与面板都从这里取。 */
 export { STYLE_DEFAULT };
 
-/** 读取「是否标注国家」+「标注样式」：KV（面板）→ 环境变量 → 默认值。 */
+/**
+ * 读取「是否标注国家」+「标注样式」。
+ *
+ * 这里刻意不再自己解析一遍：这两个字段已经是注册表里的成员（store: 'kv'，
+ * 独立 KV 键由注册表读写），来源标注也用注册表的归因。曾经这里有一份
+ * 「KV → 环境变量 → 默认」的实现，nodetag 那边还有一份「只认环境变量」的
+ * —— 于是就出现了「面板改了样式、订阅输出没变」。
+ */
 export async function readTagSettings(env) {
-  const kvOn = await kvGet(KEY_ON);
-  const kvStyle = await kvGet(KEY_STYLE);
-  const envOn = env && (env.NODE_COUNTRY_TAG || env.node_country_tag);
-  const envStyle = env && (env.NODE_COUNTRY_STYLE || env.node_country_style);
-  const onRaw = kvOn !== null && kvOn !== undefined && String(kvOn).trim() !== '' ? kvOn : envOn;
-  const styleRaw = kvStyle !== null && kvStyle !== undefined && String(kvStyle).trim() !== '' ? kvStyle : envStyle;
-  const style = String(styleRaw || '').trim().toLowerCase();
+  const cfg = await readSettings(env);
   return {
-    enabled: toggle(onRaw, true),
-    style: style || STYLE_DEFAULT,
-    sourceOn: String(kvOn || '').trim() ? 'kv' : (String(envOn || '').trim() ? 'env' : 'default'),
-    sourceStyle: String(kvStyle || '').trim() ? 'kv' : (String(envStyle || '').trim() ? 'env' : 'default'),
+    enabled: cfg.node_tag_enabled !== false,
+    style: String(cfg.node_tag_style || '').trim().toLowerCase() || STYLE_DEFAULT,
+    sourceOn: await settingsSource(env, 'node_tag_enabled'),
+    sourceStyle: await settingsSource(env, 'node_tag_style'),
   };
 }
 
-/** 保存面板里的设置。enabled / style 都允许显式写回，空串表示回到默认。 */
-export async function saveTagSettings(patch = {}) {
-  if (patch.enabled !== undefined) await kvPut(KEY_ON, patch.enabled === true ? 'true' : 'false');
-  if (patch.style !== undefined) await kvPut(KEY_STYLE, String(patch.style).trim().toLowerCase());
-  return await readTagSettings(patch.env);
-}
+/**
+ * 保存面板里的设置 —— 已并入统一运行参数，不再单独提供入口。
+ *
+ * 原先这里有一个 `saveTagSettings({enabled, style})`：它把面板的 {enabled, style} 翻译成
+ * 注册表字段名再写 KV。现在接口直接收注册表字段名（node_tag_enabled / node_tag_style），
+ * 翻译层本身就是「同一件事的第二份定义」，删掉它才谈得上单一真源。
+ */
 
 /** 单次批量查询的条数上限：运行参数（面板）优先，环境变量作种子，默认值在 SPEC 里 */
 async function batchSize(env) {

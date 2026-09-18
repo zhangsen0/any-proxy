@@ -130,6 +130,21 @@ function isDomain(s) {
 }
 
 /**
+ * 节点 UUID 判定：**必须与代理引擎的接受条件逐字一致**。
+ *
+ * vendor/vless.js 里 `userID = (envUUID && uuidRegex.test(envUUID)) ? envUUID.toLowerCase() : 由口令派生`。
+ * 也就是说：面板上填了一个「看起来像 UUID 但不是 v4 形态」的值时，引擎会**默默忽略它**
+ * 改用派生 UUID —— 面板提示保存成功，实际订阅里的节点 ID 完全没变。
+ * 这就是「改了这里、那里不生效」的典型，所以格式判断必须与引擎同源，
+ * 并且要在**写入前**拦住（见 settings.js 的 node_uuid.validate），而不是等引擎静默丢弃。
+ */
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+
+function isUuid(s) {
+  return UUID_RE.test(String(s == null ? '' : s).trim().toLowerCase());
+}
+
+/**
  * 多行文本 → 合法的 IPv4 列表。
  * 兼容换行 / 逗号 / 分号 / 空格分隔，`#` 之后视为注释，结果去重并截到 limit。
  * @param {unknown} text
@@ -158,7 +173,29 @@ function parseDomainList(text, limit) {
   return typeof limit === 'number' && limit > 0 ? out.slice(0, limit) : out;
 }
 
+/**
+ * MD5 十六进制摘要。
+ */
+async function md5Hex(s) {
+  const buf = await crypto.subtle.digest('MD5', new TextEncoder().encode(s));
+  return [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+/**
+ * 与代理引擎（vendor/vless.js 的 MD5MD5）完全一致的口径：MD5(MD5(text).hex.slice(7,27))。
+ *
+ * 为什么必须放在这里：这个口径原先在 subs.js 与 tempsubs.js 各写了一份。
+ * 两份实现只要有一处改动（哪怕只是大小写），订阅 token 与临时订阅 token 就会分叉，
+ * 表现为「临时订阅链接 404 而主订阅正常」——很难从现象定位到原因。
+ * 全项目现在只有这一份实现，引擎侧那份属于上游，改动由 check-nodetag 用例钉住。
+ */
+async function md5md5(s) {
+  const first = await md5Hex(s);
+  return (await md5Hex(first.slice(7, 27))).toLowerCase();
+}
+
 export {
   json, b64, slugify, randomSuffix, kvKey, validTarget, cors, isText, isFingerprinted, esc, isNavigation,
-  isIpv4, isDomain, parseIpv4List, parseDomainList,
+  isIpv4, isDomain, isUuid, parseIpv4List, parseDomainList,
+  md5Hex, md5md5,
 };

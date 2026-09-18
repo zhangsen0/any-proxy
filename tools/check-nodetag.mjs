@@ -201,8 +201,19 @@ reset();
   ok('增强失败仍返回可读取的原文', dt === SUB, 'len=' + dt.length);
 }
 {
-  ok('style 默认 cn-code', styleFrom({}) === 'cn-code' && DEFAULT_STYLE === 'cn-code');
-  ok('style 可读取环境变量', styleFrom({ NODE_COUNTRY_STYLE: 'name' }) === 'name');
+  // styleFrom 现在走注册表（异步）：面板 → 环境变量 → 默认，三级取值由 settings.js 统一解释。
+  // 这里曾经是一份「只认 NODE_COUNTRY_STYLE 环境变量」的同步实现，而面板把样式写进 KV ——
+  // 于是「面板改了样式、订阅输出没变」，且因为同步、调用点看不出问题，躲过了所有单测。
+  ok('style 默认 cn-code', await styleFrom({}) === 'cn-code' && DEFAULT_STYLE === 'cn-code');
+  ok('没有面板值时回落到环境变量种子', await styleFrom({ NODE_COUNTRY_STYLE: 'name' }) === 'name');
+
+  // 核心回归用例：面板（KV）值必须压过环境变量 —— 这正是「改了不生效」的原始 bug
+  mem.set('NODE_COUNTRY_STYLE', 'flag');
+  ok('面板值优先于环境变量（原始 bug 的回归用例）',
+    await styleFrom({ NODE_COUNTRY_STYLE: 'name' }) === 'flag',
+    await styleFrom({ NODE_COUNTRY_STYLE: 'name' }));
+  mem.delete('NODE_COUNTRY_STYLE');
+  ok('清掉面板值后回到环境变量', await styleFrom({ NODE_COUNTRY_STYLE: 'name' }) === 'name');
 }
 
 console.log('\n=== 7. 管理页渲染：配置卡片与绑定逻辑必须在同一页 ===');
@@ -210,17 +221,27 @@ console.log('\n=== 7. 管理页渲染：配置卡片与绑定逻辑必须在同�
   // 真人踩过的坑：把 JS 注入到模板时，锚点命中了「临时订阅页」的 script，
   // 结果主页只有 HTML 元素、没有任何点击处理，开关点了完全没反应。
   // 这里连同绑定的 JS 一起校验，而不是只查元素是否存在。
+  //
+  // 标注设置现在由**通用设置表单**渲染（目录项 node-tag → settingFormById），
+  // 不再是手写卡片。所以断言的是目录契约：表单在页面上、字段名来自注册表、
+  // 表单自己带着接口路径（通用脚本按 data-path 读写，不认路径字符串）。
   const { adminPage } = await import('../src/admin.js');
   const resp = await adminPage(true, 'https://proxy.example.com', env);
   const html = await resp.text();
   ok('管理页渲染正常', html.length > 10000, 'bytes=' + html.length);
-  for (const el of ['paneTabs', 'ntEnabled', 'ntStyle', 'ntSaveBtn', 'paneTabs']) {
+  for (const el of ['paneTabs', 'data-uid="node-tag"', 'data-key="node_tag_enabled"', 'data-key="node_tag_style"']) {
     ok('含配置元素 ' + el, html.includes(el));
   }
+  const formAt = html.indexOf('data-uid="node-tag"');
+  ok('表单自己带着接口路径（通用脚本据此读写）',
+    formAt >= 0 && /data-path="\/__api\/node-tag"/.test(html.slice(formAt, formAt + 400)),
+    formAt < 0 ? '找不到表单' : (html.slice(formAt, formAt + 400).match(/data-path="[^"]+"/) || ['无 data-path'])[0]);
   const blocks = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)].map(m => m[1]);
   const js = blocks.join('\n');
   ok('主页脚本含分区切换逻辑', js.includes('switchPane') && js.includes('paneTabs'));
-  ok('主页脚本含标注保存逻辑', js.includes('/__api/node-tag'));
+  // 通用设置脚本是「按 data-path 读写」的一套，只要它被注入，页面上的每个设置表单就有绑定了。
+  ok('主页脚本含通用设置表单逻辑（data-setting / data-path）',
+    js.includes('data-setting') && js.includes('data-path') && js.includes('data-act'));
   // 分区数量会随功能增加（外观主题 / 配置都是后来加的），所以这里不写死个数，
   // 而是校验「标签与卡片一一对应」：每个标签都有卡片，且没有卡片挂在不存在标签上。
   // 这样加分区不用改测试，加错了（漏放卡片 / 标签拼错）依然会被抓出来。
@@ -234,8 +255,8 @@ console.log('\n=== 7. 管理页渲染：配置卡片与绑定逻辑必须在同�
 
 console.log('\n=== 8. 管理接口：/__api/node-tag 必须真的能调通 ===');
 {
-  // 真人踩过的坑：admin.js 调用了 readTagSettings / saveTagSettings，却没把这两个
-  // 名字 import 进来。ESM 下这是运行时才炸的 ReferenceError，而 worker.js 的全局兜底
+  // 真人踩过的坑：admin.js 调用了 readTagSettings，却没把这个名字 import 进来。
+  // ESM 下这是运行时才炸的 ReferenceError，而 worker.js 的全局兜底
   // 在伪装开启时会把任何未捕获异常渲染成「伪装 404」——前端表现就是「保存标注设置」
   // 点了完全没反应，控制台只看到一个 404。
   //
@@ -265,15 +286,28 @@ console.log('\n=== 8. 管理接口：/__api/node-tag 必须真的能调通 ===')
   try { cfg = JSON.parse(g.text).config; } catch {}
   ok('带回开关与样式字段', !!cfg && typeof cfg.enabled === 'boolean' && !!cfg.style, JSON.stringify(cfg));
 
-  const p = await call('POST', { enabled: false, style: 'flag-name' });
+  // 请求体就是注册表的字段名：接口不再认第三套 {enabled, style} 别名。
+  // 这一条同时也是「写路径只有一套字段名」的守卫 —— 若有人再加一层翻译，
+  // 用旧名的调用方会静默写不进去（saveSettings 只认 SPEC 里的键），这里就会红。
+  const p = await call('POST', { node_tag_enabled: false, node_tag_style: 'flag-name' });
   ok('POST 保存返回 200', p.status === 200, `status=${p.status} ${/json/i.test(p.ct) ? '' : p.text.slice(0, 40)}${p.err ? ' err=' + p.err : ''}`);
   let saved = null;
   try { saved = JSON.parse(p.text).config; } catch {}
   ok('保存后开关与样式真的写回', !!saved && saved.enabled === false && saved.style === 'flag-name', JSON.stringify(saved));
-  ok('来源变成面板配置（kv）', !!saved && saved.sourceOn === 'kv' && saved.sourceStyle === 'kv');
+  // 来源标注统一由注册表归因：存在独立 KV 键里就算是「面板配置」。
+  // 原本这里断言的是 'kv'（旧实现自己编的第三种来源名），而面板只认 panel/env/default/legacy。
+  ok('来源变成面板配置（panel）', !!saved && saved.sourceOn === 'panel' && saved.sourceStyle === 'panel', JSON.stringify(saved));
+  ok('用旧别名 {enabled, style} 写入被拒（字段名只有一套）', await (async () => {
+    const q = await call('POST', { enabled: true, style: 'cn-code' });   // 旧名，应被拒
+    const e = String((() => { try { return JSON.parse(q.text).error; } catch { return ''; } })() || '');
+    if (q.status !== 400 || !/未知配置项/.test(e)) return false;
+    const c = await call('GET');                                        // 且配置一点没变
+    let now = null; try { now = JSON.parse(c.text).config; } catch {}
+    return !!now && now.enabled === false && now.style === 'flag-name';
+  })(), '旧别名应当报 400 而不是静默忽略');
 
-  // 复原，避免影响其它用例对默认值的判断
-  await call('POST', { enabled: true, style: 'cn-code' });
+  // 复原，避免影响其它用例对默认值的判断（用注册表字段名）
+  await call('POST', { node_tag_enabled: true, node_tag_style: 'cn-code' });
 }
 
 globalThis.fetch = realFetch;

@@ -262,6 +262,16 @@ export function sanitize(spec, values) {
   return out;
 }
 
+/**
+ * 归一化器对外暴露一份。
+ *
+ * 为什么必须共用：`settings.js` 的运行参数有一部分并不存在 `APP_CONFIG` 里
+ * （代理引擎的 `config.json`、历史遗留的独立 KV 键），它们的读写要自己实现，
+ * 但**归一化口径必须与分区配置完全一致** —— 否则同一个 `int` 字段在两条路径上
+ * 会有两套夹紧规则，正是本项目最忌讳的「同一设定两份定义」。
+ */
+export { coerceField as coerceBySpec };
+
 /** 取一处说明书式的字段清单，供管理页渲染表单（也能用于自检脚本核对） */
 export function describeSpec(spec) {
   return Object.entries(spec).map(([key, field]) => ({

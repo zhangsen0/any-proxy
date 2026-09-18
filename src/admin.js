@@ -7,10 +7,14 @@ import { readR2Config, saveR2Config, R2_CACHE_SPEC, R2_PREFIX } from './media-r2
 import { sweepMediaR2 } from './proxy.js';
 import {
   autoUpdatePreferredDns, filterUsableIps, applyDnsWithSelfCheck, resolveProxyHost, targetHost,
-  DNS_INTERVAL, POOL_LIMIT, DOMAIN_POOL_LIMIT,
+  DNS_INTERVAL,
 } from './dns.js';
 import { subscriptionUrl, fetchSubscriptionCandidates, CANDIDATE_LIMIT } from './subs.js';
-import { SETTINGS_SPEC, readSettings, safeSettings, saveSettings, clearSetting, settingsSources, describeGroups } from './settings.js';
+import {
+  SETTINGS_SPEC, readSettings, safeSettings, saveSettings, clearSetting,
+  settingsSources, settingsSource, describeGroups,
+  panelSpecOf, nodeIdentity,
+} from './settings.js';
 import * as tempsubs from './tempsubs.js';
 import { readConfig, saveConfig, sanitize, isActive, renderHome, listTemplates } from './disguise.js';
 import { VISIT_SCOPES } from './scopes.js';
@@ -31,21 +35,22 @@ import {
   readShareConfig, saveShareConfig, createShare, listShares,
   revokeShare, enableShare, deleteShare, linkPath, SHARE_SPEC,
 } from './share.js';
-import { renderConfigPanels, settingFormById, CONFIG_JS, CONFIG_CSS } from './config-ui.js';
+import { renderConfigPanels, settingFormById, toolItemsForTab, CONFIG_JS, CONFIG_CSS } from './config-ui.js';
 import { renderStatsPane, STATS_JS, STATS_CSS } from './stats-ui.js';
 import { renderCfPane, CF_JS, CF_CSS } from './cf-panel.js';
 import { cfAnalytics } from './cf-analytics.js';
-import { readTagSettings, saveTagSettings } from './nodetag.js';
+import { readTagSettings } from './nodetag.js';
 
 /**
- * 分钟数说成人话（720 → 12 小时），供面板文案使用。
- * 文案里的「12 小时 = 720」原先也是写死的，现在跟着 DNS_INTERVAL 走。
+ * 输入是不是「一个字都没填」。
+ *
+ * 只判断空，**不参与解析也不参与校验** —— 合法性与归一化只有 util.js 那一份解析器。
+ * 用途：区分「用户明确清空列表」与「填了一堆但一条有效的都没有」。后者必须当场报错，
+ * 否则就是我们踩过的那个坑：提示保存成功，池子其实是空的。
  */
-function minutesLabel(minutes) {
-  const m = Number(minutes) || 0;
-  if (m && m % 1440 === 0) return `${m / 1440} 天`;
-  if (m && m % 60 === 0) return `${m / 60} 小时`;
-  return `${m} 分钟`;
+function blankList(v) {
+  if (Array.isArray(v)) v = v.join('\n');
+  return String(v == null ? '' : v).replace(/[\s,;]+/g, '') === '';
 }
 
 // 站点管理：REST API + 服务端渲染的管理页
@@ -103,7 +108,8 @@ async function handleAdmin(request, url, env) {
     if (request.method === 'POST') {
       let body;
       try { body = await request.json(); } catch { return json({ error: 'invalid json' }, 400); }
-      // 前端把整块表单一次提交：只取 SPEC 里认识的键，多传的字段不写进存储
+      // 前端把整块表单一次提交。字段名只有 SPEC 一套，出现不认识的键 saveSettings 会报错
+      // （以前是静默忽略：名字写错也返回「已保存」，值却没变）。
       const r = await saveSettings(env, body);
       if (r && r.error) return json({ error: r.error }, 400);
       return json({
@@ -165,20 +171,16 @@ async function handleAdmin(request, url, env) {
     });
   }
 
-  // 优选 IP 池（PREF_IPS，仅 DNS 自动优选用，与 edgetunnel 的 ADD.txt 解耦）：GET 读取 / POST 保存（apply=true 时先测通再更新 DNS A 记录）
-  // 解析与条数上限都走 util.js / POOL_LIMIT：面板存进去的必须是运行时认得的，
-  // 否则会出现「提示保存成功、池子其实被过滤成空」（旧版校验只验段数，999.999.999.999 也能存）
+  // 优选 IP 池（PREF_IPS，仅 DNS 自动优选用，与 edgetunnel 的 ADD.txt 解耦）：
+  // GET 读取 / POST 保存（apply=true 时先测通再更新 DNS A 记录）。
+  //
+  // 字段、解析口径与条数上限全部来自运行参数注册表（settings.js 的 preferred_ips，store: 'kv'）：
+  // 这里不再自己读 KV、也不再自己写上限判断 —— 面板存进去的、运行时读出来的、这个接口返回的，
+  // 必然是同一批 IP（见 check-single-source 的「落盘条数 = 面板上限」用例）。
   if (path === '/__api/preferred-ips') {
-    // 条数上限是运行参数：面板写入的截断与运行时读取的截断必须同一口径（见 check-single-source）
-    const cfg = await readSettings(env);
-    const poolLimit = cfg.pool_limit || POOL_LIMIT;
     if (request.method === 'GET') {
-      let ips = [];
-      try {
-        const add = await runtime.KV.get('PREF_IPS');
-        if (add) ips = parseIpv4List(add, poolLimit);
-      } catch {}
-      return json({ ok: true, ips, limit: poolLimit });
+      const cfg = await readSettings(env);
+      return json({ ok: true, ips: cfg.preferred_ips, limit: cfg.pool_limit });
     }
     if (request.method === 'POST') {
       let body;
@@ -187,9 +189,14 @@ async function handleAdmin(request, url, env) {
       } catch {
         return json({ error: 'invalid json' }, 400);
       }
-      const uniq = parseIpv4List(body.ips, poolLimit);
-      if (!uniq.length) return json({ error: '没有有效的 IP（每行一个 IPv4 地址，每段需在 0~255）' }, 400);
-      await runtime.KV.put('PREF_IPS', uniq.join('\n'));
+      // 「非空输入却一条都没留下」要当场说清楚：否则就是「提示保存成功、池子其实是空的」。
+      // 用 util.js 的同一个解析器做这个判断（它就是注册表读写共用的那一份），不另立规则。
+      if (!blankList(body.ips) && !parseIpv4List(body.ips).length) {
+        return json({ error: '没有有效的 IP（每行一个 IPv4 地址，每段需在 0~255）' }, 400);
+      }
+      const r = await saveSettings(env, { preferred_ips: body.ips });
+      if (r && r.error) return json({ error: r.error }, 400);
+      const uniq = r.values.preferred_ips;
       let updated = null;
       if (body.apply && uniq.length) {
         // 立即应用：并发 HTTP 探测过滤不可达 IP，再写入 A 记录（应用后自检，不可用自动回滚）
@@ -354,88 +361,45 @@ async function handleAdmin(request, url, env) {
     }
   }
 
-  // ---- 订阅生成配置：引擎配置在 KV config.json（vless.js 每次请求直接读、无缓存），
-  // 与面板分区配置 APP_CONFIG / 伪装配置 DISGUISE_CONFIG 是相互独立的存储，
-  // 这里只读写引擎这份，保存后下一次订阅请求立即按新值输出 ----
-  if (path === '/__api/sub-gen') {
-    const readEngineCfg = async () => {
-      const raw = await runtime.KV.get('config.json').catch(() => null);
-      if (!raw) return null;
-      try { return JSON.parse(raw); } catch { return null; }
-    };
+  // GET / POST /__api/node-config -> 代理节点身份（UUID / 地址 / 路径 / 协议 / 传输 / 指纹 / 订阅名…）
+  //
+  // 这一组字段在注册表里标了 `store: 'engine'`：它们落在**代理引擎自己的配置文档**
+  // （KV config.json）里，因为引擎每次请求都直接读那份文档，搬走就等于同一个设定两份存储。
+  // 接口本身不写任何字段名 —— 字段清单取自 panelSpecOf('node-config')，读走 readSettings、
+  // 写走 saveSettings（整份读改写，保留引擎的其它键：订阅转换 / 反代 / TG…）。
+  //
+  // 保存后 router.js 会在把请求交给引擎之前用 engineEnvFor 把有效值回灌成环境变量。
+  // 不加这一步，引擎每次请求都会用自己的上下文覆盖 config.json 里的 UUID / HOSTS / PATH，
+  // 面板上「保存成功」而订阅输出毫无变化 —— 这正是最初要修的那个「改了不生效」。
+  //
+  // 订阅 TOKEN 刻意**不在**字段表里：它由 MD5MD5(节点地址 + 节点 ID) 派生，引擎与本项目的
+  // subs.js / tempsubs.js 共用同一口径（见 util.md5md5）。旧接口曾提供一个可填的 sub_token，
+  // 填了也不生效（引擎每次请求重算 TOKEN），属于典型的「假配置」。这里只如实报出派生结果。
+  if (path === '/__api/node-config') {
+    const spec = panelSpecOf('node-config');
     if (request.method === 'GET') {
-      const cfg = await readEngineCfg();
-      const sg = (cfg && cfg['优选订阅生成']) || {};
-      return json({
-        ok: true,
-        config: {
-          uuid: (cfg && cfg.UUID) || '',
-          host: (cfg && cfg.HOST) || '',
-          path: (cfg && cfg.PATH) || '/',
-          protocol: (cfg && cfg['协议类型']) || 'vless',
-          transport: (cfg && cfg['传输协议']) || 'ws',
-          fingerprint: (cfg && cfg.Fingerprint) || 'chrome',
-          sub_name: sg.SUBNAME || 'edgetunnel',
-          sub_update: sg.SUBUpdateTime || 3,
-          sub_token: sg.TOKEN || '',
-        },
-      });
+      const cfg = await readSettings(env);
+      const values = {};
+      const sources = {};
+      for (const key of Object.keys(spec)) {
+        values[key] = cfg[key];
+        sources[key] = await settingsSource(env, key);
+      }
+      return json({ ok: true, config: values, sources, identity: await nodeIdentity(env, url.hostname) });
     }
     if (request.method === 'POST') {
       let body;
       try { body = await request.json(); } catch { return json({ error: 'invalid json' }, 400); }
-      const cur = (await readEngineCfg()) || {};
-      // 「留空保持不变」：下面每个字段只在「有值」时才处理，空字符串/未传一律跳过
-      if (body.uuid !== undefined && String(body.uuid).trim() !== '') {
-        const v = String(body.uuid).trim();
-        if (!/^[0-9a-fA-F-]{32,}$/.test(v.replace(/-/g, ''))) return json({ error: 'UUID 格式不正确（应为 32 位十六进制）' }, 400);
-        cur.UUID = v;
-      }
-      if (body.host !== undefined && String(body.host).trim() !== '') {
-        const v = String(body.host).trim();
-        cur.HOST = v;
-      }
-      if (body.path !== undefined && String(body.path).trim() !== '') {
-        const v = String(body.path).trim();
-        if (!v.startsWith('/')) return json({ error: '节点路径必须以 / 开头' }, 400);
-        cur.PATH = v;
-      }
-      if (body.protocol !== undefined && String(body.protocol).trim() !== '') {
-        const v = String(body.protocol).trim();
-        if (!['vless', 'trojan', 'ss'].includes(v)) return json({ error: '协议类型仅支持 vless / trojan / ss' }, 400);
-        cur['协议类型'] = v;
-      }
-      if (body.transport !== undefined && String(body.transport).trim() !== '') {
-        const v = String(body.transport).trim();
-        if (!['ws', 'grpc'].includes(v)) return json({ error: '传输协议仅支持 ws / grpc' }, 400);
-        cur['传输协议'] = v;
-      }
-      if (body.fingerprint !== undefined && String(body.fingerprint).trim() !== '') {
-        const v = String(body.fingerprint).trim();
-        cur.Fingerprint = v;
-      }
-      // 订阅生成区（嵌套对象整体合并，保留兄弟字段如 local / 本地IP库 / SUB）
-      const sg = { ...((cur && cur['优选订阅生成']) || {}) };
-      if (body.sub_name !== undefined && String(body.sub_name).trim() !== '') {
-        const v = String(body.sub_name).trim();
-        sg.SUBNAME = v;
-      }
-      if (body.sub_update !== undefined && String(body.sub_update).trim() !== '') {
-        const v = parseInt(body.sub_update, 10);
-        if (!v || v < 1 || v > 1440) return json({ error: '更新间隔需在 1 ~ 1440 分钟之间（1 天）' }, 400);
-        sg.SUBUpdateTime = v;
-      }
-      if (body.sub_token !== undefined && String(body.sub_token).trim() !== '') {
-        const v = String(body.sub_token).trim();
-        sg.TOKEN = v;
-      }
-      cur['优选订阅生成'] = sg;
-      try {
-        await runtime.KV.put('config.json', JSON.stringify(cur));
-      } catch (e) {
-        return json({ error: '保存失败：' + String(e && e.message || e).slice(0, 200) }, 400);
-      }
-      return json({ ok: true });
+      const r = await saveSettings(env, body);
+      if (r && r.error) return json({ error: r.error }, 400);
+      const values = {};
+      for (const key of Object.keys(spec)) values[key] = r.values[key];
+      return json({
+        ok: true,
+        config: values,
+        saved: (r.saved || []).filter(k => k in spec),
+        message: '已保存；下一个订阅请求立即按新值输出（无需重新部署）',
+      });
     }
   }
 
@@ -610,17 +574,20 @@ async function handleAdmin(request, url, env) {
     }
   }
 
-  // GET / POST /__api/node-tag -> 节点备注的国家标注开关与样式
+  // GET / POST /__api/node-tag -> 节点备注的国家标注（开关 + 样式）
+  //
+  // 两个字段都是注册表成员（settings.js 的 node_tag_enabled / node_tag_style，store: 'kv'），
+  // 所以这里既不写真名也不写映射表：请求体就是注册表的字段名，写入直接走 saveSettings。
+  // 曾经这里有一层 {enabled, style} → KV 的翻译，而 nodetag.js 那边又只认环境变量 ——
+  // 于是「面板改了样式、订阅输出没变」。现在取值只有 readSettings 一条路。
   if (path === '/__api/node-tag') {
     if (request.method === 'GET') return json({ ok: true, config: await readTagSettings(env) });
     if (request.method === 'POST') {
       let body;
       try { body = await request.json(); } catch { return json({ error: 'invalid json' }, 400); }
-      const patch = { env };
-      // enabled 只在明确传布尔时才改，避免前端漏传把功能悄悄关掉
-      if (body.enabled !== undefined) patch.enabled = body.enabled === true;
-      if (body.style !== undefined) patch.style = String(body.style).trim().toLowerCase();
-      return json({ ok: true, config: await saveTagSettings(patch) });
+      const r = await saveSettings(env, body);
+      if (r && r.error) return json({ error: r.error }, 400);
+      return json({ ok: true, config: await readTagSettings(env) });
     }
   }
 
@@ -631,53 +598,49 @@ async function handleAdmin(request, url, env) {
     return renderHome(cfg, request);
   }
 
-  // GET /__api/pool-config -> 优选池 & 健康检查配置（GOOD_IPS / 候选域名池 / 上次健康检查时间），需登录
-  // POST /__api/pool-config -> 保存候选域名池（PREF_DOMAINS）或写回 GOOD_IPS（healthcheck 自愈结果），需登录
-  // 解析器与条数上限统一来自 util.js / settings.js：面板读到的、运行时用的必须是同一口径
+  // GET /__api/pool-config -> 可用集 & 候选域名池 & 上次健康检查时间，需登录
+  // POST /__api/pool-config -> 保存候选域名池（{pref_domains}）或写回可用集（{good_ips}，healthcheck 自愈用），需登录
+  //
+  // 两个池子都是注册表成员（settings.js 的 pool_good_ips / pref_domains，store: 'kv'），
+  // 条数上限来自 pool_limit / domain_pool_limit。返回结构保持不变：healthcheck.yml 依赖
+  // {good_ips, pref_domains, limits}；env 变量 PREF_DOMAINS 作为种子由注册表三级取值处理
+  // （旧实现在 GET 里顺手把种子写回 KV —— 读接口不该有写副作用，已去掉）。
   if (path === '/__api/pool-config') {
-    // 上限是运行参数（面板「配置中心 → 优选与候选」可改）：面板写入的截断长度必须等于
-    // 运行时读取的截断长度，否则人填多了会被静默丢掉 —— 这正是 check-single-source 盯着的那类事故
-    const cfg = await readSettings(env);
-    const poolLimit = cfg.pool_limit || POOL_LIMIT;
-    const domainLimit = cfg.domain_pool_limit || DOMAIN_POOL_LIMIT;
     if (request.method === 'GET') {
-      const good = []; let domains = [];
-      try { good.push(...parseIpv4List(await runtime.KV.get('GOOD_IPS'), poolLimit)); } catch {}
-      try {
-        const d = await runtime.KV.get('PREF_DOMAINS');
-        if (d) {
-          domains.push(...parseDomainList(d, domainLimit));
-        } else {
-          // KV 无配置时用环境变量做种子（wrangler.toml / Actions 变量可配），而不是在代码里写死一份域名清单。
-          // 都没配就返回空数组并带提示，由面板引导用户填写，保证 fork 后不会出现「改不到却又悄悄生效」的兜底行为。
-          const seed = parseDomainList(env && (env.PREF_DOMAINS || env.pref_domains), domainLimit);
-          domains.push(...seed);
-          if (seed.length) {
-            try { await runtime.KV.put('PREF_DOMAINS', seed.join('\n')); } catch {}
-          }
-        }
-      } catch {}
+      const cfg = await readSettings(env);
       let last = 0;
       try { const l = await runtime.KV.get('HC_LAST_RUN'); if (l) last = parseInt(l, 10) || 0; } catch {}
-      return json({ ok: true, good_ips: good, pref_domains: domains, last_run: last, limits: { ips: poolLimit, domains: domainLimit } });
+      return json({
+        ok: true,
+        good_ips: cfg.pool_good_ips,
+        pref_domains: cfg.pref_domains,
+        last_run: last,
+        limits: { ips: cfg.pool_limit, domains: cfg.domain_pool_limit },
+      });
     }
     if (request.method === 'POST') {
       let body;
       try { body = await request.json(); } catch { return json({ error: 'invalid json' }, 400); }
-      const out = { ok: true };
-      // 写回已验证可用集 GOOD_IPS（healthcheck 自愈结果，存后端由 runtime.KV 统一决定）；与 PREF_DOMAINS 可独立更新
+      const patch = {};
+      // 非空输入却一条都没留下 = 直接说清楚（与 preferred-ips 同一条判断，都走 util.js 的解析器）
       if (body.good_ips !== undefined) {
-        const ips = parseIpv4List(body.good_ips, poolLimit);
-        if (!ips.length) return json({ error: '没有有效的 IP（每行一个 IPv4 地址，每段需在 0~255）' }, 400);
-        await runtime.KV.put('GOOD_IPS', ips.join('\n'));
-        out.good_ips = ips;
+        if (!blankList(body.good_ips) && !parseIpv4List(body.good_ips).length) {
+          return json({ error: '没有有效的 IP（每行一个 IPv4 地址，每段需在 0~255）' }, 400);
+        }
+        patch.pool_good_ips = body.good_ips;
       }
       if (body.pref_domains !== undefined) {
-        const domains = parseDomainList(body.pref_domains, domainLimit);
-        if (!domains.length) return json({ error: '请输入有效域名（每行一个）' }, 400);
-        await runtime.KV.put('PREF_DOMAINS', domains.join('\n'));
-        out.pref_domains = domains;
+        if (!blankList(body.pref_domains) && !parseDomainList(body.pref_domains).length) {
+          return json({ error: '请输入有效域名（每行一个）' }, 400);
+        }
+        patch.pref_domains = body.pref_domains;
       }
+      if (!Object.keys(patch).length) return json({ error: '没有可保存的字段（good_ips / pref_domains）' }, 400);
+      const r = await saveSettings(env, patch);
+      if (r && r.error) return json({ error: r.error }, 400);
+      const out = { ok: true };
+      if (body.good_ips !== undefined) out.good_ips = r.values.pool_good_ips;
+      if (body.pref_domains !== undefined) out.pref_domains = r.values.pref_domains;
       return json(out);
     }
   }
@@ -922,12 +885,6 @@ async function adminPage(authed, origin, env) {
   try { r2Cfg = await readR2Config(); } catch {}
   const r2Bound = !!(env && env.MEDIA_R2);
   const hasToken = !!(dgCfg && dgCfg.token);
-  // 节点备注的国家标注：面板展示当前来源（面板配置 / 环境变量 / 默认），便于判断为什么是这个值
-  let ntCfg = null;
-  try { ntCfg = await readTagSettings(env); } catch {}
-  const ntHint = ntCfg
-    ? `当前：${ntCfg.enabled ? '已启用' : '已关闭'}，样式 ${esc(String(ntCfg.style))}（来源：开关 ${ntCfg.sourceOn}、样式 ${ntCfg.sourceStyle}）`
-    : '当前状态读取失败';
   let listHtml = '<div class="empty">加载中…</div>';
   try {
     const sites = await listSites();
@@ -1142,60 +1099,14 @@ ${themeScript}
   </div>` : ''}
 
   ${authed ? `
-  <div class="card" id="subgenCard" data-pane="proxy">
-    <h2>订阅生成配置</h2>
-    <div class="hint" style="margin:-8px 0 4px;">改节点 ID / 地址 / 路径 / 协议与订阅名称，保存后生成的订阅立即按新值输出；<b>修改 UUID 会让旧订阅链接全部失效</b>，需重新复制节点链接。</div>
-    <div class="grid2">
-      <div>
-        <label for="sgName">订阅名称（客户端显示名）</label>
-        <input type="text" id="sgName" placeholder="edgetunnel">
-      </div>
-      <div>
-        <label for="sgUuid">节点 ID（UUID）</label>
-        <input type="text" id="sgUuid" placeholder="xxxxxxxx-xxxx-...">
-      </div>
-    </div>
-    <div class="grid2">
-      <div>
-        <label for="sgHost">节点地址</label>
-        <input type="text" id="sgHost" placeholder="proxy.520215.xyz">
-      </div>
-      <div>
-        <label for="sgPath">路径</label>
-        <input type="text" id="sgPath" placeholder="/">
-      </div>
-    </div>
-    <div class="grid2">
-      <div>
-        <label for="sgProtocol">协议类型</label>
-        <select id="sgProtocol">
-          <option value="vless">vless</option>
-          <option value="trojan">trojan</option>
-          <option value="ss">ss</option>
-        </select>
-      </div>
-      <div>
-        <label for="sgTransport">传输协议</label>
-        <select id="sgTransport">
-          <option value="ws">ws</option>
-          <option value="grpc">grpc</option>
-        </select>
-      </div>
-    </div>
-    <div class="grid2">
-      <div>
-        <label for="sgUpdate">订阅更新间隔（分钟）</label>
-        <input type="number" id="sgUpdate" min="1" max="1440" placeholder="3">
-      </div>
-      <div>
-        <label for="sgToken">订阅 TOKEN（留空保持不变）</label>
-        <input type="text" id="sgToken" placeholder="留空保持不变">
-      </div>
-    </div>
-    <div class="row">
-      <button type="button" id="sgSaveBtn">保存订阅配置</button>
-    </div>
-    <div class="msg" id="sgMsg"></div>
+  <div class="card" data-pane="proxy">
+    <h2>代理节点</h2>
+    <div class="hint" style="margin:-8px 0 4px;">订阅里出现的节点身份。字段与取值范围来自运行参数注册表（<span class="tag">src/settings.js</span>），
+      与引擎共读同一份配置文档；保存后<b>下一个订阅请求立即按新值输出</b>，不需要重新部署。</div>
+    ${settingFormById('node-config')}
+    ${settingFormById('sub-config')}
+    ${settingFormById('node-tag')}
+    ${toolItemsForTab('proxy')}
   </div>` : ''}
 
   ${authed ? `
@@ -1237,47 +1148,23 @@ ${themeScript}
   </div>` : ''}
 
   ${authed ? `
-  <div class="card" id="dnsCard" data-pane="preferred">
+  <div class="card" data-pane="preferred">
     <h2>DNS 自动优选</h2>
-    <div class="hint" style="margin:-8px 0 8px;">定时从 <span class="tag">sub 订阅节点</span> + 优选池测速排序，HTTP 探测过滤不可达后写入 A 记录，域名始终指向可用的 CF 泛播边缘。反代链接自动走优选 IP，浏览器直连、客户端零配置。</div>
-    <label for="dnsInterval">自动更新频率（分钟）</label>
-    <div class="row" style="margin-top:6px;">
-      <input id="dnsInterval" type="number" min="${DNS_INTERVAL.min}" max="${DNS_INTERVAL.max}" style="max-width:220px;" placeholder="默认 ${DNS_INTERVAL.default}（${minutesLabel(DNS_INTERVAL.default)}）">
-      <button type="button" id="dnsBtn">保存频率</button>
-      <button type="button" id="dnsRunBtn" class="ghost">立即更新优选 IP</button>
-    </div>
-    <div class="hint" style="margin-top:6px;">范围 ${DNS_INTERVAL.min} ~ ${DNS_INTERVAL.max} 分钟（${minutesLabel(DNS_INTERVAL.default)} = ${DNS_INTERVAL.default}）；保存后立即生效，下一个检查周期按新频率执行。立即更新不等待周期，马上测通并切换 A 记录。</div>
-    <label for="subUrl" style="margin-top:14px;">订阅链接（浏览器优选从这里拉取候选 IP）</label>
-    <input id="subUrl" placeholder="粘贴完整订阅链接，或以 / 开头的路径如 /tsub/xxxx">
-    <div class="row" style="margin-top:6px;">
-      <button type="button" id="subBtn">保存订阅链接</button>
-      <span class="hint" id="subState" style="margin:0;"></span>
-    </div>
-    <div class="hint" style="margin-top:6px;">留空则回退到本机 <span class="tag">/sub</span>（token 按代理引擎同一口径推导）。第三方订阅常混入非边缘网络的节点，候选会按官方 IP 段过滤后再参与测速——否则这些不可达地址会占满优选池，还会拖慢「立即更新优选 IP」。</div>
-    <label for="prefIps" style="margin-top:14px;">优选 IP 列表（订阅候选 / 本地测速结果，每行一个）</label>
-    <textarea id="prefIps" rows="5" placeholder="每行一个 IPv4，例如 104.17.109.97" style="font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;"></textarea>
+    <div class="hint" style="margin:-8px 0 8px;">定时从 <span class="tag">sub 订阅节点</span> + 优选池测速排序，HTTP 探测过滤不可达后写入 A 记录，
+      域名始终指向可用的 CF 泛播边缘。反代链接自动走优选 IP，浏览器直连、客户端零配置。
+      下面每个字段都来自运行参数注册表，保存后立即生效、不需要重新部署（订阅链接在「代理节点」页配置）。</div>
+    ${settingFormById('dns-config')}
+    ${toolItemsForTab('preferred')}
+    ${settingFormById('preferred-ips')}
     <div class="row" style="margin-top:8px;">
-      <button type="button" id="prefBtn">保存优选池</button>
       <button type="button" id="autoBtn" class="ghost">浏览器自动优选</button>
+      <span class="hint" style="margin:0;">从订阅链接拉候选并测速（约 5~15 秒），最快的自动填入上面的优选池，再点「保存」。</span>
     </div>
-    <div class="hint" style="margin-top:6px;">「保存优选池」仅保存 IP 列表（不更新 DNS，不影响 edgetunnel 代理入口）；需要立即切换 A 记录请点上方「立即更新优选 IP」。「浏览器自动优选」先从上面的订阅链接拉候选并发测速（约 5~15 秒），最快的自动填入，再点「保存优选池」。</div>
-    <div class="msg" id="subMsg"></div>
-    <div class="msg" id="dnsMsg"></div>
-    <div class="msg" id="dnsRunMsg"></div>
-    <div class="msg" id="prefMsg"></div>
-  </div>
-  <div class="card" id="poolCard" data-pane="preferred">
-    <h2>优选池 &amp; 健康检查</h2>
-    <div class="hint" style="margin:-8px 0 4px;">已验证可用集（GOOD_IPS，自动优选 / 健康检查优先使用的 CF 泛播 IP）：<b id="poolGood" style="color:var(--ok);font-family:ui-monospace,Menlo,Consolas,monospace;font-weight:600;">加载中…</b></div>
-    <div class="hint" style="margin:6px 0 4px;">健康检查：GitHub Actions 每 12 小时自动检测 A 记录，发现 1034 / 不可达时从可用集自愈（Actions 页可手动触发「Health Check &amp; Auto Repair」）。上次执行：<b id="poolLast">—</b></div>
-    <label for="poolDomains" style="margin-top:10px;">候选域名池（健康检查兜底解析 CF 泛播 IP 的域名，每行一个）</label>
-    <textarea id="poolDomains" rows="4" placeholder="www.cloudflare.com&#10;speed.cloudflare.com&#10;time.cloudflare.com" style="font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;"></textarea>
-    <div class="row" style="margin-top:8px;">
-      <button type="button" id="poolSaveBtn">保存域名池</button>
-      ${ghActionsUrl ? `<a class="ghost-link" href="${esc(ghActionsUrl)}" target="_blank" rel="noopener" style="padding:10px 14px;display:inline-block;">手动触发健康检查 →</a>` : ''}
-    </div>
-    <div class="hint" style="margin-top:6px;">域名池用于健康检查兜底：当优选池不足时，解析这些域名得到当前 CF 泛播 IP 再扫描可用性。保存后即时生效，无需重新部署。</div>
-    <div class="msg" id="poolMsg"></div>
+    <div class="msg" id="autoMsg"></div>
+    ${settingFormById('pool-config')}
+    <div class="hint" style="margin:6px 0 4px;">健康检查：GitHub Actions 每 12 小时检测 A 记录，发现 1034 / 不可达时用「已验证可用集」自愈。
+      上次执行：<b id="poolLast">—</b>
+      ${ghActionsUrl ? `<a class="ghost-link" href="${esc(ghActionsUrl)}" target="_blank" rel="noopener" style="margin-left:8px;">手动触发健康检查 →</a>` : ''}</div>
   </div>` : `
   <div class="card" id="dnsCard">
     <h2>DNS 自动优选</h2>
@@ -1403,7 +1290,7 @@ ${themeScript}
     </div>
     <div class="msg" id="dgMsg"></div>
     <div class="hint" style="margin-top:4px;">保存后 <b>当前浏览器</b> 会记住进门状态，所以根路径仍显示管理面板；用无痕窗口或清掉 Cookie 才能看到访客视角。</div>
-  </div>
+  </div>` : ''}
 
   ${authed ? `
   <div class="card" id="themeCard" data-pane="theme">
@@ -1453,33 +1340,6 @@ ${themeScript}
     <div class="msg" id="ctMsg"></div>
     ${themeView.themes.filter(t => t.custom).length ? `
     <div class="hint" style="margin-top:6px;">已保存的自定义主题：${themeView.themes.filter(t => t.custom).map(t => `<span style="display:inline-flex;gap:6px;align-items:center;margin-right:10px;"><span class="tag">${esc(t.id)}</span><button type="button" class="danger mini" data-del-theme="${esc(t.id)}">删除</button></span>`).join('')}</div>` : ''}
-  </div>` : ''}
-
-  <div class="card" id="nodeTagCard" data-pane="proxy">
-    <h2>节点备注国家标注</h2>
-    <div class="hint" style="margin:-8px 0 4px;">给订阅里的节点备注补上 IP 归属国家，例如 <span class="tag">CF 电信优选 | 美国【US】</span>。主订阅 <span class="tag">/sub</span> 与临时订阅 <span class="tag">/tsub/&lt;id&gt;</span> 都生效。</div>
-
-    <label for="ntEnabled" style="margin-top:14px;">状态</label>
-    <select id="ntEnabled">
-      <option value="1">启用（备注补国家）</option>
-      <option value="0">关闭（备注保持原样）</option>
-    </select>
-
-    <label for="ntStyle">标注样式</label>
-    <select id="ntStyle">
-      <option value="cn-code">中文名 + 代号：美国【US】</option>
-      <option value="flag-name">国旗 + 中文名：🇺🇸美国</option>
-      <option value="name">只要中文名：美国</option>
-      <option value="code">只要代号：US</option>
-      <option value="flag">只要国旗：🇺🇸</option>
-    </select>
-
-    <div class="row">
-      <button type="button" id="ntSaveBtn">保存标注设置</button>
-    </div>
-    <div class="msg" id="ntMsg"></div>
-    <div class="hint" id="ntState" style="margin-top:4px;">${esc(ntHint)}</div>
-    <div class="hint" style="margin-top:4px;">国家查询结果会长期缓存，同一个 IP 只真正查询一次；数据源不可用时自动跳过标注，绝不影响订阅本身。</div>
   </div>` : ''}
 
 ${authed ? `
@@ -1618,15 +1478,12 @@ api('/__api/speedtest').then(r => {
   });
 });
 
-// DNS 自动优选频率：读取当前值 + 保存
+// 未登录访客看到的「当前频率」只读展示（登录后由通用设置表单读写同一个接口）
 (async () => {
+  const cur = document.getElementById('dnsCur');
+  if (!cur) return;
   const r = await api('/__api/dns-config');
-  if (r.ok && r.data.interval_minutes) {
-    const cur = document.getElementById('dnsCur');
-    if (cur) cur.textContent = r.data.interval_minutes + ' 分钟';
-    const inp = document.getElementById('dnsInterval');
-    if (inp) inp.value = r.data.interval_minutes;
-  }
+  if (r.ok && r.data.interval_minutes) cur.textContent = r.data.interval_minutes + ' 分钟';
 })();
 // ===== R2 媒体缓存策略：总开关 / 保留天数 / 单分片上限 / 总量上限 + 用量展示 + 立即清理 =====
 const r2Stat = document.getElementById('r2Stat');
@@ -1691,100 +1548,16 @@ if (r2CleanBtn) {
   };
 }
 
-const dnsBtn = document.getElementById('dnsBtn');
-if (dnsBtn) {
-  dnsBtn.onclick = async () => {
-    const inp = document.getElementById('dnsInterval');
-    const v = parseInt(inp.value, 10);
-    // 「留空保持不变」：不填频率 = 不改频率（如需立即更新用旁边按钮）
-    if (!inp.value.trim()) { setMsg('dnsMsg', '未填写频率，保持原值未修改', false); return; }
-    // 区间从输入框自己身上读（服务端按 DNS_INTERVAL 渲染的 min/max），
-    // 不在浏览器里再抄一份 5/1440 —— 抄一份就会有一天前后端判断不一致
-    const min = Number(inp.min) || 0;
-    const max = Number(inp.max) || 0;
-    if (!v || (min && v < min) || (max && v > max)) { setMsg('dnsMsg', '请输入 ' + min + ' ~ ' + max + ' 之间的分钟数', true); return; }
-    const r = await api('/__api/dns-config', { method: 'POST', body: JSON.stringify({ interval_minutes: v }) });
-    setMsg('dnsMsg', r.ok ? '已保存：每 ' + v + ' 分钟自动更新一次' : (r.data.error || '保存失败'), !r.ok);
-  };
-}
-const dnsRunBtn = document.getElementById('dnsRunBtn');
-if (dnsRunBtn) {
-  dnsRunBtn.onclick = async () => {
-    const btn = dnsRunBtn;
-    btn.disabled = true;
-    btn.textContent = '正在测通并更新…';
-    setMsg('dnsRunMsg', '', false);
-    try {
-      const r = await api('/__api/dns-run', { method: 'POST' });
-      if (r.ok) {
-        let msg = r.data.message || '更新完成';
-        if (r.data.verified === false) msg += '（A 记录已写入但未通过访问校验）';
-        setMsg('dnsRunMsg', msg, false);
-      } else {
-        // 拿不到 JSON 详情说明请求在平台侧就失败了（超时被杀 / 边缘错误），把状态码暴露出来便于定位
-        const detail = (r.data && (r.data.error || r.data.message)) || '';
-        setMsg('dnsRunMsg', detail ? detail : ('执行失败（HTTP ' + r.status + '）' + (r.status >= 500 ? '：Worker 可能已超时，请减少优选池里的无效 IP 后重试' : '')), true);
-      }
-    } catch (err) {
-      setMsg('dnsRunMsg', '请求失败：' + (err && err.message ? err.message : err), true);
-    }
-    btn.disabled = false;
-    btn.textContent = '立即更新优选 IP';
-  };
-}
-// 优选池 & 健康检查配置：加载 GOOD_IPS / 上次执行时间 / 候选域名池 + 保存
-const poolGood = document.getElementById('poolGood');
-if (poolGood) {
+// 候选域名池 / 优选池 / 自动优选频率都已经是注册表字段，读写与校验全部交给通用设置表单
+// （renderSettingForm / settingFormById，见 src/config-ui.js）—— 这里只剩下「不是配置」的那部分：
+// 健康检查的上次执行时间（运行状态，存在 KV HC_LAST_RUN，不是可配项）。
+const poolLastEl = document.getElementById('poolLast');
+if (poolLastEl) {
   api('/__api/pool-config').then(r => {
     if (!r.ok || !r.data) return;
-    if (poolGood) poolGood.textContent = r.data.good_ips && r.data.good_ips.length ? r.data.good_ips.join('  ') : '（空）';
-    const last = document.getElementById('poolLast');
-    if (last) last.textContent = r.data.last_run ? new Date(r.data.last_run * 1000).toLocaleString() : '从未';
-    const ta = document.getElementById('poolDomains');
-    if (ta) ta.value = (r.data.pref_domains || []).join('\\n');
-  });
-  const saveBtn = document.getElementById('poolSaveBtn');
-  if (saveBtn) {
-    saveBtn.onclick = async () => {
-      const ta = document.getElementById('poolDomains');
-      const msg = document.getElementById('poolMsg');
-      if (!ta || !msg) return;
-      msg.textContent = '保存中…';
-      msg.className = 'msg';
-      const r = await api('/__api/pool-config', { method: 'POST', body: JSON.stringify({ pref_domains: ta.value }) });
-      msg.textContent = r.ok ? '已保存' : (r.data.error || '保存失败');
-      msg.className = 'msg ' + (r.ok ? 'ok' : 'err');
-    };
-  }
-}
-// 优选 IP 池：读取当前 + 保存并立即更新
-const prefIps = document.getElementById('prefIps');
-const prefBtn = document.getElementById('prefBtn');
-if (prefIps) {
-  api('/__api/preferred-ips').then(r => {
-    if (r.ok && r.data.ips && r.data.ips.length) prefIps.value = r.data.ips.join('\\n');
+    poolLastEl.textContent = r.data.last_run ? new Date(r.data.last_run * 1000).toLocaleString() : '从未';
   }).catch(() => {});
 }
-if (prefBtn) {
-  prefBtn.onclick = async () => {
-    const btn = prefBtn;
-    btn.disabled = true;
-    setMsg('prefMsg', '', false);
-    try {
-      // 仅保存优选池（PREF_IPS，DNS 优选用），不触发 DNS A 记录更新、也不写 edgetunnel 的 ADD.txt——避免连带切换 edgetunnel 代理入口
-      const r = await api('/__api/preferred-ips', { method: 'POST', body: JSON.stringify({ ips: prefIps.value }) });
-      if (r.ok) {
-        setMsg('prefMsg', '已保存 ' + r.data.count + ' 个 IP 到优选池，下个 DNS 更新周期自动应用；如需立即生效请点「立即更新优选 IP」', false);
-      } else {
-        setMsg('prefMsg', r.data.error || '保存失败', true);
-      }
-    } catch (err) {
-      setMsg('prefMsg', '请求失败：' + (err && err.message ? err.message : err), true);
-    }
-    btn.disabled = false;
-  };
-}
-
 // 确认制测速：no-cors 计时近似「你网络→节点」延迟。
 // 首测 2 次取最短；resolve 快（<200ms）的 IP 可能隐藏 1034/假快（TLS 成功但 HTTP 被拒），
 // 自动复测 2 次取中位数；波动大（>150ms）的降权，避免抖动假快污染排序。
@@ -1819,39 +1592,21 @@ async function measureIp(ip) {
   return first;
 }
 
-// 订阅链接配置：浏览器优选的候选来源（存在 KV，留空则回退环境变量 / 本机 /sub）
-const subUrl = document.getElementById('subUrl');
-const subState = document.getElementById('subState');
-if (subUrl) {
-  api('/__api/sub-config').then(r => {
-    if (!r.ok || !r.data) return;
-    if (r.data.sub_url) subUrl.value = r.data.sub_url;
-    else if (subState) subState.textContent = r.data.env ? '当前使用环境变量 SUB_URL' : '未配置，将回退本机 /sub';
-  }).catch(() => {});
-  const subBtn = document.getElementById('subBtn');
-  if (subBtn) {
-    subBtn.onclick = async () => {
-      subBtn.disabled = true;
-      setMsg('subMsg', '保存中…', false);
-      try {
-        const r = await api('/__api/sub-config', { method: 'POST', body: JSON.stringify({ sub_url: subUrl.value }) });
-        if (!r.ok) { setMsg('subMsg', r.data.error || '保存失败', true); }
-        else setMsg('subMsg', r.data.sub_url ? '已保存订阅链接，浏览器优选将从这里拉候选' : '已清空，将回退环境变量 SUB_URL 或本机 /sub', false);
-      } catch (err) {
-        setMsg('subMsg', '请求失败：' + (err && err.message ? err.message : err), true);
-      }
-      subBtn.disabled = false;
-    };
-  }
-}
-
 // 浏览器自动优选：候选统一从**订阅链接**拉取（服务端已按地址归属过滤），失败才用当前池兜底
 const autoBtn = document.getElementById('autoBtn');
 if (autoBtn) {
+  // 优选池的输入框由通用设置表单渲染（目录项 preferred-ips）。这里按**目录契约**取元素，
+  // 不去猜生成出来的 id：只要目录里那张表单还在，这个按钮就还能用；
+  // 未保存态也交给表单自己的 refresh（派发一次 input 事件），不另写一套脏值判断。
+  function prefIpsField() {
+    return document.querySelector('[data-uid="preferred-ips"] [data-key="preferred_ips"]');
+  }
   autoBtn.onclick = async () => {
     const btn = autoBtn;
+    const field = prefIpsField();
+    if (!field) { setMsg('autoMsg', '找不到优选池输入框（页面结构已变），请刷新后重试', true); return; }
     btn.disabled = true;
-    setMsg('prefMsg', '', false);
+    setMsg('autoMsg', '', false);
     btn.textContent = '正在拉取订阅节点…';
     let cands = [];
     let note = '';
@@ -1873,7 +1628,7 @@ if (autoBtn) {
     }
     cands = [...new Set(cands.filter(ip => /^\\d{1,3}(\\.\\d{1,3}){3}$/.test(ip)))].slice(0, 40);
     if (!cands.length) {
-      setMsg('prefMsg', '没有可用候选：请先在上方填写订阅链接并保存' + (note ? '（' + note + '）' : ''), true);
+      setMsg('autoMsg', '没有可用候选：请先在「代理节点」页填写订阅链接并保存' + (note ? '（' + note + '）' : ''), true);
       btn.disabled = false;
       btn.textContent = '浏览器自动优选';
       return;
@@ -1893,10 +1648,12 @@ if (autoBtn) {
     results.sort((a, b) => a.t - b.t);
     const best = results.slice(0, 15);
     if (!best.length) {
-      setMsg('prefMsg', '全部节点超时（网络受限？），请稍后重试', true);
+      setMsg('autoMsg', '全部节点超时（网络受限？），请稍后重试', true);
     } else {
-      prefIps.value = best.map(r => r.ip).join('\\n');
-      setMsg('prefMsg', '优选完成：测 ' + cands.length + ' 个，最快 ' + Math.round(best[0].t) + 'ms，前 ' + best.length + ' 个已填入' + (note ? '｜' + note : '') + '，点「保存优选池」写入优选池（不自动改 DNS，可再点「立即更新优选 IP」应用）', false);
+      field.value = best.map(r => r.ip).join('\\n');
+      field.dispatchEvent(new Event('input', { bubbles: true }));
+      setMsg('autoMsg', '优选完成：测 ' + cands.length + ' 个，最快 ' + Math.round(best[0].t) + 'ms，前 ' + best.length + ' 个已填入优选池'
+        + (note ? '｜' + note : '') + '，点该表单的「保存」写入优选池（不自动改 DNS，可再点「立即更新优选 IP」应用）', false);
     }
     btn.disabled = false;
     btn.textContent = '浏览器自动优选';
@@ -1979,47 +1736,6 @@ if (dgSaveBtn) {
   };
   const dgPrev = document.getElementById('dgPreviewBtn');
   if (dgPrev) dgPrev.onclick = function () { window.open('/__api/disguise-preview', '_blank', 'noopener'); };
-}
-
-const sgSaveBtn = document.getElementById('sgSaveBtn');
-if (sgSaveBtn) {
-  const sgIds = ['sgName', 'sgUuid', 'sgHost', 'sgPath', 'sgProtocol', 'sgTransport', 'sgUpdate', 'sgToken'];
-  api('/__api/sub-gen').then(function (r) {
-    if (!r.ok || !r.data || !r.data.config) return;
-    const c = r.data.config;
-    const map = { sgName: c.sub_name, sgUuid: c.uuid, sgHost: c.host, sgPath: c.path, sgProtocol: c.protocol, sgTransport: c.transport, sgUpdate: c.sub_update, sgToken: c.sub_token };
-    sgIds.forEach(function (id) { const el = document.getElementById(id); if (el && map[id] !== undefined && map[id] !== null) el.value = map[id]; });
-  }).catch(function () {});
-  sgSaveBtn.onclick = async function () {
-    sgSaveBtn.disabled = true;
-    setMsg('sgMsg', '保存中…', false);
-    // 「留空保持不变」：只把非空字段提交，空输入框不改原值（服务端同样忽略空值）
-    const body = {};
-    const take = function (id, key) {
-      const el = document.getElementById(id);
-      const val = el ? el.value.trim() : '';
-      if (val !== '') body[key] = val;
-    };
-    take('sgUuid', 'uuid');
-    take('sgHost', 'host');
-    take('sgPath', 'path');
-    take('sgProtocol', 'protocol');
-    take('sgTransport', 'transport');
-    take('sgName', 'sub_name');
-    take('sgToken', 'sub_token');
-    const upd = document.getElementById('sgUpdate');
-    const uv = upd ? upd.value.trim() : '';
-    if (uv !== '') body.sub_update = parseInt(uv, 10);
-    if (!Object.keys(body).length) { setMsg('sgMsg', '没有填写任何要修改的字段（留空 = 保持不变）', true); sgSaveBtn.disabled = false; return; }
-    try {
-      const r = await api('/__api/sub-gen', { method: 'POST', body: JSON.stringify(body) });
-      if (!r.ok) setMsg('sgMsg', r.data.error || '保存失败', true);
-      else setMsg('sgMsg', '已保存，生成的订阅将按新配置输出', false);
-    } catch (err) {
-      setMsg('sgMsg', '请求失败：' + (err && err.message ? err.message : err), true);
-    }
-    sgSaveBtn.disabled = false;
-  };
 }
 
 // ===== 站点模式注册表编辑器（列表 CRUD：查看 / 新增 / 编辑 / 删除，自包含不依赖模块导入） =====
@@ -2490,30 +2206,6 @@ if (paneTabs.length) {
     const n = String(location.hash || '').replace('#', '');
     if (tabNames.indexOf(n) >= 0) switchPane(n);
   });
-}
-// 节点备注的国家标注：开关 + 样式。样式清单写死在下拉框里是安全的 ——
-// 它描述的是「怎么展示」而不是业务数据，写死不会让 fork 后指向别人的资源。
-const ntEnabled = document.getElementById('ntEnabled');
-const ntStyle = document.getElementById('ntStyle');
-if (ntEnabled) {
-  api('/__api/node-tag').then(function (r) {
-    if (!r.ok || !r.data || !r.data.config) return;
-    const c = r.data.config;
-    ntEnabled.value = c.enabled ? '1' : '0';
-    ntStyle.value = c.style || 'cn-code';
-  });
-  const ntSaveBtn = document.getElementById('ntSaveBtn');
-  if (ntSaveBtn) ntSaveBtn.onclick = async function () {
-    ntSaveBtn.disabled = true;
-    setMsg('ntMsg', '保存中…', false);
-    try {
-      const r = await api('/__api/node-tag', { method: 'POST', body: JSON.stringify({
-        enabled: ntEnabled.value === '1', style: ntStyle.value,
-      }) });
-      setMsg('ntMsg', r.ok ? '已保存，订阅下次拉取即生效' : (r.data && r.data.error ? r.data.error : '保存失败'), !r.ok);
-    } catch (e) { setMsg('ntMsg', '请求失败', true); }
-    ntSaveBtn.disabled = false;
-  };
 }
 ${authed ? CONFIG_JS : ''}
 ${authed ? STATS_JS : ''}

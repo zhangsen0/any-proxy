@@ -1,4 +1,5 @@
 import { runtime } from './runtime.js';
+import { md5md5 } from './util.js';
 
 // 临时订阅管理：
 //   在不改动代理面板主配置的前提下，创建一批「独立 UUID、限时有效」的订阅链接。
@@ -50,14 +51,9 @@ function fallbackUuidv4() {
 }
 
 // 与 edgetunnel 订阅密钥口径一致：MD5MD5(text) = MD5(MD5(text).hex.slice(7,27))。
-// 订阅 token = MD5MD5(host + uuid)，host 取请求 hostname（未配置 HOST 变量时的同一口径）。
-async function md5Hex(s) {
-  const buf = await crypto.subtle.digest('MD5', new TextEncoder().encode(s));
-  return [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, '0')).join('');
-}
+// 实现取 util.js 的那一份 —— 全项目只有一处，避免与主订阅的 token 算法分叉。
 async function subToken(host, uuid) {
-  const first = await md5Hex(String(host) + String(uuid));
-  return (await md5Hex(first.slice(7, 27))).toLowerCase();
+  return await md5md5(String(host) + String(uuid));
 }
 
 async function listAll() {

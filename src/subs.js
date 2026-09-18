@@ -7,8 +7,8 @@
 // 远端数据源地址也不再写死在这里：默认值登记在 settings.js 的 SPEC 里，面板可改、改完即生效。
 
 import { runtime } from './runtime.js';
-import { b64, isIpv4, isDomain } from './util.js';
-import { SETTINGS_SPEC, readSettings } from './settings.js';
+import { b64, isIpv4, isDomain, md5Hex, md5md5 } from './util.js';
+import { SETTINGS_SPEC, readSettings, nodeIdentity } from './settings.js';
 
 // 远端边缘 IP 段数据源 / 公共 DNS / 缓存时长的默认值：真源在 settings.js 的 SPEC，
 // 这里只取出来复用，避免同一个默认值在两处各写一份（AGENTS 第 1 节）。
@@ -39,15 +39,10 @@ async function kvPut(key, value) {
   }
 }
 
-async function md5Hex(s) {
-  const buf = await crypto.subtle.digest('MD5', new TextEncoder().encode(s));
-  return [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, '0')).join('');
-}
+// MD5 摘要与 MD5MD5 口径统一由 util.js 提供（全项目只有一份实现，含 tempsubs 的 token 推导），
+// 这里只做转发，保留历史导出名，避免调用方为了一个工具函数改动 import 路径。
+// 见 util.js 的 md5md5 注释：两份实现分叉过会表现为「临时订阅 404、主订阅正常」。
 
-async function md5md5(s) {
-  const first = await md5Hex(s);
-  return (await md5Hex(first.slice(7, 27))).toLowerCase();
-}
 
 // IPv4 判定与列表解析统一由 util.js 提供（面板与运行时必须同一口径），这里只做转发，
 // 保留历史导出名，避免调用方为了一个工具函数改动 import 路径。
@@ -148,25 +143,21 @@ async function subscriptionUrl(env, origin) {
  *     本仓库无法共享该默认值，因此这种情况明确返回 null（由调用方降级），绝不猜测。
  */
 async function fallbackSubscription(env, origin, hostname) {
-  const envUuid = env && (env.UUID || env.uuid);
   const uuidRe = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$/;
-  let userId = '';
-  if (envUuid && uuidRe.test(envUuid)) {
-    userId = envUuid.toLowerCase();
-  } else if (env && env.KEY) {
+  // 身份与引擎同源：面板里配的节点 ID / 节点地址优先，其次环境变量，最后本次请求的 hostname。
+  // 两边必须算出同一个 token，否则「兜底订阅链接」会 404（引擎校验的就是 MD5MD5(host+uuid)）。
+  const id = await nodeIdentity(env, hostname);
+  let userId = uuidRe.test(id.uuid) ? id.uuid : '';
+  if (!userId) {
+    // 面板还没写过、环境变量也没给：按引擎的派生规则算。
+    // KEY 未配置时引擎用它自己的默认密钥，本仓库无法共享该默认值，故明确返回 null 由调用方降级。
+    if (!(env && env.KEY)) return null;
     const admin = env.ADMIN || env.PASSWORD || env.TOKEN || env.KEY;
     const seed = await md5md5(String(admin) + String(env.KEY));
     userId = [seed.slice(0, 8), seed.slice(8, 12), '4' + seed.slice(13, 16), '8' + seed.slice(17, 20), seed.slice(20)].join('-');
-  } else {
-    return null;
   }
-  // host 口径同样跟随 edgetunnel：配了 HOST 就用 HOST 的首个条目，否则取请求 hostname
-  let host = String(hostname || '');
-  const hostCfg = env && (env.HOST || env.host);
-  if (hostCfg) {
-    host = String(hostCfg).split(/[,;\s]+/).map(s => s.trim()).filter(Boolean)[0]
-      .toLowerCase().replace(/^https?:\/\//, '').split('/')[0].split(':')[0] || host;
-  }
+  const host = String(id.host || hostname || '')
+    .toLowerCase().replace(/^https?:\/\//, '').split('/')[0].split(':')[0];
   const token = await md5md5(host + userId);
   return String(origin || '').replace(/\/+$/, '') + '/sub?token=' + encodeURIComponent(token);
 }

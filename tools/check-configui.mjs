@@ -140,26 +140,35 @@ section('3. 面板渲染覆盖');
 section('4. 同一份配置只有一处可改');
 {
   // 这是本次改动的核心：优选池 & 健康检查曾经同时长在「优选 IP」和「配置」页，
-  // 于是「面板显示 A、实际生效 B」。这里按接口路径统计全页出现次数。
-  const paths = [...pageHtml.matchAll(/data-path="([^"]+)"/g)].map(m => m[1]);
-  const tally = paths.reduce((a, p) => (a[p] = (a[p] || 0) + 1, a), {});
+  // 于是「面板显示 A、实际生效 B」。
+  //
+  // 不变量是「**一份配置只有一张可编辑表单**」：同一接口路径最多一个 data-setting 块。
+  // 动作块（data-tool）与表单共用路径是另一回事（读表单 + 触发一次动作，如
+  // 「优选 IP 池」表单旁边挂「把当前池子写入 DNS」），所以只对 data-setting 计数。
+  const settingPaths = [...pageHtml.matchAll(/data-setting data-uid="[^"]*" data-path="([^"]+)"/g)].map(m => m[1]);
+  const tally = settingPaths.reduce((a, p) => (a[p] = (a[p] || 0) + 1, a), {});
   const dup = Object.entries(tally).filter(([, n]) => n > 1);
-  ok('全页没有重复的设置表单 / 接口块', dup.length === 0,
-    dup.length ? dup.map(([p, n]) => `${p}×${n}`).join(', ') : `${paths.length} 个接口块`);
+  ok('全页没有重复的设置表单（一份配置只有一张可编辑表单）', dup.length === 0,
+    dup.length ? dup.map(([p, n]) => `${p}×${n}`).join(', ') : `${settingPaths.length} 张设置表单`);
 
   const preferredPaths = ['/__api/pool-config', '/__api/preferred-ips', '/__api/dns-config'];
   ok('优选池与优选 IP 的配置不在配置页出现', preferredPaths.every(p => !panelsHtml.includes(`data-path="${p}"`)),
     preferredPaths.join(', '));
 
-  // 归属选项卡必须仍然能改到这些配置（搬家别搬丢）
-  // 手写表单没有 data-path，所以这里按页面元素 id 核对
+  // 归属选项卡必须仍然能改到这些配置（搬家别搬丢）。
+  // 走目录契约（data-uid + data-key）而不是手写元素 id：表单 id 由注册表推导，
+  // 断言字段名才能同时钉住「表单在页面上」和「字段来自注册表」。
   const anchors = {
-    preferred: ['dnsInterval', 'prefIps', 'poolDomains', 'dnsRunBtn', 'poolSaveBtn', 'autoBtn'],
+    preferred: ['data-uid="dns-config"', 'data-uid="preferred-ips"', 'data-uid="pool-config"',
+      'data-key="preferred_ips"', 'data-key="pool_good_ips"', 'data-key="pref_domains"',
+      'data-path="/__api/dns-run"', 'id="autoBtn"'],
     theme: ['themeGrid', 'rtMode', 'rtMinutes', 'rtPool', 'ctId'],
     security: ['disguiseCard'],
     share: ['shSite', 'shCreate', 'shList'],
     sites: ['addCard', 'editModal'],
-    proxy: ['nodeTagCard', 'subUrl', 'ntEnabled'],
+    proxy: ['data-uid="node-config"', 'data-key="node_uuid"', 'data-key="node_host"',
+      'data-uid="sub-config"', 'data-key="sub_url"',
+      'data-uid="node-tag"', 'data-key="node_tag_enabled"', 'data-key="node_tag_style"'],
     // 驾驶舱：图表容器 + 设置表单都得在「数据驾驶舱」选项卡里，别在搬家时丢件
     stats: ['statsCard', 'stDays', 'stKpis', 'stChart', 'stRank'],
   };
@@ -234,6 +243,30 @@ section('7. 目录里的接口都真的存在');
   }).map(i => i.id + ' ' + i.path);
   ok('每个接口在 admin.js 里都有对应分支', bad.length === 0, bad.join(', ') || `${flat.length} 个接口`);
 
+  // 反向也要查：admin.js 里新加了接口，目录却没跟上 ——
+  // 面板不会渲染它、手册也不会收录它，而且**什么都不会报错**（页面照常渲染、检查照常绿）。
+  // 这正是「这里改了、那里不生效」的另一种长相：功能能调，但运营在面板上永远看不见。
+  // 白名单只放「刻意不进目录」的接口，每条都要写明理由，否则就不该在这张名单上。
+  const OFF_CATALOG = [
+    // 内部探活端点：dns.js 用它判断哪个边缘主机活着（PROBE_PATH），不是给人点的操作，
+    // 出现在面板上只会被误点。
+    '/__api/config',
+    // 伪装页预览：管理员自查访客视角，入口按钮写在伪装卡片自己的脚本里（新标签页打开），
+    // 不是「运营要改的配置」，所以不入目录。
+    '/__api/disguise-preview',
+  ];
+  // 归一化：去掉 <id> 占位、去掉查询串（/__api/tempsubs?t=xxx 与 /__api/tempsubs 是同一条路由）、去掉尾斜杠
+  const norm = p => p.replace(/<[^>]+>/g, '').split('?')[0].replace(/\/+$/, '');
+  const catalogPaths = new Set(flat.map(i => norm(i.path)));
+  const orphan = [...new Set(adminPaths.map(norm))]
+    .filter(p => !catalogPaths.has(p) && !OFF_CATALOG.includes(p) && !routerOwned.includes(p));
+  ok('admin.js 里的接口都在目录里（新增接口不会漏掉面板与手册）', orphan.length === 0,
+    orphan.join(', ') || `已核对 ${new Set(adminPaths.map(norm)).size} 条路径`);
+  for (const p of OFF_CATALOG) {
+    ok(`白名单里的 ${p} 确实还没进目录（防止白名单写了却不生效）`,
+      adminPaths.map(norm).includes(p) && !catalogPaths.has(p));
+  }
+
   const routerJs = read('src/router.js');
   ok('登录 / 登出接口在路由里', routerJs.includes('/__api/login') && routerJs.includes('/__api/logout'));
 }
@@ -269,7 +302,21 @@ section('9. 前端脚本');
 
   const styleCss = read('src/config-ui.js');
   ok('配置页样式随主题变量走', /var\(--(line|card|input|txt)\)/.test(styleCss) && !/#[0-9a-f]{6}/i.test(styleCss.split('CONFIG_CSS')[1] || ''));
-  ok('未登录分支不渲染配置分区', !/data-setting/.test(anonHtml));
+  // 「未登录不给设置表单」：断言的是设置块元素本身（data-setting data-uid=…），
+  // 而不是 data-setting 这个字符串 —— 注入的页面脚本注释里也会出现它。
+  ok('未登录分支不渲染配置分区', !/data-setting data-uid=/.test(anonHtml));
+
+  // 页面脚本引用的 DOM id 必须真的存在。
+  //
+  // 起因：把几张手写卡片换成目录渲染的表单时，卡片连同它的输入框一起没了，
+  // 但脚本里那段 `getElementById('xxx').onclick = …` 还留着。这类残留不会报错 ——
+  // 页面照常打开、其它功能照常，只有那段逻辑静默失效（`?.` 或 `if (el)` 守卫把它吞了）。
+  // 反过来「脚本还在、卡片已删」和「卡片在、脚本忘了配」都靠这一条兜住。
+  const usedIds = new Set([...adminJs.matchAll(/getElementById\(['"]([^'"]+)['"]\)/g)].map(m => m[1]));
+  const ghostIds = [...usedIds].filter(id => !new RegExp(`id="${id.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}"`).test(pageHtml)
+    && !new RegExp(`id="${id.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}"`).test(anonHtml));
+  ok('页面脚本引用的 DOM id 都真实存在（删卡片时别把脚本落下）', ghostIds.length === 0,
+    ghostIds.join(', ') || `已核对 ${usedIds.size} 个 id`);
 }
 
 // ===================== 10. 各选项卡的内容宽度 =====================

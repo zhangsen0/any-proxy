@@ -19,6 +19,9 @@
  *   item.kind       setting 可读可写的配置 / query 只读查询 / action 执行动作。
  *                   不写则按方法推断：GET 视为 query，其余视为 action。
  *   item.spec       该配置项的字段表（模块导出的 SPEC），字段类型与默认值由它决定。
+ *                   运行参数里的字段另有归属表单：`panelSpecOf(id) / panelParamsOf(id)`
+ *                   只取声明了「属于这张表单」的字段，因此一个字段不可能同时出现在两处。
+ *   item.body       动作类接口的固定请求体（如 {action:"clean"}），界面不用为它写输入框。
  *   item.keep       true 表示即使所在分组归属别的选项卡，这一项仍留在配置页 ——
  *                   给「不属于任何功能页」的诊断类工具用。
  *   item.pathParam  路径里的 <id> 由界面单独收集。
@@ -34,7 +37,8 @@ import { STATS_SPEC } from './stats.js';
 import { RATELIMIT_SPEC } from './ratelimit.js';
 import { ALERT_SPEC, ALERT_FORMATS, ALERT_EVENT_IDS } from './alert.js';
 import { SHARE_SPEC } from './share.js';
-import { SETTINGS_SPEC, panelSpec, panelParams } from './settings.js';
+import { R2_CACHE_SPEC } from './media-r2.js';
+import { SETTINGS_SPEC, panelSpec, panelParams, panelSpecOf, panelParamsOf } from './settings.js';
 
 /** 选项卡 id -> 显示名。跳转行与手册按它出文案，避免多处各写一遍中文 */
 export const TAB_LABELS = {
@@ -248,30 +252,55 @@ export const API_CATALOG = [
       },
       {
         id: 'r2-cache', name: 'R2 媒体缓存策略', kind: 'setting', method: 'GET', path: '/__api/r2-cache', writeMethod: 'POST',
-        desc: '流媒体分片持久缓存的策略：总开关 / 保留天数（1~365）/ 单分片上限 MB（1~256），KV 可编辑立即生效；POST {action:"clean"} 立即清理过期分片', auth: true,
+        desc: '流媒体分片持久缓存的策略：总开关 / 保留天数 / 单分片上限 MB / 缓存总量上限 MB，KV 可编辑、保存即生效',
+        auth: true,
+        spec: R2_CACHE_SPEC,
+        params: [
+          { key: 'enabled', label: '启用持久缓存', hint: '关闭后不再往 R2 写入分片，已缓存的不受影响' },
+          { key: 'ttlDays', label: '分片保留天数', type: 'number', unit: '天' },
+          { key: 'maxObjectMB', label: '单分片缓存上限', type: 'number', unit: 'MB' },
+          { key: 'maxTotalMB', label: '缓存总量上限', type: 'number', unit: 'MB', hint: '0 表示不限；超出后按到期时间淘汰最早的对象', level: 'advanced' },
+        ],
+      },
+      {
+        id: 'r2-clean', name: '立即清理过期分片', kind: 'action', method: 'POST', path: '/__api/r2-cache',
+        desc: '不等定时周期，马上删除当前已过期的媒体分片', auth: true,
+        body: { action: 'clean' },
       },
     ],
   },
   {
     id: 'subscription',
     name: '代理节点与订阅',
-    desc: '订阅链接、节点国家标注、临时订阅，在「代理节点」选项卡里管理。',
+    desc: '订阅里出现的节点身份、订阅链接、节点国家标注与临时订阅，在「代理节点」选项卡里管理。'
+      + '这一页的每一个字段都来自同一张运行参数表，且只有这一处可改。',
     tab: 'proxy',
     items: [
       {
-        id: 'sub-gen', name: '订阅生成配置', kind: 'setting', method: 'GET', path: '/__api/sub-gen', writeMethod: 'POST',
-        desc: '节点 ID / 地址 / 路径 / 协议 / 订阅名称与更新间隔；保存后生成的订阅立即按新值输出（修改 UUID 会使旧订阅链接失效）', auth: true,
+        id: 'node-config', name: '订阅生成配置', kind: 'setting', method: 'GET', path: '/__api/node-config', writeMethod: 'POST',
+        desc: '订阅里出现的节点 ID / 地址 / 路径 / 协议 / 传输 / 指纹与订阅名称、更新间隔。'
+          + '取值与代理引擎共用同一份配置文档，保存后下一个订阅请求立即按新值输出；'
+          + '改节点 ID 会让已发出的订阅链接失效，需要重新复制节点链接。'
+          + '（订阅 TOKEN 由「节点地址 + 节点 ID」派生，不是独立配置，所以这里不提供填写处。）',
+        auth: true,
+        spec: panelSpecOf('node-config'),
+        params: panelParamsOf('node-config'),
       },
       {
         id: 'sub-config', name: '订阅链接', kind: 'setting', method: 'GET', path: '/__api/sub-config', writeMethod: 'POST',
         desc: '浏览器优选从这里拉候选 IP；留空则用本机 /sub。（值与校验来自统一运行参数表，编辑入口就在本页，只此一处）',
         auth: true,
-        spec: { sub_url: SETTINGS_SPEC.sub_url },
-        params: [{ key: 'sub_url', label: '订阅链接', wide: true }],
+        spec: panelSpecOf('sub-config'),
+        params: panelParamsOf('sub-config'),
       },
       {
-        id: 'node-tag', name: '节点国家标注', kind: 'setting', method: 'GET', path: '/__api/node-tag', writeMethod: 'POST',
-        desc: '给订阅节点备注补 IP 归属国家', auth: true,
+        id: 'node-tag', name: '节点备注国家标注', kind: 'setting', method: 'GET', path: '/__api/node-tag', writeMethod: 'POST',
+        desc: '给订阅节点的备注补上 IP 归属国家，例如 CF 电信优选 | 美国【US】。'
+          + '主订阅 /sub 与临时订阅 /tsub/<id> 同一套规则；关闭后订阅原样输出，不产生任何外部查询。'
+          + '国家查询结果长期缓存，同一个 IP 只真正查询一次。',
+        auth: true,
+        spec: panelSpecOf('node-tag'),
+        params: panelParamsOf('node-tag'),
       },
       {
         id: 'tempsubs', name: '临时订阅列表', kind: 'query', path: '/__api/tempsubs',
@@ -291,19 +320,34 @@ export const API_CATALOG = [
     items: [
       {
         id: 'dns-config', name: '自动优选频率', kind: 'setting', method: 'GET', path: '/__api/dns-config', writeMethod: 'POST',
-        desc: '定时任务的间隔（分钟，允许区间由接口返回）', auth: true,
+        desc: '定时任务按这个间隔执行一次优选；保存后立即生效，不等下一个周期',
+        auth: true,
+        spec: panelSpecOf('dns-config'),
+        params: panelParamsOf('dns-config'),
       },
       {
-        id: 'dns-run', name: '立即执行一次优选', kind: 'action', method: 'POST', path: '/__api/dns-run',
-        desc: '不等定时任务，马上测通并改写 A 记录', auth: true,
+        id: 'dns-run', name: '立即更新优选 IP', kind: 'action', method: 'POST', path: '/__api/dns-run',
+        desc: '不等定时任务，马上测通并改写 A 记录（不可用会自动回滚）', auth: true,
       },
       {
         id: 'preferred-ips', name: '优选 IP 池', kind: 'setting', method: 'GET', path: '/__api/preferred-ips', writeMethod: 'POST',
-        desc: '每行一个 IPv4；apply=true 时顺带写入 DNS', auth: true,
+        desc: '自动优选优先从这里取候选；条数上限沿用「配置中心 → 优选与候选」里的「优选池上限」',
+        auth: true,
+        spec: panelSpecOf('preferred-ips'),
+        params: panelParamsOf('preferred-ips'),
       },
       {
-        id: 'pool-config', name: '候选域名池 / 健康集', kind: 'setting', method: 'GET', path: '/__api/pool-config', writeMethod: 'POST',
-        desc: '候选域名来源；健康检查自愈写回的可用集也在这里', auth: true,
+        id: 'preferred-apply', name: '把当前池子写入 DNS', kind: 'action', method: 'POST', path: '/__api/preferred-ips',
+        desc: '并发测通当前优选池里的 IP，把可用的写入 A 记录并自检（不修改池子内容）', auth: true,
+        body: { apply: true },
+      },
+      {
+        id: 'pool-config', name: '可用集与候选域名池', kind: 'setting', method: 'GET', path: '/__api/pool-config', writeMethod: 'POST',
+        desc: '「已验证可用集」是自动优选与健康检查写回的、确实通的 IP（优先级高于优选池）；'
+          + '「候选域名池」是解析 A 记录来补充候选 IP 的域名清单，留空则不启用这一路',
+        auth: true,
+        spec: panelSpecOf('pool-config'),
+        params: panelParamsOf('pool-config'),
       },
     ],
   },

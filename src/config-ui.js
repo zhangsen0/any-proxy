@@ -13,7 +13,7 @@
  */
 
 import { esc } from './util.js';
-import { splitCatalog, flatCatalog, TAB_LABELS } from './api-catalog.js';
+import { API_CATALOG, splitCatalog, flatCatalog, TAB_LABELS } from './api-catalog.js';
 
 const ADMIN_PATHS = ['/__api'];
 const AUTHED_PATHS = ['/__api/login', '/__api/logout', '/__api/config'];
@@ -169,7 +169,12 @@ export function renderToolItem(item, opts = {}) {
   const method = String(item.method || 'GET').toUpperCase();
   const params = item.params || [];
   const label = method === 'GET' ? '查看' : (item.danger ? '确认执行' : '执行');
-  return `<div class="cfg-tool" data-tool data-uid="${esc(uid)}" data-path="${esc(item.path)}" data-method="${esc(method)}" data-name="${esc(item.name)}"${item.danger ? ' data-confirm="1"' : ''}>
+  // 目录声明的固定请求体（如「把当前池子写入 DNS」的 {apply:true}）：挂到元素上，
+  // 浏览器侧与用户填写的字段合并。不挂上去的话，目录里写的那份 body 就是一句空话 ——
+  // 「在目录里声明了、实际没生效」正是本页要消灭的那类问题。
+  const fixed = item.body && typeof item.body === 'object' && Object.keys(item.body).length
+    ? ` data-body="${esc(JSON.stringify(item.body))}"` : '';
+  return `<div class="cfg-tool" data-tool data-uid="${esc(uid)}" data-path="${esc(item.path)}" data-method="${esc(method)}" data-name="${esc(item.name)}"${item.danger ? ' data-confirm="1"' : ''}${fixed}>
     <div class="cfg-tool-main">
       <div class="cfg-tool-text">
         <b>${esc(item.name)}</b>
@@ -190,6 +195,27 @@ export function renderToolItem(item, opts = {}) {
 export function settingFormById(id, opts = {}) {
   const item = flatCatalog().find(i => i.id === id);
   return item ? renderSettingForm(item, opts) : '';
+}
+
+/**
+ * 某个功能选项卡自己的「非设置项」（动作 / 查询），由目录渲染。
+ *
+ * 为什么要有这个函数：归属功能选项卡的分组不在配置页渲染（见 placementOf 的 jump），
+ * 于是像「立即更新优选 IP」这类动作项只能靠各页手写按钮 —— 一页一个样子，还会忘。
+ * 交给目录渲染之后，「新增一个动作」不需要改任何页面代码。
+ */
+export function toolItemsForTab(tabId) {
+  const parts = [];
+  for (const g of API_CATALOG) {
+    if (g.hidden || g.tab !== tabId) continue;
+    for (const i of g.items) {
+      if (i.hidden || kindOf(i) === 'setting') continue;
+      // 目录里声明了 keep 的项留在配置页，不在这里重复出现
+      if (i.keep) continue;
+      parts.push(renderToolItem(i));
+    }
+  }
+  return parts.join('');
 }
 
 // ===================== 配置页 =====================
@@ -377,7 +403,10 @@ function configInit() {
     const btn = $('[data-act="run"]', tool);
     const box = $('.cfg-result', tool);
     const out = $('[data-out]', tool);
-    const body = {};
+    // 目录声明的固定请求体先铺底，用户填写的字段覆盖同名键
+    let body = {};
+    const fixedRaw = tool.getAttribute('data-body');
+    if (fixedRaw) { try { body = JSON.parse(fixedRaw) || {}; } catch (e) { body = {}; } }
     const qs = [];
     $$('[data-key]', tool).forEach(el => {
       const value = fieldValue(el);
