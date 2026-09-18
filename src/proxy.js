@@ -66,17 +66,18 @@ function cacheKeyOf(u) {
 }
 
 /**
- * 媒体分片缓存 key：在普通缓存 key 基础上把 Range 区间与（可选）鉴权身份绑进去。
- *  - Range 不绑会互相污染：播放器按不同区间拉分片，Cache API 匹配时不看 Range 头，
- *    先到先得会把某个区间的分片当成另一个区间的返回 → 花屏 / 卡死 / seek 错乱。
+ * 媒体分片缓存 key：在普通缓存 key 基础上把（可选）鉴权身份绑进去。
+ *  - 刻意**不**绑 Range：CF Cache API 的 cache.put 拒绝 status=206 的响应
+ *    （官方文档 Invalid parameters 明确列出 206），媒体缓存只存 200 完整小响应
+ *    （HLS/DASH 分片 .ts/.m4s 等）。cache.match 命中带 Content-Length 的完整
+ *    200 响应时，CF 会根据请求的 Range 头自动切 206 返回 —— key 不绑 Range 才能
+ *    吃到这个能力；绑了 Range 反而让带 Range 的请求永远 miss。
  *  - authBind（盗链保护）：把 api_key / X-Emby-Token 编进 key，不同用户的缓存隔离，
  *    未带鉴权的请求永远命中不了别人的缓存；不开则共享缓存（更快，播放 URL 带鉴权时
  *    本身不可猜测，已受一层保护，这里做的是第二层）。
  */
 function mediaCacheKeyOf(targetUrl, request, authBind) {
   const x = new URL(cacheKeyOf(targetUrl));
-  const range = request.headers.get('range') || request.headers.get('if-range');
-  if (range) x.searchParams.set('__r', range);
   if (authBind) {
     const apiKey = x.searchParams.get('api_key') || request.headers.get('X-Emby-Token') || '';
     if (apiKey) x.searchParams.set('__auth', apiKey);
@@ -128,17 +129,18 @@ function cacheableSize(res) {
  * 跨隔离共享：首次回源后所有请求直接命中，避免每个用户每次都要 Worker 回源 + 重写，
  * 也避免大 bundle（数百 KB）在浏览器端等 4-7 秒才执行、拖垮 React 水合。
  * 只命中 200 的 GET，且体积在上限内；miss 时构建响应并 waitUntil 写入缓存。
- * allowPartial=true 时（流媒体模式分片缓存）：206 分片同样允许命中/写入，
- * 但 key 必须带 Range 区间（见 mediaCacheKeyOf），否则不同区间会互相污染。
+ *
+ * ⚠️ 绝不缓存 206：CF Cache API 的 cache.put 对 status=206 的响应直接抛错
+ * （官方文档 Invalid parameters 明确列出），流媒体分片缓存只对 200 完整小响应
+ * （HLS/DASH 分片）生效；MP4 等 206 Range 分片靠零 CPU 透传满速转发。
  */
-async function serveCached(ctx, cacheKey, build, allowPartial) {
+async function serveCached(ctx, cacheKey, build) {
   if (!ctx || !cacheKey || typeof caches === 'undefined') return build();
   const key = new Request(cacheKey);
   const hit = await caches.default.match(key).catch(() => null);
   if (hit) return hit;
   const res = build();
-  const okStatus = res && (res.status === 200 || (allowPartial && res.status === 206));
-  if (okStatus && cacheableSize(res)) {
+  if (res && res.status === 200 && cacheableSize(res)) {
     try { ctx.waitUntil(caches.default.put(key, res.clone())); } catch {}
   }
   return res;
@@ -419,13 +421,13 @@ async function proxyRequest(request, site, crossHost, ctx, env) {
   // HLS 清单是明文但不在 isText 白名单里，必须单独判定。漏掉这一条，清单会走进下面的
   // 「非文本直传」分支：分片地址与 AES 密钥 URI 原样透出，播放器按根路径去取 → 404 / 解密失败
   if (!isText(ct) && !isHls) {
-    // 流媒体模式（proxyMode=media）：媒体请求走分片边缘缓存，命中即免回源，
-    // 播放器拉片从「每次回源」变成「绝大多数命中 CF 边缘缓存」，体感接近直连。
-    // key 绑 Range + （可选）鉴权身份，防盗链的同时保证不同分片区间不互相污染；
-    // 体积闸门沿用 MAX_CACHE_BYTES（4MB），整片大文件仍然挡在缓存之外。
-    if (request.method === 'GET' && site.proxyMode === 'media' && isMediaRequest(request, ct) && cacheableSize(upstream)) {
+    // 流媒体模式（proxyMode=media）：媒体小响应（HLS/DASH 分片 .ts/.m4s 等 200 响应）
+    // 走分片边缘缓存，命中即免回源；MP4 等 206 Range 分片无法进 Cache API
+    // （平台限制：cache.put 拒绝 206），由零 CPU 透传满速转发，两者结合播放体感接近直连。
+    // key 绑（可选）鉴权身份防盗链；体积闸门沿用 MAX_CACHE_BYTES（4MB），整片挡在缓存外。
+    if (request.method === 'GET' && site.proxyMode === 'media' && isMediaRequest(request, ct) && cacheableSize(upstream) && upstream.status === 200) {
       return serveCached(ctx, mediaCacheKeyOf(targetUrl, request, !!site.mediaCacheAuthBind), () =>
-        new Response(upstream.body, { status: upstream.status, headers: headersOut }), true);
+        new Response(upstream.body, { status: upstream.status, headers: headersOut }));
     }
     // 非文本资源（图片/字体/音视频）：fingerprinted 走共享缓存，其余直接回源
     if (request.method === 'GET' && upstream.status === 200 && isFingerprinted(url.pathname)) {

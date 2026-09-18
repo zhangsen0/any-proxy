@@ -182,33 +182,34 @@ console.log('\n[9] 流媒体请求判定（isMediaRequest）：宁可宽不可�
   check('JSON 接口不判媒体', !isMediaRequest(new Request('https://x/api/data'), 'application/json'));
 }
 
-console.log('\n[10] 媒体分片缓存 key：Range 必绑（防区间污染），鉴权按开关绑定（防盗链）');
+console.log('\n[10] 媒体分片缓存 key：不绑 Range（cache.match 命中 200 完整响应时 CF 会按 Range 自动切 206），鉴权按开关绑定（防盗链）');
 {
   const req = (range) => new Request('https://x/v.mp4?api_key=sec1', { headers: range ? { range } : {} });
   const k1 = mediaCacheKeyOf('https://x/v.mp4?api_key=sec1', req('bytes=0-99'), false);
-  check('缓存 key 绑定 Range 区间（防不同分片互相污染）', k1.includes('__r=bytes%3D0-99'), k1);
-  const kNoRange = mediaCacheKeyOf('https://x/v.mp4?api_key=sec1', req(null), false);
-  check('无 Range 请求不绑定区间', !kNoRange.includes('__r='));
+  check('缓存 key 不绑定 Range 区间（绑了会挡住 CF 的 Range→206 切片能力）', !k1.includes('__r='), k1);
   const kAuth = mediaCacheKeyOf('https://x/v.mp4?api_key=sec1', req('bytes=0-99'), true);
   check('盗链保护开：key 绑定鉴权身份（用户缓存隔离）', kAuth.includes('__auth=sec1'));
   const kNoAuth = mediaCacheKeyOf('https://x/v.mp4?api_key=sec1', req('bytes=0-99'), false);
   check('盗链保护关：key 不含鉴权身份（共享缓存）', !kNoAuth.includes('__auth='));
 }
 
-console.log('\n[11] 分片边缘缓存：allowPartial 时 206 可写缓存（流媒体模式的加速点），默认仍拒绝');
+console.log('\n[11] 分片边缘缓存：CF Cache API 拒绝 206（cache.put 对 206 直接抛错），只缓存 200 媒体小响应');
 {
   const c = fakeCaches();
   globalThis.caches = c;
   const part = new Response('x'.repeat(16), { status: 206, headers: { 'content-length': '1024', 'content-range': 'bytes 0-1023/10240' } });
   const ctx = ctxOf();
-  await serveCached(ctx, 'https://x/seg.ts?__apv=1&__r=bytes%3D0-1023', () => part, true);
+  await serveCached(ctx, 'https://x/seg.ts?__apv=1', () => part);
   await flush(ctx);
-  check('流媒体模式：206 分片写入缓存（allowPartial=true）', c.puts.length === 1, `put 次数=${c.puts.length}`);
+  check('206 分片绝不写入缓存（平台限制，写缓存必然报错）', c.puts.length === 0, `put 次数=${c.puts.length}`);
 
   const c2 = fakeCaches();
   globalThis.caches = c2;
-  await serveCached(ctxOf(), 'https://x/seg2.ts', () => part, false);
-  check('默认（非流媒体分支）：206 分片不写缓存', c2.puts.length === 0);
+  const ok = new Response('y'.repeat(16), { status: 200, headers: { 'content-length': '1024' } });
+  const ctx2 = ctxOf();
+  await serveCached(ctx2, 'https://x/seg2.ts?__apv=1', () => ok);
+  await flush(ctx2);
+  check('200 媒体小响应（HLS/DASH 分片）写入缓存', c2.puts.length === 1, `put 次数=${c2.puts.length}`);
 }
 
 console.log(`\n媒体与大文件链路：${pass} 项，失败 ${fail} 项\n`);

@@ -803,7 +803,7 @@ async function adminPage(authed, origin, env) {
     .row { gap:var(--sp-1); }
     button { padding:10px 14px; }
   }
-.tabs { display:flex; gap:6px; margin:16px 0 2px; padding:4px; background:var(--input); border:1px solid var(--line); border-radius:var(--radius-sm); overflow-x:auto; scrollbar-width:none; }
+.tabs { display:flex; flex-wrap:wrap; gap:6px; margin:16px 0 2px; padding:4px; background:var(--input); border:1px solid var(--line); border-radius:var(--radius-sm); overflow-x:auto; scrollbar-width:none; }
 .tabs::-webkit-scrollbar { display:none; }
 .tab { padding:8px 14px; margin:0; width:auto; background:transparent; color:var(--muted); border:none; border-radius:var(--radius-xs); cursor:pointer; font-size:14px; font-weight:500; white-space:nowrap; transition:color .15s, background .15s; }
 .tab:hover { background:transparent; color:var(--txt); transform:none; }
