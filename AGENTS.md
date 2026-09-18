@@ -32,6 +32,7 @@
 - **写入侧不许静默忽略**：`saveSettings` 遇到 `SETTINGS_SPEC` 之外的键直接报 400 并点名是哪个字段。静默忽略会让「字段名写错 / 调用方还在用旧别名」表现为「提示保存成功、值却没变」——不报错、日志干净，只能人肉比对。同理，新增接口时别再造一层 `{别名} → 注册表字段名` 的翻译。
 - **校验要拦在写入前**：面板值若不能被引擎接受（如 `uuid` 必须是 v4 形态，否则 `vendor/vless.js` 会静默改用派生值），必须在注册表字段的 `validate` 里拦住，而不是等引擎默默丢弃。
 - **接口必须进目录**：`admin.js` 里新增 `/__api/*` 就要在 `api-catalog.js` 加条目，否则面板不渲染、手册不收录，而且什么都不报错。刻意不进目录的（内部探活、预览类）要登记进 `check-configui` 第 7 段的 `OFF_CATALOG` 白名单并写明理由。
+- **页面脚本里不许写死运行参数的数字**：浏览器优选曾经在脚本里写死 `40 / 15 / 8 / 3500`，于是面板把「订阅候选上限」调到 100、浏览器依旧只测 40 个 —— 开关存在、行为不变，不报错。需要口径就从服务端下发（见 `admin.js` 的 `pickLimits(cfg)`，由 `/__api/preferred-candidates` 与 `/__api/preferred-ips` 回带），**拿不到就停下报错、不要用写死数字兜底**。判据在 `check-preferred.mjs` 第 6 段：真改一次值断言下发跟着变 + 静态扫描源码里没有第二套数字。
 - 强制检查：`node tools/check-single-source.mjs` + `node tools/check-settings.mjs`（均已入 CI）。
 
 ## 2. 浏览器端 `api()` 返回包装结构
@@ -75,7 +76,7 @@ CF 边缘（workers.dev 与自定义域行为一致）会：① 改写入站 `Ac
 ## 7. 提交与部署纪律
 
 - 提交信息一律**中文**。
-- 提交前跑全套：`check-rewrite / check-disguise / check-nodetag / check-anycast / check-themes / check-compress / check-smoke / check-guard / check-configui / check-stats / check-cf-panel / check-single-source / check-settings / check-wrangler` + `node tools/gen-manual.mjs --check`。
+- 提交前跑全套：`check-rewrite / check-disguise / check-nodetag / check-anycast / check-themes / check-compress / check-smoke / check-guard / check-configui / check-stats / check-cf-panel / check-single-source / check-settings / check-wrangler / check-preferred` + `node tools/gen-manual.mjs --check`。
 - 改 `api-catalog.js` 后必须跑 `gen-manual.mjs --write`，否则 `docs/09` 附录与代码脱节（CI 会卡住）。
 - push 到 master 触发自动部署 + 线上 e2e；部署后带 `ap_auth` cookie 抽查 `/__admin`（未登录应伪装 404）。
 - 统计（数据驾驶舱）默认**关闭**，`record_admin` 缺省 false——改配置面板时别把默认值写反。

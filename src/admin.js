@@ -70,6 +70,22 @@ async function dnsContext(request, url, env) {
   };
 }
 
+/**
+ * 浏览器自动优选「怎么跑」的运行参数：一次测几个、留几条、几路并发、单次等多久。
+ * 这五个数字以前写死在面板脚本里（40 / 15 / 8 / 3500），注册表里改「订阅候选上限」不生效 ——
+ * 面板上有开关、行为不变，属于最难查的一类问题。现在只有这一处定义：
+ * 服务端接口把它回带给前端，前端照单执行，自己不再留任何数字。
+ */
+function pickLimits(cfg) {
+  const num = (key) => Number(cfg[key]) || SETTINGS_SPEC[key].default;
+  return {
+    scan_limit: num('pick_scan_limit'),
+    keep: num('pick_keep'),
+    concurrency: num('pick_concurrency'),
+    timeout_ms: num('pick_timeout_ms'),
+  };
+}
+
 async function handleAdmin(request, url, env) {
   if (request.method === 'OPTIONS') {
     return new Response(null, {
@@ -219,7 +235,9 @@ async function handleAdmin(request, url, env) {
   if (path === '/__api/preferred-ips') {
     if (request.method === 'GET') {
       const cfg = await readSettings(env);
-      return json({ ok: true, preferred_ips: cfg.preferred_ips, limit: cfg.pool_limit });
+      // 顺带回带浏览器测速的运行参数：订阅拉不到候选时前端走「当前池」兜底，
+      // 那条路同样要按注册表里的数字来跑 —— 兜底路径写死一份就等于另一套真源。
+      return json({ ok: true, preferred_ips: cfg.preferred_ips, limit: cfg.pool_limit, limits: pickLimits(cfg) });
     }
     if (request.method === 'POST') {
       let body;
@@ -269,6 +287,7 @@ async function handleAdmin(request, url, env) {
   // 并让「立即更新优选 IP」逐个探测这些不可达地址直到超时。过滤开关与条数上限都是运行参数，面板可改。
   if (request.method === 'GET' && path === '/__api/preferred-candidates') {
     const cfg = await readSettings(env);
+    const limits = pickLimits(cfg);
     let res;
     try {
       res = await fetchSubscriptionCandidates(env, {
@@ -276,14 +295,18 @@ async function handleAdmin(request, url, env) {
         hostname: (await resolveProxyHost(env, url.hostname)) || url.hostname,
         limit: cfg.candidate_limit || CANDIDATE_LIMIT,
         strict: cfg.sub_strict !== false,
-        signal: AbortSignal.timeout(9000),
+        signal: AbortSignal.timeout(
+          Number(cfg.pick_candidate_timeout_ms) || SETTINGS_SPEC.pick_candidate_timeout_ms.default
+        ),
       });
     } catch (e) {
-      return json({ ok: false, ips: [], error: '候选拉取异常：' + (e && e.message ? e.message : e) }, 502);
+      // 失败也要回带 limits：前端这条报错分支后面还会走「当前池」兜底，拿不到参数就跑不动
+      return json({ ok: false, ips: [], limits, error: '候选拉取异常：' + (e && e.message ? e.message : e) }, 502);
     }
     return json({
       ok: true,
       ips: res.ips,
+      limits,
       source: res.source,
       note: res.note || '',
       stats: { addresses: res.addresses || 0, filtered: res.filtered || 0, ranges: res.ranges || '' },
@@ -1715,23 +1738,27 @@ if (pickLastEl) {
 // 探活目标改用根路径：伪装开启后 /__api/config 要求登录，跨站 no-cors 请求带不上 cookie，
 // 继续打它会全部超时。根路径在伪装状态下始终返回 200 的伪装页，且「根路径」是所有网站都有的，
 // 不引入任何新指纹。代价：no-cors 模式本就无法读取状态码，1034 仍要靠服务端优选（dns.js）判定。
-async function measureIp(ip) {
+// timeoutMs 由运行参数（单次测速超时）下发，这里不再自带数字。
+// 「作废阈值」跟着超时走：超时是一次 fetch 的上限，超时两次的量级就是 2×timeoutMs，
+// 若另写一个固定值（曾经是 5000），把超时调大到 8000 就会把正常慢节点全部误判为不可用。
+async function measureIp(ip, timeoutMs) {
   let first = Infinity;
   for (let t = 0; t < 2; t++) {
     const t0 = performance.now();
     try {
-      await fetch('https://' + ip + '/', { mode: 'no-cors', cache: 'no-store', signal: AbortSignal.timeout(3500) });
+      await fetch('https://' + ip + '/', { mode: 'no-cors', cache: 'no-store', signal: AbortSignal.timeout(timeoutMs) });
     } catch (e) {}
     const ms = performance.now() - t0;
     if (ms < first) first = ms;
   }
-  if (first >= 5000) return null;
+  // +1500 是给「浏览器 abort + 计时开销」留的余量，超过才说明这次测量本身不可信
+  if (first >= timeoutMs + 1500) return null;
   if (first < 200) {
     const samples = [first];
     for (let t = 0; t < 2; t++) {
       const t0 = performance.now();
       try {
-        await fetch('https://' + ip + '/', { mode: 'no-cors', cache: 'no-store', signal: AbortSignal.timeout(3500) });
+        await fetch('https://' + ip + '/', { mode: 'no-cors', cache: 'no-store', signal: AbortSignal.timeout(timeoutMs) });
       } catch (e) {}
       samples.push(performance.now() - t0);
     }
@@ -1761,23 +1788,39 @@ if (autoBtn) {
     btn.textContent = '正在拉取订阅节点…';
     let cands = [];
     let note = '';
+    // 测速口径（测几个 / 留几条 / 几路并发 / 单次等多久）由服务端从注册表下发。
+    // 前端不自带任何数字：写死一份就等于第二套真源，面板上改了也不生效。
+    let limits = null;
     try {
       const r = await api('/__api/preferred-candidates');
       if (r.ok && r.data) {
         cands = r.data.ips || [];
+        limits = r.data.limits || null;
         const s = r.data.stats || {};
         note = r.data.note || (s.filtered ? '订阅共 ' + s.addresses + ' 个节点，已过滤非边缘网络 ' + s.filtered + ' 个' : '');
       } else {
+        limits = (r.data && r.data.limits) || null; // 失败分支也带，后面兜底路径要用
         note = (r.data && r.data.error) || '订阅拉取失败';
       }
     } catch (e) { note = '订阅拉取异常'; }
     if (!cands.length) {
       try {
         const r = await api('/__api/preferred-ips');
-        if (r.ok && r.data.preferred_ips && r.data.preferred_ips.length) { cands = r.data.preferred_ips; note = '订阅无候选，改用当前优选池'; }
+        if (r.ok && r.data.preferred_ips && r.data.preferred_ips.length) {
+          cands = r.data.preferred_ips;
+          limits = limits || r.data.limits || null;
+          note = '订阅无候选，改用当前优选池';
+        }
       } catch {}
     }
-    cands = [...new Set(cands.filter(ip => /^\\d{1,3}(\\.\\d{1,3}){3}$/.test(ip)))].slice(0, 40);
+    if (!limits) {
+      // 拿不到口径就直接停：宁可不测，也不用一套「看起来能跑」的写死数字把池子改掉
+      setMsg('autoMsg', '拿不到浏览器测速的运行参数（刷新页面重试）' + (note ? '（' + note + '）' : ''), true);
+      btn.disabled = false;
+      btn.textContent = '浏览器自动优选';
+      return;
+    }
+    cands = [...new Set(cands.filter(ip => /^\\d{1,3}(\\.\\d{1,3}){3}$/.test(ip)))].slice(0, limits.scan_limit);
     if (!cands.length) {
       setMsg('autoMsg', '没有可用候选：请先在「代理节点」页填写订阅链接并保存' + (note ? '（' + note + '）' : ''), true);
       btn.disabled = false;
@@ -1786,9 +1829,9 @@ if (autoBtn) {
     }
     const results = [];
     let done = 0;
-    const CONC = 8;
+    const CONC = limits.concurrency;
     const ping = async (ip) => {
-      const t = await measureIp(ip);
+      const t = await measureIp(ip, limits.timeout_ms);
       if (t !== null) results.push({ ip, t });
       done++;
       btn.textContent = '自动优选中 ' + done + '/' + cands.length + '…（已测 ' + results.length + '）';
@@ -1797,7 +1840,7 @@ if (autoBtn) {
       await Promise.all(cands.slice(i, i + CONC).map(ping));
     }
     results.sort((a, b) => a.t - b.t);
-    const best = results.slice(0, 15);
+    const best = results.slice(0, limits.keep);
     if (!best.length) {
       setMsg('autoMsg', '全部节点超时（网络受限？），请稍后重试', true);
     } else {

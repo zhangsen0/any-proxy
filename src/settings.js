@@ -154,6 +154,36 @@ export const SETTINGS_SPEC = {
     group: 'preferred', label: '浏览器测速结果有效期', unit: '毫秒', level: 'advanced',
     hint: '超过这个时间没重新测过就当作没测过，回到服务端顺序。换了网络（回家、出国）旧数字就是错的，所以宁可不用也不能一直信',
   },
+  // ---------- 浏览器测速怎么跑 ----------
+  //
+  // 这一组以前是写死在面板脚本里的五个数字（40 / 15 / 8 / 3500 / 9000）：改配置改不动，
+  // 「订阅候选上限」调到 100 了浏览器还是只测 40 个 —— 属于「面板上有开关、实际不生效」。
+  // 收进注册表之后，默认值与旧行为一致（改完行为不变），但终于能改了，且与服务端共用同一份。
+  pick_scan_limit: {
+    type: 'int', default: 40, min: 1, max: 200, env: 'PICK_SCAN_LIMIT',
+    group: 'preferred', label: '浏览器一次最多测几个', unit: '个', level: 'advanced',
+    hint: '拉到的候选先截到这个数再逐个测。调大更准但更慢（每个都要打一次请求）',
+  },
+  pick_keep: {
+    type: 'int', default: 15, min: 1, max: 100, env: 'PICK_KEEP',
+    group: 'preferred', label: '测完写进优选池几条', unit: '条', level: 'advanced',
+    hint: '只留最快的这几条。写入时还会按「优选池上限」再夹一次，两者取小',
+  },
+  pick_concurrency: {
+    type: 'int', default: 8, min: 1, max: 32, env: 'PICK_CONCURRENCY',
+    group: 'preferred', label: '浏览器测速并发', unit: '路', level: 'advanced',
+    hint: '同时测几个 IP。太大容易被浏览器或网络当成异常流量，反而测不准',
+  },
+  pick_timeout_ms: {
+    type: 'int', default: 3500, min: 1000, max: 10000, env: 'PICK_TIMEOUT_MS',
+    group: 'preferred', label: '单次测速超时', unit: '毫秒', level: 'advanced',
+    hint: '单个 IP 等多久算没回应。网络差时调大能少丢一些慢节点，代价是整轮变长',
+  },
+  pick_candidate_timeout_ms: {
+    type: 'int', default: 9000, min: 2000, max: 25000, env: 'PICK_CANDIDATE_TIMEOUT_MS',
+    group: 'preferred', label: '拉候选的超时', unit: '毫秒', level: 'advanced',
+    hint: '从订阅链接拉候选最多等多久。订阅站反应慢就调大；超时会退回用当前优选池',
+  },
   hc_slow_evict: {
     type: 'bool', default: true, env: 'HC_SLOW_EVICT',
     group: 'preferred', label: '淘汰明显慢的节点',

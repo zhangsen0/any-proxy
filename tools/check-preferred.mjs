@@ -18,6 +18,7 @@ import { btoa } from 'node:buffer';
 import { handleRequest } from '../src/router.js';
 import { bindRuntime } from '../src/runtime.js';
 import { filterUsableIps, autoUpdatePreferredDns } from '../src/dns.js';
+import { SETTINGS_SPEC } from '../src/settings.js';
 
 const PASSWORD = process.env.PASSWORD || 'dev';
 const ORIGIN = process.env.PROBE_ORIGIN || 'https://proxy.example.com';
@@ -150,6 +151,76 @@ if (!SKIP_NETWORK) {
     (noMemory.error || '无错误').slice(0, 60)
   );
   env.PROXY_HOST = saved;
+}
+
+// 6) 浏览器自动优选「怎么跑」必须是运行参数，不是写死在面板脚本里的数字
+//
+// 以前脚本里写死 40 / 15 / 8 / 3500 / 9000：注册表里把「订阅候选上限」调到 100，
+// 浏览器那边依旧只测 40 个 —— 面板上有开关、行为不变，是最难查的一类问题。
+// 这里钉死两件事：①接口真的下发这些口径；②前端源码里不再留第二套数字。
+{
+  const EXPECT = {
+    pick_scan_limit: 40, pick_keep: 15, pick_concurrency: 8,
+    pick_timeout_ms: 3500, pick_candidate_timeout_ms: 9000,
+  };
+  for (const [key, want] of Object.entries(EXPECT)) {
+    check(
+      `注册表里有 ${key}，默认值沿用旧行为（${want}）`,
+      !!SETTINGS_SPEC[key] && SETTINGS_SPEC[key].default === want,
+      SETTINGS_SPEC[key] ? String(SETTINGS_SPEC[key].default) : '缺失'
+    );
+  }
+
+  const cands = await call('/__api/preferred-candidates');
+  const limits = (cands.data && cands.data.limits) || null;
+  // 无论订阅拉没拉到都要回带：拉不到时前端还要走「当前池」兜底，那条路同样按这套数字跑
+  check('候选接口回带浏览器测速口径', !!limits, JSON.stringify(limits || {}));
+  if (limits) {
+    check('口径四个键齐全且为正数',
+      ['scan_limit', 'keep', 'concurrency', 'timeout_ms'].every(k => Number(limits[k]) > 0),
+      JSON.stringify(limits));
+  }
+  const poolRes = await call('/__api/preferred-ips', { authed: true });
+  check('优选池接口也回带口径（兜底路径要用）',
+    !!(poolRes.data && poolRes.data.limits), JSON.stringify((poolRes.data || {}).limits || {}));
+
+  // 「可自定义」的本体：改完立刻生效。只断言字段存在是不够的 —— 存在但不下发等于没改
+  const saved = await call('/__api/settings', {
+    method: 'POST', authed: true,
+    body: JSON.stringify({ pick_scan_limit: 7, pick_keep: 3, pick_concurrency: 2, pick_timeout_ms: 1234 }),
+  });
+  check('保存浏览器测速口径', saved.status === 200 && !!(saved.data && saved.data.ok), 'HTTP ' + saved.status);
+  const after = await call('/__api/preferred-candidates');
+  const L2 = (after.data && after.data.limits) || {};
+  check('改完立刻下发新值（不是写死的旧值）',
+    L2.scan_limit === 7 && L2.keep === 3 && L2.concurrency === 2 && L2.timeout_ms === 1234,
+    JSON.stringify(L2));
+
+  const src = readFileSync(new URL('../src/admin.js', import.meta.url), 'utf8');
+  const deadNums = [
+    ['一次测几个写死 40', /slice\(0,\s*40\)/],
+    ['保留条数写死 15', /slice\(0,\s*15\)/],
+    ['并发写死 8', /CONC\s*=\s*8\b/],
+    ['单次测速超时写死 3500', /timeout\(3500\)/],
+    ['拉候选超时写死 9000', /timeout\(9000\)/],
+  ];
+  for (const [name, re] of deadNums) {
+    check('前端不再写死：' + name, !re.test(src));
+  }
+  check('测速函数签名带超时参数（不自带数字）', /function measureIp\([^)]*timeoutMs/.test(src));
+  check('测速调用真的把超时传进去', /measureIp\([^)]*limits\.timeout_ms/.test(src));
+  // 候选接口的每个出口都要带口径：拉订阅失败那条路后面还会走「当前池」兜底，
+  // 少了它前端就会因为拿不到参数直接停住 —— 这种「只在失败时才出问题」的分支最容易漏。
+  const block = src.slice(
+    src.indexOf("path === '/__api/preferred-candidates'"),
+    src.indexOf("path === '/__api/pick-speed'")
+  );
+  // 窗口按「到本条语句的分号为止」取，不能按固定字符数 —— 固定窗口会越过 `);` 读到
+  // 下一个 return 里的 limits，于是「失败分支没带」也被判成带了（牙齿验证抓出来的）。
+  const rets = [...block.matchAll(/return json\(/g)].map((m) => m.index);
+  const withLimits = rets.filter((i) => /^[^;]{0,400}limits/.test(block.slice(i)));
+  check('候选接口每个出口都带口径（含失败分支）',
+    rets.length >= 2 && withLimits.length === rets.length, `${withLimits.length}/${rets.length}`);
 }
 
 console.log(`\n=== ${failed === 0 ? '全部通过' : failed + ' 项失败'} ===\n`);
