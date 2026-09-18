@@ -524,11 +524,14 @@ async function proxyRequest(request, site, crossHost, ctx, env) {
   // 带 Set-Cookie 的响应）；短 TTL 避免缓存住会变化的私有状态。
   if (request.method === 'GET' && upstream.status === 200 && site.proxyMode === 'media'
       && /^application\/json\b/i.test(ct) && rewritten && rewritten.length <= MAX_CACHE_BYTES) {
+    const ckey = new Request(mediaCacheKeyOf(targetUrl, request, !!site.mediaCacheAuthBind));
+    const cj = await caches.default.match(ckey).catch(() => null);
+    if (cj) return cj;
     headersOut.set('Cache-Control', 'public, max-age=60, stale-while-revalidate=300');
     headersOut.delete('set-cookie');
     const resp = finalizeResponse(upstream.status, rewritten, headersOut);
     try {
-      ctx.waitUntil(caches.default.put(new Request(mediaCacheKeyOf(targetUrl, request, !!site.mediaCacheAuthBind)), resp.clone()));
+      ctx.waitUntil(caches.default.put(ckey, resp.clone()));
     } catch {}
     return resp;
   }
