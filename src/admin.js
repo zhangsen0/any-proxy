@@ -9,13 +9,14 @@ import {
 } from './dns.js';
 import { subscriptionUrl, fetchSubscriptionCandidates, CANDIDATE_LIMIT } from './subs.js';
 import * as tempsubs from './tempsubs.js';
-import { readConfig, saveConfig, sanitize, isActive, renderHome } from './disguise.js';
+import { readConfig, saveConfig, sanitize, isActive, renderHome, listTemplates } from './disguise.js';
+import { VISIT_SCOPES } from './scopes.js';
 import {
   readThemeConfig, saveThemeConfig, listThemes, upsertCustom, removeCustom,
   themeCss, baseVarsCss, applyScript, THEME_STORAGE_KEY, DEFAULT_PRESET_ID,
   rotatingTheme, rotatePool, themeFieldBounds,
 } from './themes.js';
-import { readStatsConfig, saveStatsConfig, summarize, clearAll, STATS_SPEC } from './stats.js';
+import { readStatsConfig, saveStatsConfig, summarize, clearAll, STATS_SPEC, STATS_RANGES } from './stats.js';
 import {
   readLimitConfig, saveLimitConfig, listBans, clearBans, RATELIMIT_SPEC,
 } from './ratelimit.js';
@@ -785,6 +786,25 @@ async function adminPage(authed, origin, env) {
   const modeOptions = Object.entries(modes)
     .map(([k, v]) => `<option value="${esc(k)}">${esc(v.label)}</option>`)
     .join('');
+  // 系统配置字典（代码级真源，只读）：集中列出系统所有字典 / 注册表的当前可用项
+  // 真源位置在标注的模块文件里，面板只读展示；可编辑的注册表（站点模式）在配置中心单独维护
+  let dictHtml = '<div class="empty">字典加载失败</div>';
+  try {
+    dictHtml = [
+      { title: '访问渠道注册表', src: 'src/scopes.js', items: VISIT_SCOPES.map(s => `${s.id} · ${s.label}（${s.prefixes.join(' ')}）`) },
+      { title: '统计档位（天）', src: 'src/stats.js', items: STATS_RANGES.map(d => `${d} 天`) },
+      { title: '告警事件', src: 'src/alert.js', items: ALERT_EVENTS.map(e => `${e.id} · ${e.label}：${e.desc}`) },
+      { title: '伪装模板', src: 'src/disguise.js', items: listTemplates().map(t => `${t.id}：${t.desc}`) },
+      { title: '执行引擎词表', src: 'src/site-modes.js', items: SITE_ENGINES },
+      { title: '徽标色板', src: 'src/site-modes.js', items: BADGE_CLASSES },
+    ].map(g => `
+    <div class="dict-group" style="margin:12px 0 0;">
+      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:6px;">
+        <b>${esc(g.title)}</b><span class="tag" style="font-weight:400;">真源 ${esc(g.src)}</span>
+      </div>
+      <div style="display:flex;gap:6px;flex-wrap:wrap;">${g.items.map(i => `<span class="tag">${esc(i)}</span>`).join('')}</div>
+    </div>`).join('');
+  } catch {}
   // 服务端直接渲染站点列表（首屏秒开，不依赖前端 fetch；前端 load() 仅用于增删/操作后刷新）
   // 页面上展示的「优选目标域名」由配置推导，不写死任何域名
   const pageHost = proxyHost(env, String(origin || '').replace(/^https?:\/\//i, '').split(/[/?#]/)[0].split(':')[0]);
@@ -994,6 +1014,7 @@ ${themeScript}
     <button type="button" class="tab" data-tab="security">伪装与安全</button>
     <button type="button" class="tab" data-tab="theme">外观主题</button>
     <button type="button" class="tab" data-tab="share">临时链接</button>
+    <button type="button" class="tab" data-tab="registry">配置中心</button>
     <button type="button" class="tab" data-tab="config">配置</button>
   </nav>` : ''}
 
@@ -1095,6 +1116,10 @@ ${themeScript}
     <div class="hint">协议自动判断：域名→https；IP/带端口→http；也可手动填 http(s):// 指定</div>
     <label for="sitePort">端口（可选）</label>
     <input id="sitePort" placeholder="如 8080，留空则使用默认端口">
+    <label for="addProxyMode">代理类型</label>
+    <select id="addProxyMode" style="width:100%;box-sizing:border-box;margin:4px 0 10px;padding:9px 12px;border-radius:8px;border:1px solid var(--line);background:var(--input);color:var(--txt);font-size:14px;">
+      ${modeOptions}
+    </select>
     <div class="row">
       <button type="button" id="addBtn">添加站点</button>
     </div>
@@ -1156,10 +1181,16 @@ ${themeScript}
   </div>
 
   ${authed ? `
-  <div class="card" data-pane="sites">
+  <div class="card" data-pane="registry">
     <h2>站点模式（注册表）</h2>
-    <div class="hint" style="margin:-8px 0 4px;">站点列表徽标与编辑弹窗的类型选项都来自这里。内置 normal / media / ai 三种不可删除、引擎不可修改；可自定义模式（自定义标签 / 徽标 / 说明 + 三选一执行引擎），自定义模式的站点按所选引擎执行，新增模式无需改代码。</div>
+    <div class="hint" style="margin:-8px 0 4px;">站点列表徽标与编辑弹窗的类型选项都来自这里。内置 normal / media / ai 三种不可删除、引擎不可修改；可自定义模式（自定义标签 / 徽标 / 说明 + 三选一执行引擎），自定义模式的站点按所选引擎执行，新增模式无需改代码。列表支持新增 / 查看 / 编辑 / 删除（仅自定义）。</div>
     <div id="modesEditor">加载中…</div>
+  </div>
+
+  <div class="card" data-pane="registry">
+    <h2>系统配置字典（只读）</h2>
+    <div class="hint" style="margin:-8px 0 4px;">系统内所有注册表 / 字典的集中查看。标记「真源」的是代码级定义（改代码后重新部署生效，运行逻辑依赖它们的键值，请勿在面板直接改）；可编辑的注册表（如上方站点模式）在面板内单独维护。</div>
+    ${dictHtml}
   </div>` : ''}
 
   ${authed ? `
@@ -1771,13 +1802,14 @@ if (sgSaveBtn) {
   };
 }
 
-// ===== 站点模式注册表编辑器（自包含：不依赖任何模块导入） =====
+// ===== 站点模式注册表编辑器（列表 CRUD：查看 / 新增 / 编辑 / 删除，自包含不依赖模块导入） =====
 (function () {
   const box = document.getElementById('modesEditor');
   if (!box) return;
   var modes = null;
   var engines = ['normal', 'media', 'ai'];
   var builtinKeys = ['normal', 'media', 'ai'];
+  var dirty = false;
   var badgeOpts = [
     ['badge-normal', '灰（普通）'], ['badge-media', '绿（流媒体）'], ['badge-ai', '蓝（AI）'],
     ['badge-blue', '蓝'], ['badge-purple', '紫'], ['badge-orange', '橙'], ['badge-red', '红'],
@@ -1787,58 +1819,121 @@ if (sgSaveBtn) {
       return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
     });
   }
+  function badgeLabel(cls) {
+    const hit = badgeOpts.filter(function (b) { return b[0] === cls; })[0];
+    return hit ? hit[1] : cls;
+  }
+  // 弹窗表单（新增 / 编辑共用；查看走只读弹窗）
+  function openModal(editKey) {
+    const isEdit = !!editKey && modes[editKey];
+    const v = isEdit ? modes[editKey] : { label: '', badge: '', badgeClass: 'badge-blue', hint: '', engine: 'normal' };
+    const builtin = isEdit && builtinKeys.indexOf(editKey) >= 0;
+    const ov = document.createElement('div');
+    ov.style.cssText = 'position:fixed;inset:0;background:rgba(15,23,42,.55);z-index:1100;display:flex;align-items:center;justify-content:center;';
+    ov.innerHTML = '<div style="background:var(--card);border:1px solid var(--line);border-radius:14px;padding:22px;width:min(92vw,440px);box-sizing:border-box;box-shadow:0 20px 60px rgba(0,0,0,.3);">'
+      + '<h2 style="margin:0 0 14px;font-size:18px;">' + (isEdit ? '编辑模式' : '新增自定义模式') + '</h2>'
+      + '<label>模式键（' + (isEdit ? '保存后不可修改' : '仅小写字母/数字/-，如 custom-1') + '）</label>'
+      + '<input id="mdKey" ' + (isEdit ? 'readonly style="background:var(--input);"' : '') + ' value="' + esc2(isEdit ? editKey : '') + '" placeholder="custom-1" style="width:100%;box-sizing:border-box;margin:4px 0 10px;padding:9px 12px;border-radius:8px;border:1px solid var(--line);background:var(--input);color:var(--txt);font-size:14px;">'
+      + '<label>标签（编辑弹窗选项显示名）</label>'
+      + '<input id="mdLabel" value="' + esc2(v.label) + '" placeholder="我的影视" style="width:100%;box-sizing:border-box;margin:4px 0 10px;padding:9px 12px;border-radius:8px;border:1px solid var(--line);background:var(--input);color:var(--txt);font-size:14px;">'
+      + '<div class="grid2">'
+      + '<div><label>徽标文字</label><input id="mdBadge" value="' + esc2(v.badge) + '" placeholder="影视" style="width:100%;box-sizing:border-box;margin:4px 0 10px;padding:9px 12px;border-radius:8px;border:1px solid var(--line);background:var(--input);color:var(--txt);font-size:14px;"></div>'
+      + '<div><label>徽标颜色</label><select id="mdBadgeClass" style="width:100%;box-sizing:border-box;margin:4px 0 10px;padding:9px 12px;border-radius:8px;border:1px solid var(--line);background:var(--input);color:var(--txt);font-size:14px;">'
+      + badgeOpts.map(function (b) { return '<option value="' + b[0] + '"' + (v.badgeClass === b[0] ? ' selected' : '') + '>' + b[1] + '</option>'; }).join('')
+      + '</select></div>'
+      + '</div>'
+      + (builtin ? '' : '<label>执行引擎</label><select id="mdEngine" style="width:100%;box-sizing:border-box;margin:4px 0 10px;padding:9px 12px;border-radius:8px;border:1px solid var(--line);background:var(--input);color:var(--txt);font-size:14px;">'
+        + engines.map(function (e) { return '<option value="' + e + '"' + (v.engine === e ? ' selected' : '') + '>' + e + '</option>'; }).join('')
+        + '</select>')
+      + '<label>说明（编辑弹窗展示）</label>'
+      + '<input id="mdHint" value="' + esc2(v.hint) + '" placeholder="这个模式是做什么的" style="width:100%;box-sizing:border-box;margin:4px 0 12px;padding:9px 12px;border-radius:8px;border:1px solid var(--line);background:var(--input);color:var(--txt);font-size:14px;">'
+      + '<div class="row"><button type="button" id="mdOk">' + (isEdit ? '保存修改' : '新增') + '</button><button type="button" id="mdCancel" class="ghost">取消</button></div>'
+      + '<div class="msg" id="mdMsg" style="min-height:18px;margin:0 0 6px;"></div>'
+      + '</div>';
+    document.body.appendChild(ov);
+    ov.addEventListener('click', function (e) { if (e.target === ov) ov.remove(); });
+    document.getElementById('mdCancel').onclick = function () { ov.remove(); };
+    document.getElementById('mdOk').onclick = function () {
+      const k = document.getElementById('mdKey').value.trim();
+      const label = document.getElementById('mdLabel').value.trim();
+      const badge = document.getElementById('mdBadge').value.trim();
+      const badgeClass = document.getElementById('mdBadgeClass').value;
+      const hint = document.getElementById('mdHint').value.trim();
+      const engineEl = document.getElementById('mdEngine');
+      const engine = engineEl ? engineEl.value : (isEdit ? v.engine : 'normal');
+      const msg = document.getElementById('mdMsg');
+      if (!/^[a-z0-9-]{1,32}$/.test(k)) { msg.textContent = '模式键仅限小写字母 / 数字 / 短横线，1~32 位'; msg.style.color = 'var(--err)'; return; }
+      if (!label) { msg.textContent = '标签不能为空'; msg.style.color = 'var(--err)'; return; }
+      if (!isEdit && modes[k]) { msg.textContent = '模式键 ' + k + ' 已存在'; msg.style.color = 'var(--err)'; return; }
+      modes[k] = { label: label, badge: badge || k, badgeClass: badgeClass, hint: hint, engine: engine };
+      if (isEdit && editKey !== k) { delete modes[editKey]; }
+      dirty = true;
+      ov.remove();
+      render();
+    };
+  }
+  function openView(key) {
+    const v = modes[key];
+    if (!v) return;
+    const ov = document.createElement('div');
+    ov.style.cssText = 'position:fixed;inset:0;background:rgba(15,23,42,.55);z-index:1100;display:flex;align-items:center;justify-content:center;';
+    ov.innerHTML = '<div style="background:var(--card);border:1px solid var(--line);border-radius:14px;padding:22px;width:min(92vw,440px);box-sizing:border-box;box-shadow:0 20px 60px rgba(0,0,0,.3);">'
+      + '<h2 style="margin:0 0 12px;font-size:18px;">模式详情：' + esc2(key) + '</h2>'
+      + '<div style="display:flex;flex-direction:column;gap:8px;font-size:14px;">'
+      + '<div>标签：<b>' + esc2(v.label) + '</b></div>'
+      + '<div>徽标：<span class="tag ' + esc2(v.badgeClass) + '">' + esc2(v.badge) + '</span>（' + esc2(badgeLabel(v.badgeClass)) + '）</div>'
+      + '<div>执行引擎：<b>' + esc2(v.engine) + '</b>' + (builtinKeys.indexOf(key) >= 0 ? '（内置，不可修改）' : '') + '</div>'
+      + '<div>说明：' + esc2(v.hint || '（无）') + '</div>'
+      + '</div>'
+      + '<div class="row"><button type="button" id="mdClose" class="ghost">关闭</button></div>'
+      + '</div>';
+    document.body.appendChild(ov);
+    ov.addEventListener('click', function (e) { if (e.target === ov) ov.remove(); });
+    document.getElementById('mdClose').onclick = function () { ov.remove(); };
+  }
   function render() {
     const rows = Object.keys(modes).map(function (k) {
       const v = modes[k];
       const builtin = builtinKeys.indexOf(k) >= 0;
-      return '<div class="mode-row" data-key="' + esc2(k) + '">'
-        + '<span class="mode-key">' + esc2(k) + '</span>'
-        + '<input data-f="label" value="' + esc2(v.label) + '" placeholder="标签">'
-        + '<input data-f="badge" value="' + esc2(v.badge) + '" placeholder="徽标" style="flex:0 1 90px;">'
-        + '<select data-f="badgeClass">' + badgeOpts.map(function (b) {
-          return '<option value="' + b[0] + '"' + (v.badgeClass === b[0] ? ' selected' : '') + '>' + b[1] + '</option>';
-        }).join('') + '</select>'
-        + (builtin ? '' : '<select data-f="engine">' + engines.map(function (e) {
-          return '<option value="' + e + '"' + (v.engine === e ? ' selected' : '') + '>' + e + '</option>';
-        }).join('') + '</select>')
-        + '<input data-f="hint" value="' + esc2(v.hint) + '" placeholder="说明（编辑弹窗展示）" style="flex:1 1 200px;">'
-        + (builtin ? '<span class="tag" title="内置模式不可删除">内置</span>' : '<button type="button" class="danger mini" data-del="1">删除</button>')
+      return '<div class="mode-row" style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:8px 10px;border:1px solid var(--line);border-radius:8px;">'
+        + '<span class="mode-key" style="font-weight:600;min-width:92px;">' + esc2(k) + '</span>'
+        + '<span style="flex:1 1 160px;">' + esc2(v.label) + '</span>'
+        + '<span class="tag ' + esc2(v.badgeClass) + '">' + esc2(v.badge) + '</span>'
+        + '<span class="tag" style="font-weight:400;">' + esc2(v.engine) + '</span>'
+        + (builtin ? '<span class="tag" title="内置模式不可删除" style="font-weight:400;">内置</span>' : '')
+        + '<span style="display:inline-flex;gap:6px;">'
+        + '<button type="button" class="mini" data-view="' + esc2(k) + '">查看</button>'
+        + '<button type="button" class="mini" data-edit="' + esc2(k) + '">编辑</button>'
+        + (builtin ? '' : '<button type="button" class="danger mini" data-del="' + esc2(k) + '">删除</button>')
+        + '</span>'
         + '</div>';
     }).join('');
-    box.innerHTML = '<div style="display:flex;flex-direction:column;gap:8px;">' + rows + '</div>'
+    box.innerHTML = '<div style="display:flex;flex-direction:column;gap:8px;">' + (rows || '<div class="empty">还没有自定义模式</div>') + '</div>'
       + '<div class="row" style="margin-top:12px;">'
-      + '<button type="button" id="modesAddBtn" class="ghost">+ 添加自定义模式</button>'
-      + '<button type="button" id="modesSaveBtn">保存注册表</button>'
+      + '<button type="button" id="modesAddBtn" class="ghost">+ 新增自定义模式</button>'
+      + '<button type="button" id="modesSaveBtn"' + (dirty ? '' : ' disabled') + '>保存注册表</button>'
+      + (dirty ? '<span class="msg" style="color:var(--accent);">有未保存的修改</span>' : '')
       + '</div>'
       + '<div class="msg" id="modesMsg"></div>';
-    box.querySelectorAll('[data-del]').forEach(function (btn) {
-      btn.onclick = function () {
-        const row = btn.closest('.mode-row');
-        if (row) { delete modes[row.getAttribute('data-key')]; render(); }
+    box.querySelectorAll('[data-view]').forEach(function (b) { b.onclick = function () { openView(b.getAttribute('data-view')); }; });
+    box.querySelectorAll('[data-edit]').forEach(function (b) { b.onclick = function () { openModal(b.getAttribute('data-edit')); }; });
+    box.querySelectorAll('[data-del]').forEach(function (b) {
+      b.onclick = function () {
+        if (!confirm('确认删除模式 ' + b.getAttribute('data-del') + '？已使用该模式的站点将回退为普通反代。')) return;
+        delete modes[b.getAttribute('data-del')];
+        dirty = true;
+        render();
       };
     });
     const addBtn = document.getElementById('modesAddBtn');
-    if (addBtn) addBtn.onclick = function () {
-      let n = 1;
-      while (modes['custom-' + n]) n++;
-      modes['custom-' + n] = { label: '自定义模式' + n, badge: '自定义', badgeClass: 'badge-blue', hint: '', engine: 'normal' };
-      render();
-    };
+    if (addBtn) addBtn.onclick = function () { openModal(null); };
     const saveBtn = document.getElementById('modesSaveBtn');
     if (saveBtn) saveBtn.onclick = function () {
-      const out = {};
-      box.querySelectorAll('.mode-row').forEach(function (row) {
-        const k = row.getAttribute('data-key');
-        const o = {};
-        row.querySelectorAll('[data-f]').forEach(function (el) { o[el.getAttribute('data-f')] = el.value; });
-        out[k] = o;
-      });
       saveBtn.disabled = true;
-      api('/__api/site-modes', { method: 'POST', body: JSON.stringify({ modes: out }) }).then(function (r) {
+      api('/__api/site-modes', { method: 'POST', body: JSON.stringify({ modes: modes }) }).then(function (r) {
         const msg = document.getElementById('modesMsg');
-        if (r.ok) { modes = r.data.modes; render(); msg.textContent = '已保存'; msg.style.color = ''; }
-        else { msg.textContent = (r.data && r.data.error) || '保存失败'; msg.style.color = 'var(--err)'; }
-        saveBtn.disabled = false;
+        if (r.ok) { modes = r.data.modes; dirty = false; render(); msg.textContent = '已保存'; msg.style.color = ''; }
+        else { msg.textContent = (r.data && r.data.error) || '保存失败'; msg.style.color = 'var(--err)'; saveBtn.disabled = false; }
       }).catch(function (e) {
         const msg = document.getElementById('modesMsg');
         msg.textContent = '请求失败：' + String(e && e.message || e);
@@ -2029,11 +2124,13 @@ if (addBtn) addBtn.addEventListener('click', async (e) => {
   const slug = document.getElementById('siteSlug').value.trim();
   const target = document.getElementById('siteTarget').value.trim();
   const port = document.getElementById('sitePort').value.trim();
+  const addModeEl = document.getElementById('addProxyMode');
+  const proxyMode = addModeEl ? addModeEl.value : 'normal';
   if (!name || !target) { setMsg('addMsg', '请填写中文名称和网址', true); return; }
   setMsg('addMsg', '正在添加…');
   addBtn.disabled = true;
   try {
-    const r = await api('/__api/sites', { method: 'POST', body: JSON.stringify({ name, slug, target, port }) });
+    const r = await api('/__api/sites', { method: 'POST', body: JSON.stringify({ name, slug, target, port, proxyMode }) });
     if (r.ok) {
       setMsg('addMsg', '添加成功');
       document.getElementById('siteName').value = '';

@@ -45,6 +45,7 @@ export const TAB_LABELS = {
   security: '伪装与安全',
   theme: '外观主题',
   share: '临时链接',
+  registry: '配置中心',
 };
 
 const SELECT = {
@@ -217,13 +218,21 @@ export const API_CATALOG = [
         pathParam: { key: 'id', label: '站点 id', placeholder: 'demo' },
       },
       {
-        id: 'site-modes', name: '站点模式注册表', kind: 'setting', method: 'GET', path: '/__api/site-modes', writeMethod: 'POST',
-        desc: '站点类型标签 / 徽标 / 说明 / 执行引擎（KV 可编辑，未配置用默认；内置 normal/media/ai 不可删、引擎不可改，自定义模式可增删改）', auth: true,
-      },
-      {
         id: 'site-delete', name: '删除站点', kind: 'action', method: 'DELETE', path: '/__api/sites/<id>',
         desc: '删除后 /p/<id>/ 立即失效', auth: true, danger: true,
         pathParam: { key: 'id', label: '站点 id', placeholder: 'demo' },
+      },
+    ],
+  },
+  {
+    id: 'registry',
+    name: '配置中心',
+    desc: '系统注册表与配置字典的集中查看与编辑：站点模式注册表可编辑（新增 / 查看 / 编辑 / 删除），其余代码级字典（访问渠道 / 统计档位 / 告警事件 / 伪装模板 / 引擎词表 / 徽标色板）在面板内只读展示真源位置。',
+    tab: 'registry',
+    items: [
+      {
+        id: 'site-modes', name: '站点模式注册表', kind: 'setting', method: 'GET', path: '/__api/site-modes', writeMethod: 'POST',
+        desc: '站点类型标签 / 徽标 / 说明 / 执行引擎（KV 可编辑，未配置用默认；内置 normal/media/ai 不可删、引擎不可改，自定义模式可增删改）', auth: true,
       },
     ],
   },
