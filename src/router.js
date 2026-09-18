@@ -14,7 +14,6 @@ import {
   renderHome, renderNotFound, renderRobots, emptyFavicon,
 } from './disguise.js';
 import { subscriptionTaggingEnabled, styleFrom, tagSubscriptionResponse } from './nodetag.js';
-import { detectSubscriptionFormat, convertSubscription } from './subfmt.js';
 import { check as rateLimitCheck } from './ratelimit.js';
 import { readShareConfig, resolve as resolveShare } from './share.js';
 import { notify as notifyAlert } from './alert.js';
@@ -150,11 +149,17 @@ async function handleRequest(request, env, ctx) {
   // 与 /tsub/ 同理，永不参与伪装门禁；token 由代理引擎内部校验，
   // 无效请求不会返回任何节点信息，放行不泄漏任何东西。
   if (path === '/sub' || path.startsWith('/sub/')) {
-    const resp = await vlessHandler.fetch(request, { ...env, KV: runtime.KV }, ctx);
-    // 多格式输出：?fmt=clash|singbox|base64（文本层转换，见 src/subfmt.js）。
-    // 只认显式参数、不做 UA 猜测，默认保持引擎原样 vless:// 输出。
-    const fmt = detectSubscriptionFormat(url);
-    if (fmt !== 'plain') return await convertSubscription(resp, fmt);
+    // 多格式输出：?fmt=clash|singbox|base64 映射为引擎原生参数。
+    // 唯一真源在 vendor/vless.js（内置 clash YAML / sing-box JSON / b64 渲染与 UA 自动识别，
+    // 还支持 ?target=、surge、quanx、loon 等），这里只做参数映射，不另写转换实现。
+    // 多格式响应已结构化，不做 vless 文本层面的国家标注（标注仅作用于原样输出）。
+    const fmt = String(url.searchParams.get('fmt') || '').toLowerCase();
+    let subReq = request;
+    if (fmt === 'clash' || fmt === 'clashyaml') { url.searchParams.set('clash', '1'); subReq = new Request(url.toString(), request); }
+    else if (fmt === 'singbox' || fmt === 'sing-box' || fmt === 'sing') { url.searchParams.set('singbox', '1'); subReq = new Request(url.toString(), request); }
+    else if (fmt === 'base64' || fmt === 'b64') { url.searchParams.set('b64', '1'); subReq = new Request(url.toString(), request); }
+    const resp = await vlessHandler.fetch(subReq, { ...env, KV: runtime.KV }, ctx);
+    if (fmt === 'clash' || fmt === 'clashyaml' || fmt === 'singbox' || fmt === 'sing-box' || fmt === 'sing') return resp;
     // 订阅出口：给每个节点的备注补上 IP 归属国家。
     // 开关关闭时这里一次都不会触发，不产生任何外部请求或存储读取。
     if (!(await subscriptionTaggingEnabled(env))) return resp;
@@ -332,9 +337,9 @@ async function dispatchTempSub(request, url, env, ctx) {
   subUrl.searchParams.set('token', token);
   const subReq = new Request(subUrl.toString(), request);
   const resp = await vlessHandler.fetch(subReq, { ...env, KV: runtime.KV, UUID: rec.uuid }, ctx);
-  // 临时订阅同样支持多格式输出：/tsub/<id>?fmt=clash|singbox|base64
-  const fmt = detectSubscriptionFormat(url);
-  if (fmt !== 'plain') return await convertSubscription(resp, fmt);
+  // 临时订阅同样支持多格式输出：/tsub/<id>?fmt=clash|singbox|base64 → 引擎原生参数
+  const fmt = String(url.searchParams.get('fmt') || '').toLowerCase();
+  if (fmt === 'clash' || fmt === 'clashyaml' || fmt === 'singbox' || fmt === 'sing-box' || fmt === 'sing') return resp;
   // 临时订阅同样是订阅输出，备注规则与主订阅保持一致
   if (!(await subscriptionTaggingEnabled(env))) return resp;
   return await tagSubscriptionResponse(resp, tagOpts(env, ctx));
