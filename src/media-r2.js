@@ -1,3 +1,5 @@
+import { runtime } from './runtime.js';
+
 // R2 媒体分片缓存的策略配置（KV 可编辑，唯一真源）：
 //   enabled      总开关：关闭后不再写入也不命中 R2 分片缓存，链路回到 Cache API + 透传；
 //   ttlDays      分片保留天数：超过后由 cron 的 sweepMediaR2 定时删除（1~365，默认 7）；
@@ -5,6 +7,7 @@
 //   maxTotalMB   缓存总量上限：超过后 sweep 按最旧优先删到不超（0 不限，默认 10GB=免费额度）。
 // 面板「配置中心 → R2 媒体缓存」可改并立即生效；R2_PREFIX 是结构键（改动会使旧缓存全部失效），
 // 不属于策略参数，保持稳定，导出供 proxy.js 与面板统计共用（单一真源）。
+// 存储统一走 runtime.KV（全局注入的 KV 抽象，binding 名为 SITES，与全项目一致）。
 export const R2_PREFIX = 'media/';
 
 export const R2_CACHE_SPEC = {
@@ -35,14 +38,14 @@ export function sanitizeR2Config(cfg) {
   return out;
 }
 
-export async function readR2Config(env) {
-  const v = await env.KV.get(KV_KEY, 'json').catch(() => null);
+export async function readR2Config() {
+  const v = await runtime.KV.get(KV_KEY, 'json').catch(() => null);
   return sanitizeR2Config(v);
 }
 
-export async function saveR2Config(env, patch) {
-  const cur = await readR2Config(env);
+export async function saveR2Config(patch) {
+  const cur = await readR2Config();
   const next = sanitizeR2Config({ ...cur, ...patch });
-  await env.KV.put(KV_KEY, JSON.stringify(next));
+  await runtime.KV.put(KV_KEY, JSON.stringify(next));
   return next;
 }

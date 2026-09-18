@@ -148,7 +148,7 @@ export async function mediaR2Key(targetUrl, request, authBind) {
 export async function serveR2Segment(ctx, env, targetUrl, request, authBind, upstream, headersOut) {
   if (!env || !env.MEDIA_R2 || upstream.status !== 206) return null;
   // 策略配置（KV 可编辑）：总开关关闭则不写入也不命中；单分片上限过滤超大区间
-  const cfg = await readR2Config(env);
+  const cfg = await readR2Config();
   if (!cfg.enabled) return null;
   const key = await mediaR2Key(targetUrl, request, authBind);
   const obj = await env.MEDIA_R2.get(key).catch(() => null);
@@ -179,7 +179,7 @@ export async function serveR2Segment(ctx, env, targetUrl, request, authBind, ups
 /** 定时清理 R2 媒体分片缓存：先删超过保留天数的，再按总量上限（>0 时）从最旧删到不超；无绑定则跳过 */
 export async function sweepMediaR2(env) {
   if (!env || !env.MEDIA_R2) return;
-  const cfg = await readR2Config(env);
+  const cfg = await readR2Config();
   const ttlMs = cfg.ttlDays * 24 * 3600 * 1000;
   const maxBytes = cfg.maxTotalMB > 0 ? cfg.maxTotalMB * 1024 * 1024 : Infinity;
   const now = Date.now();

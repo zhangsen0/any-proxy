@@ -285,7 +285,7 @@ async function handleAdmin(request, url, env) {
         } while (cursor && pages < 200);
         stat = { count, bytesMB: Math.round(bytes / 1048576), truncated: pages >= 200 };
       }
-      return json({ ok: true, config: await readR2Config(env), spec: R2_CACHE_SPEC, bound: !!(env && env.MEDIA_R2), stat });
+      return json({ ok: true, config: await readR2Config(), spec: R2_CACHE_SPEC, bound: !!(env && env.MEDIA_R2), stat });
     }
     if (request.method === 'POST') {
       let body;
@@ -295,7 +295,12 @@ async function handleAdmin(request, url, env) {
         catch (e) { return json({ error: '清理失败：' + String(e && e.message || e).slice(0, 200) }, 400); }
       }
       try {
-        const saved = await saveR2Config(env, { ttlDays: body.ttlDays });
+        const saved = await saveR2Config({
+          enabled: body.enabled,
+          ttlDays: body.ttlDays,
+          maxObjectMB: body.maxObjectMB,
+          maxTotalMB: body.maxTotalMB,
+        });
         return json({ ok: true, config: saved });
       } catch (e) {
         return json({ error: '保存失败：' + String(e && e.message || e).slice(0, 200) }, 400);
@@ -849,7 +854,7 @@ async function adminPage(authed, origin, env) {
   try { dgCfg = await readConfig(env); } catch {}
   // R2 媒体缓存策略（KV 可编辑）：面板展示当前值并可在配置中心修改
   let r2Cfg = null;
-  try { r2Cfg = await readR2Config(env); } catch {}
+  try { r2Cfg = await readR2Config(); } catch {}
   const r2Bound = !!(env && env.MEDIA_R2);
   const hasToken = !!(dgCfg && dgCfg.token);
   // 节点备注的国家标注：面板展示当前来源（面板配置 / 环境变量 / 默认），便于判断为什么是这个值
