@@ -16,6 +16,7 @@ import {
 import { subscriptionTaggingEnabled, styleFrom, tagSubscriptionResponse } from './nodetag.js';
 import { sortSubscriptionResponse } from './sublat.js';
 import { engineEnvFor, nodeIdentity, readSettings, SETTINGS_SPEC } from './settings.js';
+import { renderClashYaml, renderSingboxJson } from './native-sub.js';
 import { check as rateLimitCheck } from './ratelimit.js';
 import { readShareConfig, resolve as resolveShare } from './share.js';
 import { notify as notifyAlert } from './alert.js';
@@ -170,17 +171,33 @@ async function handleRequest(request, env, ctx) {
   // 与 /tsub/ 同理，永不参与伪装门禁；token 由代理引擎内部校验，
   // 无效请求不会返回任何节点信息，放行不泄漏任何东西。
   if (path === '/sub' || path.startsWith('/sub/')) {
-    // 多格式输出：?fmt=clash|singbox|base64 映射为引擎原生参数。
-    // 唯一真源在 vendor/vless.js（内置 clash YAML / sing-box JSON / b64 渲染与 UA 自动识别，
-    // 还支持 ?target=、surge、quanx、loon 等），这里只做参数映射，不另写转换实现。
-    // 多格式响应已结构化，不做 vless 文本层面的国家标注（标注仅作用于原样输出）。
+    // 多格式输出。
+    //
+    // clash / sing-box 由**本文件本地渲染**（native-sub.js）：拿引擎的 mixed 输出
+    // （vless:// 行列表，本地生成、一直可靠），渲染成对应格式。
+    //
+    // 为什么不再转给引擎：引擎的这两种格式走「外部订阅转换后端」（SUBAPI）——
+    // 默认值是个占位假域名，面板没有改它的入口，而那台后端一旦坏掉（2026-09-20
+    // 就坏了），Stash 这类只吃 YAML 的客户端拿到的是伪装页 HTML，报
+    // 「yaml: found character that cannot start any token」，看起来像订阅坏了，
+    // 实际是转换后端单点故障。注释里写的「内置渲染」必须真的内置，才算数。
+    //
+    // base64 与未识别的客户端维持原路径：引擎 mixed ＋ 国家标注 ＋ 延迟重排
+    // （这两个增强只作用于原样输出，多格式响应已结构化，不做文本层面标注）。
     const fmt = String(url.searchParams.get('fmt') || '').toLowerCase();
+    const ua = (request.headers.get('User-Agent') || '').toLowerCase();
+    // UA 自动识别：客户端不用改链接就能拿到对的格式（Stash / mihomo / Clash 系
+    // 的 UA 都带自家名字；带 fmt 参数时以参数为准）。
+    const wantClash = fmt === 'clash' || fmt === 'clashyaml'
+      || (!fmt && /\b(clash|mihomo|stash|verge|meta)\b|clash\.(meta|verge)|mihomo\//.test(ua));
+    const wantSb = fmt === 'singbox' || fmt === 'sing-box' || fmt === 'sing'
+      || (!fmt && /sing-?box|\bsfa\b|\bsfm\b|\bsfi\b/.test(ua));
+    if (wantClash || wantSb) {
+      return await nativeSubResponse(request, url, env, ctx, wantClash ? 'clash' : 'singbox');
+    }
     let subReq = request;
-    if (fmt === 'clash' || fmt === 'clashyaml') { url.searchParams.set('clash', '1'); subReq = new Request(url.toString(), request); }
-    else if (fmt === 'singbox' || fmt === 'sing-box' || fmt === 'sing') { url.searchParams.set('singbox', '1'); subReq = new Request(url.toString(), request); }
-    else if (fmt === 'base64' || fmt === 'b64') { url.searchParams.set('b64', '1'); subReq = new Request(url.toString(), request); }
+    if (fmt === 'base64' || fmt === 'b64') { url.searchParams.set('b64', '1'); subReq = new Request(url.toString(), request); }
     const resp = await vlessHandler.fetch(subReq, await engineEnv(env), ctx);
-    if (fmt === 'clash' || fmt === 'clashyaml' || fmt === 'singbox' || fmt === 'sing-box' || fmt === 'sing') return resp;
     // 订阅出口的两层增强（都可以在面板关掉，关掉就是原样透传）：
     //   1. 给节点备注补 IP 归属国家；
     //   2. 把节点按实测延迟重排 —— 客户端通常拿第一个节点用，所以顺序就是速度。
@@ -214,6 +231,61 @@ async function handleRequest(request, env, ctx) {
     } finally {
       if (timer) clearTimeout(timer);
     }
+  }
+
+  /**
+   * clash / sing-box 的本地渲染出口（native-sub.js 承担解析与渲染）。
+   *
+   * 内层再发一次 /sub、UA 定成浏览器：让引擎走 mixed 分支（本地生成、明文输出），
+   * 这是整条订阅链里唯一不依赖外部服务的一环。token 原样带着 —— 引擎会校验，
+   * 校验不过内层就是伪装页，那正好被下面「没有分享链接行」的判定接住，
+   * 给客户端一个说人话的 503，而不是一份把客户端解析器炸掉的 HTML。
+   */
+  async function nativeSubResponse(req, subUrl, e, c2, kind) {
+    const innerUrl = new URL(subUrl);
+    for (const k of ['fmt', 'clash', 'clashyaml', 'singbox', 'sing-box', 'sing', 'b64', 'base64', 'target', 'surge', 'quanx', 'loon']) {
+      innerUrl.searchParams.delete(k);
+    }
+    const inner = new Request(innerUrl.toString(), {
+      method: 'GET',
+      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; native-sub/1; +https://github.com/zhangsen0/any-proxy)' },
+    });
+    const mixed = await vlessHandler.fetch(inner, await engineEnv(e), c2);
+    const text = await mixed.text();
+    const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
+    const share = lines.filter(l => /^(vless|trojan|ss):\/\//i.test(l));
+    const say = (body, status, extra = {}) => new Response(body, {
+      status,
+      headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store', ...extra },
+    });
+    if (!share.length) {
+      // 引擎连 mixed 都没给出来（token 不对 / 数据不在）：此时说什么都要比回 HTML 强
+      return say('订阅当前不可用：服务端没有取到节点清单（常见于存储降级中）。'
+        + '链接本身没错，稍后重试；若持续，请进管理面板看顶部运行模式。', 503);
+    }
+    // 引擎在 mixed 响应上带的流量信息头（Subscription-Userinfo 等）原样透传
+    const info = {};
+    for (const h of ['subscription-userinfo', 'profile-update-interval', 'profile-web-page-url']) {
+      const v = mixed.headers.get(h);
+      if (v) info[h] = v;
+    }
+    if (kind === 'clash') {
+      const r = renderClashYaml(share);
+      if (!r.yaml) return say(`订阅当前不可用：拿到 ${r.total} 行链接但一行都解析不出来。`, 503, info);
+      return say(r.yaml, 200, {
+        'Content-Type': 'application/x-yaml; charset=utf-8',
+        'Content-Disposition': `attachment; filename*=utf-8''${encodeURIComponent('config.yaml')}`,
+        ...(r.skipped ? { 'X-Sub-Skipped-Lines': String(r.skipped) } : {}),
+        ...info,
+      });
+    }
+    const r = renderSingboxJson(share);
+    if (!r.json) return say(`订阅当前不可用：拿到 ${r.total} 行链接但一行都解析不出来。`, 503, info);
+    return say(r.json, 200, {
+      'Content-Type': 'application/json; charset=utf-8',
+      ...(r.skipped ? { 'X-Sub-Skipped-Lines': String(r.skipped) } : {}),
+      ...info,
+    });
   }
 
   // ---- 陌生人：只允许「一个普通网站该有的东西」，其余一律伪装 404 ----

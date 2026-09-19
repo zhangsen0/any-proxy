@@ -31,12 +31,14 @@ const FILES = {
   seedtool: join(ROOT, 'tools/export-seed.mjs'),
   prepare: join(ROOT, '.github/scripts/prepare-deploy.py'),
   admin: join(ROOT, 'src/admin.js'),
+  native: join(ROOT, 'src/native-sub.js'),
 };
 // 每个变异跑哪一套自检：改动落在哪个环节，就由盯那个环节的那套来咬。
 // 默认 storage —— 内存模式这条链路上大部分约束都由它看
 const CHECKS = {
   storage: join(ROOT, 'tools/check-storage.mjs'),
   wrangler: join(ROOT, 'tools/check-wrangler.mjs'),
+  clash: join(ROOT, 'tools/check-clash.mjs'),
 };
 
 // ===================== 变异清单 =====================
@@ -247,6 +249,28 @@ const MUTANTS = [
     name: '摘要写成空操作（运行详情页上看不出这次没建表）',
     from: 'def summarize(lines):\n    """写进 Actions 的运行摘要。日志看不看随缘，摘要是这次部署躲不掉的一页。"""',
     to: 'def summarize(lines):\n    return\n    """写进 Actions 的运行摘要。日志看不看随缘，摘要是这次部署躲不掉的一页。"""',
+  },
+  // ---- 本地订阅渲染：Stash 这类客户端拿到的 YAML 必须是真的 ----
+  {
+    file: 'native',
+    check: 'clash',
+    name: '字符串值不加引号（备注里的「: 」把 YAML 写坏）',
+    from: 'const yq = v => JSON.stringify(String(v));',
+    to: 'const yq = v => String(v);',
+  },
+  {
+    file: 'native',
+    check: 'clash',
+    name: 'ws 节点丢掉 ws-opts（客户端连不上而不是报错）',
+    from: "  if (node['ws-opts']) {\n    L.push('    ws-opts:');",
+    to: '  if (false) {\n    L.push(\'    ws-opts:\');',
+  },
+  {
+    file: 'native',
+    check: 'clash',
+    name: '重名节点不去重（proxy-group 引用指向谁不可预期）',
+    from: '    if (c > 0) n.name = `${n.name} #${c + 1}`;',
+    to: '    if (false) n.name = `${n.name} #${c + 1}`;',
   },
   // ---- 面板：用户提出的原话是「在网站显眼的位置显示当前的运行模式」----
   {

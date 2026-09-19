@@ -112,6 +112,11 @@ jobs:
       # 排序用例刻意用串行：并发下快的先完成，顺序天然就对，测不出去掉 .sort() 的情况。
       - name: 节点延迟实测校验
         run: node tools/check-latency.mjs
+      # 本地订阅渲染：clash/sing-box 由业务层直接产出，不再依赖外部转换后端。
+      # 防的是那类「转换后端挂了 → Stash 拿到伪装页 HTML → yaml 报错」的单点故障，
+      # YAML 合法性用真解析器（python yaml.safe_load）验，不用渲染器自己说了算
+      - name: 本地订阅渲染校验
+        run: node tools/check-clash.mjs
       # 存储降级（内存模式）：D1 / KV 超限时站点不能 500，而要在面板顶部写明「正跑在内存模式」。
       # 钉死三条硬约束：抖动不降级、绝不自动切回、失败要响（降级进事件、写不回去的键留在 dirty）。
       - name: 存储降级校验
