@@ -17,6 +17,7 @@
 import { readSettings, invalidateSettings } from '../src/settings.js';
 import { invalidateDoc } from '../src/config.js';
 import { bindRuntime } from '../src/runtime.js';
+import { handleRequest } from '../src/router.js';
 import {
   wrapStorage, stateOf, getStatus, setStorageMode, flush, probe, setFailThreshold, resetState,
 } from '../src/memstore.js';
@@ -477,6 +478,52 @@ console.log('\n[14] 单个变量上限 5 KB：种子必须分片，且拼回来�
       st4.events.map((e) => e.detail).join(' | '));
     resetState(null, env3);
   }
+}
+
+// ===================== 15. 端到端：真的没有一个存储绑定也能跑 =====================
+console.log('\n[15] 端到端：memory 后端 + 分片种子 —— 站点到底起不起得来');
+{
+  // 这一段不验某个函数，验整条链：路由 → 绑定 → 内存模式 → 页面。
+  // 单元各自的绿组合起来照样可能是坏的（参数没顺着调用链传下去），只有跑通整条路才知道。
+  const ORIGIN = 'https://proxy.example.com';
+  const PASSWORD = 'dev';
+  const COOKIE = 'ap_auth=' + Buffer.from(PASSWORD).toString('base64');
+  const UUID = 'b1e6cc7c-9f8f-4f2c-9d2a-3b6f3f34d4b1';
+
+  // 第 14 段是在块里动态引入的，这里再引一次：同一个模块实例，没有额外开销
+  const { splitSeed, seedVarName } = await import('./export-seed.mjs');
+
+  const appConfig = JSON.stringify({ uuid: UUID, sub_token: 'tok' });
+  const demo = JSON.stringify({ id: 'demo', slug: 'demo', name: '演示站', target: 'https://example.com', mode: 'proxy' });
+  // 切得碎一点：这么小的数据也要走好几段，顺带把分段路径一起跑进去
+  const { parts } = splitSeed(JSON.stringify({ APP_CONFIG: appConfig, 'site:demo': demo }), 60);
+
+  const env = { PASSWORD, UUID, STORAGE_BACKEND: 'memory' };   // 关键：一个存储绑定都不给
+  parts.forEach((v, i) => { env[seedVarName(i)] = v; });
+  bindRuntime(env);
+  const H = { cookie: COOKIE };
+
+  const home = await handleRequest(new Request(ORIGIN + '/__admin', { headers: H }), env, {});
+  const html = await home.text();
+  check('管理页打得开', home.status === 200, String(home.status));
+  check('顶部那条状态条渲染出来了', html.includes('membar'));
+  check('上头写明正跑在内存模式', /内存模式/.test(html));
+  check('也标明了影响范围（不许只写模式不写范围）', /全站|实例/.test(html));
+
+  const api = await handleRequest(new Request(ORIGIN + '/__api/storage', { headers: H }), env, {});
+  const body = await api.json();
+  const st = body.status || {};
+  check('接口报的模式与内存里的键数对得上', st.mode === 'memory' && st.memKeys === 2,
+    JSON.stringify({ mode: st.mode, memKeys: st.memKeys, dirty: st.dirtyKeys, scope: st.scope }));
+  check('后端名字说的是 memory', body.backend === 'memory', String(body.backend));
+  check('种子灌进来的事被记下了', (st.events || []).some((e) => e.kind === 'seed'),
+    (st.events || []).map((e) => e.kind).join(','));
+
+  const site = await handleRequest(new Request(ORIGIN + '/p/demo/', { headers: H }), env, {});
+  check('种子里的站点真的能访问（不再依赖任何存储）', site.status !== 500 && site.status !== 404,
+    String(site.status));
+
+  check('这一段用的种子确实分了好几段（否则等于没验分段）', parts.length > 2, `${parts.length} 段`);
 }
 
 console.log(`\n=== ${fail === 0 ? '全部通过' : '存在失败'} ===`);

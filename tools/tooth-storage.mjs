@@ -30,6 +30,7 @@ const FILES = {
   memstore: join(ROOT, 'src/memstore.js'),
   seedtool: join(ROOT, 'tools/export-seed.mjs'),
   prepare: join(ROOT, '.github/scripts/prepare-deploy.py'),
+  admin: join(ROOT, 'src/admin.js'),
 };
 // 每个变异跑哪一套自检：改动落在哪个环节，就由盯那个环节的那套来咬。
 // 默认 storage —— 内存模式这条链路上大部分约束都由它看
@@ -186,6 +187,13 @@ const MUTANTS = [
     name: '根本不把种子写进配置（站点起来却读不到任何数据）',
     from: '    text = appendSeedVars(text, seed)',
     to: '    text = text',
+  },
+  // ---- 面板：用户提出的原话是「在网站显眼的位置显示当前的运行模式」----
+  {
+    file: 'admin',
+    name: '面板不渲染状态条（内存模式跑着，页面上却一点迹象都没有）',
+    from: '${authed ? renderModeBar(env) : \'\'}',
+    to: "''",
   },
 ];
 
