@@ -19,11 +19,10 @@
  */
 
 import { runtime } from './runtime.js';
-import { readSection, writeSection, sanitize } from './config.js';
+import { readSection, writeSection, sanitize, CONFIG_CACHE_TTL_MS } from './config.js';
 
 const SECTION = 'theme';
 const CUSTOM_KEY = 'THEME_CUSTOM';
-const CACHE_TTL_MS = 3000;
 /** 浏览器里存放「访客自己挑的主题」的键名。两处以上的地方要用，集中定义避免写歪 */
 export const THEME_STORAGE_KEY = 'ap_theme';
 
@@ -393,7 +392,7 @@ let cache = null;
 let cacheTs = 0;
 
 async function listCustom(force = false) {
-  if (cache && !force && Date.now() - cacheTs < CACHE_TTL_MS) return cache;
+  if (cache && !force && Date.now() - cacheTs < CONFIG_CACHE_TTL_MS) return cache;
   let items = [];
   try {
     const raw = await runtime.KV.get(CUSTOM_KEY);

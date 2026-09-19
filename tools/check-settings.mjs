@@ -18,7 +18,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { handleRequest } from '../src/router.js';
 import { bindRuntime, onConfigChange } from '../src/runtime.js';
-import { readSetting, readSettings, clearSetting, panelParams, panelSpec, describeGroups, settingsSources } from '../src/settings.js';
+import { readSetting, readSettings, clearSetting, invalidateSettings, panelParams, panelSpec, describeGroups, settingsSources } from '../src/settings.js';
 import { renderSettingForm } from '../src/config-ui.js';
 import { flatCatalog } from '../src/api-catalog.js';
 
@@ -252,6 +252,11 @@ section('6. 老部署的独立 KV 键仍被认（升级不丢配置）');
   mem.set('DNS_CONFIG', '180');
   mem.set('SUB_URL', 'https://legacy.example.com/tsub/x');
   mem.set('CF_IP_RANGES', '104.16.0.0/13');
+  // 这几行是**绕过面板直接写存储**（模拟旧版本留下的数据 / 外部脚本迁移）。
+  // readSettings 有进程内缓存（3 秒 TTL），这种「不是经由 readSection/writeSection 写入」
+  // 的变更它看不见 —— 与 config.js 一直以来「别处最多要等一个 TTL」的取舍同口径。
+  // 这里要的是「从这张表重建出来的取值」，所以显式作废缓存，而不是让测试等 3 秒。
+  invalidateSettings();
   const legacy = await readSettings(env);
   ok('频率遗留键被读到', legacy.dns_interval_minutes === 180, String(legacy.dns_interval_minutes));
   ok('订阅链接遗留键被读到', legacy.sub_url === 'https://legacy.example.com/tsub/x', legacy.sub_url);

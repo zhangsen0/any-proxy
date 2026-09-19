@@ -16,6 +16,7 @@
  */
 import { handleRequest } from '../src/router.js';
 import { bindRuntime } from '../src/runtime.js';
+import { invalidateSite } from '../src/sites.js';
 
 let pass = 0;
 let fail = 0;
@@ -66,6 +67,11 @@ const manySites = makeEnv([
 ]);
 
 async function call(env, path) {
+  bindRuntime(env);
+  // sites.js 的站点缓存是进程内全局的、不按绑定区分 —— 生产环境永远只有一组绑定，
+  // 所以这不是缺陷；但本脚本要在 oneSite / manySites / env 之间来回切同一个进程，
+  // 不清的话「多站点必须放弃」会读到上一个 env 的站点列表而误判成单站点。
+  invalidateSite();
   const seen = stubFetch();
   const out = await handleRequest(new Request('https://proxy.example' + path, { method: 'GET' }), env, {});
   return { status: out.status, seen };

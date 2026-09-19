@@ -16,6 +16,7 @@ import { handleRequest } from '../src/router.js';
 import { handleWebSocket } from '../src/proxy.js';
 import { bindRuntime } from '../src/runtime.js';
 import { kvKey } from '../src/util.js';
+import { invalidateSettings } from '../src/settings.js';
 import zlib from 'node:zlib';
 
 const ORIGIN = 'https://proxy.example.com';
@@ -68,9 +69,9 @@ const NAV = {
   'Sec-Fetch-Dest': 'document',
 };
 
-async function call(path, headers = {}, method = 'GET') {
+async function call(path, headers = {}, method = 'GET', body) {
   try {
-    const res = await handleRequest(new Request(ORIGIN + path, { method, headers }), env, {});
+    const res = await handleRequest(new Request(ORIGIN + path, { method, headers, body }), env, {});
     const buf = await res.arrayBuffer();
     return { status: res.status, buf, headers: res.headers };
   } catch (e) {
@@ -162,7 +163,10 @@ console.log('\n[5] 优选候选的同源自拉必须带凭据（否则被自家�
   const AUTH = 'ap_auth=' + Buffer.from(PASSWORD).toString('base64');
   try {
     // 场景 A：SUB_URL 指向本机 /sub（同源）
+    // 直接写 KV 键 = 绕过面板写入，readSettings 的进程内缓存对此无感（与 config.js
+    // 「外部变更最多等一个 TTL」同口径），所以这里显式作废，模拟的是「冷启动读到这份值」
     mem.set('SUB_URL', '/sub?token=smoketest');
+    invalidateSettings();
     seen.length = 0;
     const ra = await call('/__api/preferred-candidates', { Cookie: AUTH });
     const ja = JSON.parse(new TextDecoder().decode(ra.buf));
@@ -177,6 +181,7 @@ console.log('\n[5] 优选候选的同源自拉必须带凭据（否则被自家�
 
     // 场景 B：SUB_URL 指向外部订阅 —— 绝不能把凭据带出去
     mem.set('SUB_URL', 'https://external-sub.example.com/sub?token=ext');
+    invalidateSettings();   // 同上：绕过面板的直接写入，缓存看不见
     seen.length = 0;
     const rb = await call('/__api/preferred-candidates', { Cookie: AUTH });
     JSON.parse(new TextDecoder().decode(rb.buf));
@@ -369,6 +374,82 @@ console.log('\n[9] 分片请求：上游不支持 Range 时必须明确声明，
     `${c.headers.get('accept-ranges') || '无'}`);
 
   globalThis.fetch = realFetch;
+}
+
+// [10] 站点增删改之后必须**立刻**可见 —— 钉住 `sites.js` 那层进程内缓存的失效点。
+//
+// 为什么单开一段：`getSite` 落在每个反代请求的热路径上（媒体播放一次上百个分片），
+// 不缓存就变成一次播放几百次存储读。但加了缓存之后，每一次写入之后**都必须**同时清缓存，
+// 漏一处就是「改完 slug 三秒内还走旧值」「刚删除的站点还能打开」——
+// 症状看起来就是「保存成功、行为没变」，而且只在缓存窗口那几秒内出现，极难复现。
+//
+// 牙齿验证（四份清理缺哪个坏哪个，均已逐条实测）：
+//   · `src/admin.js` DELETE 分支的 `invalidateSite(id)`            -> 「删除后立刻打不开」「删除后列表里也没有了」
+//   · `src/admin.js` PUT 末尾的 `invalidateSite(keyId)`            -> 「改完 slug：新后缀立刻打得开」
+//   · `src/admin.js` 的 `if (renamedFrom) invalidateSite(...)`      -> 「旧后缀立刻打不开」
+//   · `src/sites.js` 里 `addSite()` 末尾那份                        -> 「新增后列表里立刻就有」「新增后立刻能打开」
+// 在补这一段之前，这四份一处都没被任何检查盯着；且早先它们散成三份互相打掩护
+// （三选二就够用，砍掉一份照样全绿），收拢之后才做到「缺哪个坏哪个」。
+//
+// ⚠️ 这里每一条都要先「预热」再验，否则断言全是假的：缓存本来是空的（cold），
+// 写完之后就算没失效，下次读也会因为 miss 而拿到新值 —— 怎么改都是绿的，
+// 验的其实是「缓存天生没东西」，不是「写入之后有没有清」。
+// 必须先把一份「写着没有 / 写着旧值」的副本装进缓存，改动才有被暴露的机会。
+console.log('\n[10] 站点增删改后立即生效（缓存失效点）');
+{
+  const AUTH = { Cookie: 'ap_auth=' + Buffer.from(PASSWORD).toString('base64'), 'Content-Type': 'application/json' };
+  const jcall = async (p, m, b) => {
+    const r = await call(p, AUTH, m, JSON.stringify(b));
+    let j = {};
+    try { j = JSON.parse(new TextDecoder().decode(r.buf)); } catch {}
+    return { status: r.status, j };
+  };
+
+  const rnd = Math.random().toString(36).slice(2, 7);
+  const slug = 'smoke-' + rnd;
+  const newSlug = slug + '-v2';
+
+  // 探针用**真实访问路径** `/p/<slug>/`（而不用 `/__api/sites/:id` —— 后者没有 GET 分支）：
+  // 用户感知的正是「能不能打开」，顺带把「新增完立刻能用」这条也覆盖了。
+  const open = async (id) => (await call(`/p/${id}/`, { ...NAV, 'Accept-Encoding': 'identity' })).status;
+  const listHas = async (id) => {
+    const r = await jcall('/__api/sites', 'GET');
+    const sites = r.j.sites || [];
+    return { n: sites.length, has: sites.some(s => s.id === id) };
+  };
+
+  // 1) 新增：先把「列表里没有它」「这个后缀不存在」两份旧状态塞进缓存，再写
+  const absent = await open(slug);
+  ok('前置：新后缀此刻不存在（负缓存里已有一份「没有」）', absent === 404, `HTTP ${absent}`);
+  const beforeN = (await listHas(slug)).n;
+
+  const cre = await jcall('/__api/sites', 'POST', { name: '缓存校验站', slug, target: 'https://cache-check.example.com' });
+  ok('新增站点返回 201', cre.status === 201, `HTTP ${cre.status} ${cre.j.error || ''}`);
+  const list1 = await listHas(slug);
+  ok('新增后列表里立刻就有', list1.has, `列表 ${list1.n} 条（新增前 ${beforeN} 条）`);
+  const freshSt = await open(slug);
+  ok('新增后立刻能打开（不是要等缓存过期）', freshSt === 200, `HTTP ${freshSt}`);
+
+  // 2) 改 slug：新后缀立刻可用、旧后缀立刻打不开 —— 两个方向都要清，
+  //    只清新不清旧会让旧地址在缓存窗口里继续可用（看起来像删不掉）
+  const put = await jcall(`/__api/sites/${slug}`, 'PUT', { slug: newSlug });
+  ok('改 slug 返回 200', put.status === 200, `HTTP ${put.status} ${put.j.error || ''}`);
+  const nsSt = await open(newSlug);
+  ok('改完 slug：新后缀立刻打得开', nsSt === 200, `HTTP ${nsSt}`);
+  const oldSt = await open(slug);
+  ok('改完 slug：旧后缀立刻打不开（缓存里没留下残影）', oldSt === 404, `HTTP ${oldSt}`);
+
+  // 3) 删除：立刻打不开，也从列表里消失。
+  //    列表要重新预热一次 —— 上一步改 slug 时顺手清过 listCache，不重装进去
+  //    这条就退化成「缓存本来是空的」，永远绿。
+  const warm = await listHas(newSlug);
+  ok('前置：删除前列表里确实有它（列表缓存已装上）', warm.has, `列表 ${warm.n} 条`);
+  const del = await jcall(`/__api/sites/${newSlug}`, 'DELETE');
+  ok('删除返回 200', del.status === 200, `HTTP ${del.status}`);
+  const goneSt = await open(newSlug);
+  ok('删除后立刻打不开', goneSt === 404, `HTTP ${goneSt}`);
+  const list2 = await listHas(newSlug);
+  ok('删除后列表里也没有了', !list2.has, `列表 ${list2.n} 条`);
 }
 
 console.log(`\n=== ${fail === 0 ? '全部通过' : '存在失败'} ===`);

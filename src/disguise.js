@@ -15,6 +15,7 @@
  */
 
 import { runtime } from './runtime.js';
+import { CONFIG_CACHE_TTL_MS } from './config.js';
 import { esc } from './util.js';
 
 const KEY = 'DISGUISE_CONFIG';
@@ -103,12 +104,13 @@ function writeQuiet(env, cfg) {
  * 等于给全站加了一次存储往返。Workers isolate 长期存活，这里缓存 3 秒已足够，
  * 且 saveConfig 会立即失效缓存，保证「面板点保存 → 立刻生效」不被延迟影响。
  */
-const CACHE_TTL_MS = 3000;
+// 窗口值不再自己抄一份（曾经这里写了第二个 3000）：与 config.js / settings.js 共用同一个常量，
+// 「多长算新鲜」这句话全项目只有一处定义。
 let cacheValue = null;
 let cacheTs = 0;
 
 export async function readConfig(env) {
-  if (cacheValue && Date.now() - cacheTs < CACHE_TTL_MS) return cacheValue;
+  if (cacheValue && Date.now() - cacheTs < CONFIG_CACHE_TTL_MS) return cacheValue;
   let cfg;
   try {
     const raw = await runtime.KV.get(KEY);

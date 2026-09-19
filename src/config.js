@@ -18,12 +18,14 @@ import { runtime, notifyConfigChange } from './runtime.js';
 const CONFIG_KEY = 'APP_CONFIG';
 
 /**
- * 进程内缓存 TTL。
+ * 进程内缓存 TTL（**导出给其它模块复用**：settings.js 的运行参数、disguise.js 的伪装
+ * 配置都用它，值只在这里定义一处 —— 曾经 disguise.js 自己抄了一份 3000，属于典型的
+ * 「同一个设定两份定义」）。
  * 这些配置参与每个请求的判断（开关是否打开、阈值多少），逐请求读一次 D1/KV
  * 等于给全站加一次存储往返；写入时立即失效缓存，保证「面板保存 → 立刻生效」。
  *
  * 注意「立刻」的边界：写入只失效**当前 isolate** 的缓存，别处最多要等一个 TTL
- * 才看到新值。所以改完开关后短时间内可能新旧取值并存（最长 CACHE_TTL_MS），
+ * 才看到新值。所以改完开关后短时间内可能新旧取值并存（最长 CONFIG_CACHE_TTL_MS），
  * 这是拿一点收敛延迟换掉「每个请求一次存储往返」的自觉取舍 —— 需要更快的收敛
  * 就调小这个值，别在业务代码里绕开它。
  *
@@ -31,7 +33,7 @@ const CONFIG_KEY = 'APP_CONFIG';
  * 就成了「用配置去改读配置的窗口」的自指。它属于 AGENTS 第 0 节允许的
  * 「代码级具名常量」——只有这一处定义，不存在两份口径。
  */
-const CACHE_TTL_MS = 3000;
+export const CONFIG_CACHE_TTL_MS = 3000;
 
 let cachedDoc = null;
 let cachedTs = 0;
@@ -147,7 +149,7 @@ function writeQuiet(doc) {
 }
 
 async function readDoc(env) {
-  if (cachedDoc && Date.now() - cachedTs < CACHE_TTL_MS) return cachedDoc;
+  if (cachedDoc && Date.now() - cachedTs < CONFIG_CACHE_TTL_MS) return cachedDoc;
   cachedDoc = await loadDoc(env);
   cachedTs = Date.now();
   return cachedDoc;

@@ -1,7 +1,7 @@
 import { json, esc, kvKey, validTarget, parseIpv4List, parseDomainList } from './util.js';
 import { toBool } from './config.js';
 import { runtime } from './runtime.js';
-import { listSites, getSite, autoSlug, validSlug, buildTarget, addSite } from './sites.js';
+import { listSites, getSite, autoSlug, validSlug, buildTarget, addSite, invalidateSite } from './sites.js';
 import { DEFAULT_SITE_MODES, getSiteModes, saveSiteModes, resolveEngine, siteBadge, SITE_ENGINES, BADGE_CLASSES } from './site-modes.js';
 import { readR2Config, saveR2Config, R2_CACHE_SPEC, R2_PREFIX } from './media-r2.js';
 import { sweepMediaR2 } from './proxy.js';
@@ -879,6 +879,14 @@ async function handleAdmin(request, url, env) {
     }
     if (site.proxyMode || site.mediaCacheAuthBind || site.mediaSkipDetailLog) {
       await runtime.KV.put(kvKey(slug), JSON.stringify(site));
+      // 这是**第二次** put（补写 mode 字段），addSite() 里那次作废已经用掉了，
+      // 不清的话缓存窗口里读到的还是没带这些字段的那一版。
+      //
+      // ⚠️ 如实标注：这一处**目前没有检查盯住**。它藏在「站点运行在错误的引擎上」这一类
+      // 静默行为里，需要在反代链路上观测才能显形，`check-smoke` 第 [10] 段验到的那三条
+      // （列表 / 打开 / 改 slug）都够不到这里。留下它是因为它防的问题是真实的，
+      // 但请不要以为它被覆盖着 —— 要让一个防御真的算数，得有意识地给它写检查。
+      invalidateSite(slug);
     }
     return json({ ok: true, site }, 201);
   }
@@ -892,6 +900,7 @@ async function handleAdmin(request, url, env) {
 
     if (request.method === 'DELETE') {
       await runtime.KV.delete(kvKey(id));
+      invalidateSite(id);
       return json({ ok: true });
     }
 
@@ -904,6 +913,7 @@ async function handleAdmin(request, url, env) {
       }
       // 编辑访问后缀（slug / id）：变更则迁移 KV（新 key 写入 + 旧 key 删除）
       let keyId = id;
+      let renamedFrom = '';
       if (body.slug !== undefined && String(body.slug).trim() !== '' && String(body.slug).trim() !== id) {
         const ns = String(body.slug).trim();
         if (!validSlug(ns)) return json({ error: '后缀格式不合法（字母数字 - _，最长 40）' }, 400);
@@ -911,6 +921,7 @@ async function handleAdmin(request, url, env) {
         site.id = ns;
         await runtime.KV.put(kvKey(ns), JSON.stringify(site));
         await runtime.KV.delete(kvKey(id));
+        renamedFrom = id;
         keyId = ns;
       }
       if (body.name !== undefined && String(body.name).trim() !== '') site.name = String(body.name).trim();
@@ -942,6 +953,12 @@ async function handleAdmin(request, url, env) {
         site.port = built.port;
       }
       await runtime.KV.put(kvKey(keyId), JSON.stringify(site));
+      // 写入后统一清理：所有分支的缓存作废都收在这一处。
+      // 曾经散成三份（改名分支里「清新 + 清旧」，末尾再清一次 keyId）——
+      // 三选二就够用，于是砍掉任何一份检查都不会红：看着是双保险，实际谁都没被验住。
+      // 收拢之后，下面每一行被删掉都立刻有对应的检查变红。
+      invalidateSite(keyId);
+      if (renamedFrom) invalidateSite(renamedFrom);   // 旧 slug 只在这里有机会被摘掉
       return json({ ok: true, site });
     }
   }

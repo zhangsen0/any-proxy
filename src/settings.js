@@ -31,9 +31,9 @@
 
 import {
   readSection, writeSection, readStoredSection, readEnvValue, readRawDoc,
-  sanitize, invalidateDoc, CONFIG_KEY, coerceBySpec,
+  sanitize, invalidateDoc, CONFIG_KEY, coerceBySpec, CONFIG_CACHE_TTL_MS,
 } from './config.js';
-import { runtime, notifyConfigChange } from './runtime.js';
+import { runtime, notifyConfigChange, onConfigChange } from './runtime.js';
 import { isUuid, parseIpv4List, parseDomainList } from './util.js';
 
 /** 配置文档里的分区名。整表存 APP_CONFIG[section]，与其它模块的分区同一份文档、同一份缓存。 */
@@ -605,11 +605,32 @@ function writeEngineField(doc, engineKey, value) {
   setPath(doc, engineKey, value);
 }
 
-/**
- * 读全部运行参数（已归一化、已夹紧、已脱敏前）。
- * @returns {Promise<Record<string, any>>}
- */
-export async function readSettings(env) {
+// ===================== 进程内缓存 =====================
+//
+// readSettings 是全项目最热的一个读点：**29 处调用**，一次订阅请求沿途会触发好几次
+// （router 的 tagOpts 与 /sub 出口、sublat 的排序、subs 的链接构造、geoip 的批量…）。
+// 而它里面两类字段原本是每次直读存储、零缓存：store:'engine' 读代理引擎的 config.json、
+// store:'kv' 逐个读历史独立键 —— 一次调用合计 7~9 次 IO，乘上调用次数就是几十次往返。
+//
+// 所以这里加一层进程内缓存。窗口**直接复用 config.js 的 CONFIG_CACHE_TTL_MS** ——
+// 「多长算新鲜」这句话全项目只允许有一处定义，不再由本报告自造一个 3000。
+//
+// 为什么 TTL 不进 SETTINGS_SPEC（理由与 config.js:30-33 完全一致）：
+// 它是「读配置的窗口」，若由配置去决定，就成了「用配置去改读配置的窗口」的自指。
+//
+// 失效不靠逐个写入点清理：settings 的三种写入路径末尾**都已经在调 notifyConfigChange**
+// （saveSettings 的 section/engine/kv 三路、clearSetting 的三路），这里注册一个钩子就能
+// 全覆盖。漏掉一个写入点就是「保存成功、行为不变」，所以钩子比手工清理可靠得多。
+// 模式切换（内存模式）走同一条广播。
+
+let settingsCache = null;   // { env, values, ts } —— env 也记：单测里多个 env 交替，串味会很难查
+
+/** 手动作废缓存。除了钩子，单测与「切 mode」也用它 */
+export function invalidateSettings() { settingsCache = null; }
+
+onConfigChange(() => invalidateSettings());
+
+async function computeSettings(env) {
   const { section, engine, kv } = groupByStore(SETTINGS_SPEC);
   const values = await readSection(env, SETTINGS_SECTION, section);
 
@@ -644,6 +665,21 @@ export async function readSettings(env) {
 
   applyListLimits(values);
   return values;
+}
+
+/**
+ * 读全部运行参数（已归一化、已夹紧、已脱敏前）。
+ * @returns {Promise<Record<string, any>>}
+ */
+export async function readSettings(env) {
+  if (settingsCache && settingsCache.env === env
+      && Date.now() - settingsCache.ts < CONFIG_CACHE_TTL_MS) {
+    // 给调用方一份浅拷贝：缓存对象本身不能被写脏，否则所有读者一起跟着错
+    return { ...settingsCache.values };
+  }
+  const values = await computeSettings(env);
+  settingsCache = { env, values, ts: Date.now() };
+  return { ...values };
 }
 
 /** 遗留键存的是裸值（如 '720'、多行 CIDR），按字段声明归一化一次 */

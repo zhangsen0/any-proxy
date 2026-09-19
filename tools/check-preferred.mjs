@@ -18,7 +18,7 @@ import { btoa } from 'node:buffer';
 import { handleRequest } from '../src/router.js';
 import { bindRuntime } from '../src/runtime.js';
 import { filterUsableIps, autoUpdatePreferredDns } from '../src/dns.js';
-import { SETTINGS_SPEC } from '../src/settings.js';
+import { SETTINGS_SPEC, invalidateSettings } from '../src/settings.js';
 
 const PASSWORD = process.env.PASSWORD || 'dev';
 const ORIGIN = process.env.PROBE_ORIGIN || 'https://proxy.example.com';
@@ -137,6 +137,9 @@ if (!SKIP_NETWORK) {
 {
   const saved = env.PROXY_HOST;
   delete env.PROXY_HOST;
+  // readSettings 有进程内缓存（3 秒 TTL），而这里改的是 **env 对象本身**（引用没变、
+  // 值变了），缓存按引用命中会继续返回旧快照。显式作废，取的才是「改完 env 之后」的值。
+  invalidateSettings();
   const withMemory = await autoUpdatePreferredDns(env, {});
   check(
     'cron 无 PROXY_HOST 时可用已记住的域名兜底',
@@ -144,6 +147,7 @@ if (!SKIP_NETWORK) {
     (withMemory.error || '无错误').slice(0, 60)
   );
   mem.delete('SEEN_HOST');
+  invalidateSettings();   // 同上：绕过面板的直接写入，缓存看不见
   const noMemory = await autoUpdatePreferredDns(env, {});
   check(
     'cron 且无历史域名时给出明确错误（不猜域名）',
