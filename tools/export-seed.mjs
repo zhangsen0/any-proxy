@@ -343,7 +343,7 @@ function fromSql(file) {
 function parseArgs(argv) {
   const a = {
     chunk: 0, out: '', proxy: process.env.HTTPS_PROXY || '',
-    keepStats: false, scrub: true,
+    keepStats: false, scrub: false,
   };
   for (let i = 0; i < argv.length; i++) {
     const k = argv[i];
@@ -358,7 +358,7 @@ function parseArgs(argv) {
     else if (k === '--out') a.out = argv[++i];
     else if (k === '--chunk') a.chunk = Number(argv[++i]);
     else if (k === '--keep-stats') a.keepStats = true;
-    else if (k === '--keep-secrets') a.scrub = false;
+    else if (k === '--scrub') a.scrub = true;
     else if (k === '--only') a.only = String(argv[++i]).split(',').map((s) => s.trim()).filter(Boolean);
     else if (k === '--help' || k === '-h') a.help = true;
     else die('未知参数：' + k);
@@ -376,7 +376,7 @@ const HELP = `
   --out seed.json   同时写一份完整 JSON（给本地备份用；通常超过单变量 5 KB 上限）
   --chunk 4096      按字节分片打印，并标明每段该填进哪个变量
   --keep-stats      连统计类键一起导出（默认跳过：量大且丢得起）
-  --keep-secrets    凭据也导出（默认脱敏 —— 变量是明文，见文件头说明）
+  --scrub            把凭据类字段清成空串（默认**不**脱敏，见下方说明）
   --only a,b        只导出这些前缀 / 键
   --proxy HOST:PORT 本机能出网的那条路（默认读 HTTPS_PROXY）
   -h / --help       看这个
@@ -400,6 +400,17 @@ async function main() {
   const { picked, dropped } = pickEntries(entries, { keepStats: a.keepStats, only: a.only });
   if (!picked.length) die('一个键都没取到 —— 看看过滤条件是不是太严，或者数据本来就不在这份来源里');
 
+  // 默认**原样导出**，凭据也一并带上 —— 这是刻意的选择，不是疏忽。
+  //
+  // 之前这里默认脱敏（清成空串），理由是 GitHub Variables 是明文。但代价被低估了：
+  // 导出的种子要**原样顶替整套存储**，少一个凭据就少一处功能还看不出来；
+  // 更要命的是它会让人误判根因 —— 2026-09-19 面板全部失灵时第一反应就是「脱敏搞的」，
+  // 查了半天真凶却是页面脚本里的转义。事实核对下来，那几处被清空的凭据里，
+  // 订阅令牌由 MD5MD5(host+uuid) 派生、掩饰入口有 path 兜底、统计盐本来就会重新生成，
+  // 一个都没真正失效 —— 也就是说脱敏只制造了噪音，没换来安全。
+  //
+  // 真要防泄漏，正确的做法是关掉仓库写权限、或者在导完 Local 之后把临时文件删了，
+  // 而不是让每个人先丢一遍配置。需要脱敏时显式加 --scrub。
   let list = picked;
   let hits = [];
   if (a.scrub) {

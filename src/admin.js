@@ -1774,11 +1774,17 @@ function setMsg(id, text, isErr) {
     if (force && !confirm('覆盖模式会把内存值强行写回，可能盖掉降级期间别的实例写入的新数据。确定吗？')) return;
     const r = await post({ action: 'flush', force: !!force });
     const d = r.data || {};
+    // 这里的换行必须写两个反斜杠（\\n）。整段 script 是被模板字符串包出来的，
+    // 写单个反斜杠会被 JS 在解析模板时提前解释成真实换行，注入到页面就成了
+    // 「字符串里出现裸换行」——浏览器拿到直接 SyntaxError，整个 script 块不执行：
+    // 页面照常渲染，但所有按钮的事件一个都没绑上，表现为「所有功能都不能用」。
+    // 同一文件里 2050 / 2093 行的写法就是这样，别照着做错的那版抄。
+    // 注释里也不要出现反引号：那会提前结束外层模板字符串，同样白屏。
     alert('写回 ' + ((d.written || []).length) + ' 个'
-      + '\n跳过（存储里已被改过）' + ((d.skipped || []).length) + ' 个'
-      + '\n失败 ' + ((d.failed || []).length) + ' 个'
-      + '\n还剩 ' + (d.pending || 0) + ' 个没写回'
-      + ((d.error ? '\n\n错误：' + d.error : '')));
+      + '\\n跳过（存储里已被改过）' + ((d.skipped || []).length) + ' 个'
+      + '\\n失败 ' + ((d.failed || []).length) + ' 个'
+      + '\\n还剩 ' + (d.pending || 0) + ' 个没写回'
+      + ((d.error ? '\\n\\n错误：' + d.error : '')));
     reload();
   };
   on('memFlushBtn', doFlush(false));

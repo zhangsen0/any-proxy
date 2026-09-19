@@ -452,6 +452,33 @@ console.log('\n[10] 站点增删改后立即生效（缓存失效点）');
   ok('删除后列表里也没有了', !list2.has, `列表 ${list2.n} 条`);
 }
 
+// [11] 注入到页面的脚本必须是合法 JS：页面能渲染 ≠ 前端能跑。
+//
+// 这一段的来历很痛：面板整段 script 是被模板字符串拼出来的。写
+//     alert('写回 ' + n + ' 个' + '\n跳过' + m)
+// 这种单反斜杠写法时，反斜杠被模板字符串提前解释成了真实换行，浏览器拿到的是
+// 「单引号字符串里出现裸换行」——直接 SyntaxError，整个 script 块一行都不执行。
+// 后果特别难查：页面照样渲染得漂漂亮亮，但所有按钮的 onclick 一个都没挂上，
+// 用户看到的就是「所有功能都不能用」；而后端接口清一色 200，Worker 日志一条报错都没有。
+// 从此所有带 script 的页面都把里面的脚本原样抽出来过一遍语法。
+console.log('\n[11] 注入页面的脚本必须是合法 JS（页面能渲染不等于前端能跑）');
+{
+  const AUTH = 'ap_auth=' + Buffer.from(PASSWORD).toString('base64');
+  const pages = ['/__admin', '/__login', '/'];
+  for (const p of pages) {
+    const resp = await handleRequest(new Request(ORIGIN + p, { headers: { Cookie: AUTH } }), env, {});
+    const html = await resp.text();
+    const scripts = [...html.matchAll(/<script[^>]*>([\s\S]*?)<\/script>/g)].map(m => m[1]);
+    if (scripts.length === 0) { ok(`${p} 不含注入脚本（跳过语法检查）`, true, `${html.length}B`); continue; }
+    let err = null;
+    for (const s of scripts) {
+      // 只构造不调用：语法都在这里解析完，运行时才跑的部分交给浏览器
+      try { new Function(s); } catch (e) { err = `${e.name}: ${e.message}`.slice(0, 140); break; }
+    }
+    ok(`${p} 的 ${scripts.length} 段脚本都过得了语法（前端不会整块不执行）`, err === null, err || '');
+  }
+}
+
 console.log(`\n=== ${fail === 0 ? '全部通过' : '存在失败'} ===`);
 console.log(`代理链路冒烟：${pass} 项，失败 ${fail} 项\n`);
 process.exit(fail ? 1 : 0);
