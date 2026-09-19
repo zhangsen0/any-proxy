@@ -9,8 +9,11 @@ wrangler.toml 在版本库里。它一旦写死某个账号下的 D1 / KV 资源
 
   1. 仓库 Variables 配了 → 用你配的（想复用已有资源时用）
   2. 没配 → 调 Cloudflare 接口**自动创建**（D1 数据库 / KV 命名空间 / R2 桶），拿了 ID 回填
-  3. R2 是唯一允许失败的资源：建不出来（账号没开通）就删掉整个 [[r2_buckets]]，
-     Worker 本来就有「未绑定则降级为纯 Cache API」的路径，不该因为它卡住部署
+  3. 有两处失败是**允许**的，因为它们各自都有降级路径，不该卡住部署：
+       - R2 建不出来（账号没开通）→ 删掉 [[r2_buckets]]，Worker 退回纯 Cache API
+       - d1 迁移跑不动（配额打满）→ 跳过建表，Worker 起来后自动降级到内存模式，
+         靠部署时注入的种子提供服务（见第 4 段的说明）
+     「允许失败」不等于「悄悄失败」：两处都会打 error annotation 并写进 job summary。
   4. 健康检查链接按 GITHUB_REPOSITORY 拼成你自己仓库的地址
 
 结果：fork 完不用改任何文件，也不用去控制台抄 ID。
@@ -150,6 +153,63 @@ def resolveActionsUrl():
 
 def cutSection(text, header):
     return re.sub(re.escape(header) + r'.*?(?=\n\[\[|\n\[|\Z)', '', text, flags=re.S)
+
+
+def summarize(lines):
+    """写进 Actions 的运行摘要。日志看不看随缘，摘要是这次部署躲不掉的一页。"""
+    path = os.environ.get('GITHUB_STEP_SUMMARY')
+    if not path:
+        return
+    with open(path, 'a', encoding='utf-8') as fh:
+        fh.write('\n'.join(lines).rstrip() + '\n\n')
+
+
+def apply_migrations():
+    """跑 wrangler d1 migrations apply。
+
+    失败了**不阻断部署** —— 这个决定是踩出来的，别改回 check=True：
+
+    D1 配额打满时，wrangler 连迁移都跑不通，于是整个 workflow 在建表这步就红掉，
+    而部署这一步被硬生生卡住的结果是「Worker 没更新，d1 绑定也没上去」，面板上
+    还什么都看不出来。可 Worker 自己本来就有退路：读不到存储就降级到内存模式，
+    拿部署时注入的种子照常服务（这也是 wrangler.toml 里那段种子的用途）。
+    让一次配额超限升级成「发不了版」，不划算。
+
+    代价是必须把它喊够响：error annotation 让运行详情页标红，摘要里写清后果和
+    该做什么。静默跳过的下场是 —— 哪天真换了空库，部署一路绿，上去才发现没表。
+    """
+    proc = subprocess.run(
+        ['npx', 'wrangler', 'd1', 'migrations', 'apply', D1_NAME, '--remote'],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode == 0:
+        log('d1 模式：迁移已应用')
+        return
+    detail = (proc.stderr or '') + (proc.stdout or '')
+    tail = [l for l in detail.strip().splitlines() if l.strip()][-6:] or ['(wrangler 没有给出输出)']
+    log('d1 迁移失败（exit %d），部署继续 —— 常见原因是 D1 读写配额打满' % proc.returncode)
+    for line in tail:
+        print('::error::[d1 migrations] ' + line)
+    summarize([
+        '> ⚠️ **d1 迁移没跑成，本次部署没有建表**（exit %d）' % proc.returncode,
+        '',
+        'Worker 仍然带着 **d1 绑定** 部署上去了。读不到存储时它会自动降级到内存模式，',
+        '用部署时注入的种子提供服务 —— 所以站点与订阅照常可用，只是不落盘。',
+        '',
+        '最常见的原因是 D1 读写配额超限（连迁移本身也要额度）。配额恢复后的收尾：',
+        '',
+        '1. 面板「**检测存储**」确认存储可用；',
+        '2. 点「**写回存储**」把内存里的数据搬回去；',
+        '3. 点「**切回存储模式**」。',
+        '',
+        '如果这是全新的数据库（表里还没有数据），则必须让迁移跑一次：',
+        '等配额恢复后重跑本 workflow（不加任何开关）即可。',
+        '',
+        'wrangler 输出的最后几行：',
+        '```',
+    ] + ['    ' + l for l in tail] + ['```'])
 
 
 def render(text, values):
@@ -317,15 +377,14 @@ def main():
             # 只能由「手动触发 ＋ 勾选 skip_migrations」走到这里（开关怎么用写在
             # deploy-cloudflare.yml 的 inputs 说明里）。跳过必须在日志里喊一声：
             # 静默跳过的下场是 —— 哪天真的换了新库，部署一片绿，上去才发现没表。
-            log('警告：已跳过 d1 迁移（ANYPROXY_SKIP_MIGRATIONS）。'
-                '本次部署不会建表，前提是目标库里的表早就存在；'
-                '换了新的空库请务必去掉这个开关重跑一次。')
+            log('警告：已跳过 d1 迁移（ANYPROXY_SKIP_MIGRATIONS）。')
+            summarize([
+                '> ⚠️ **本次部署跳过了 d1 迁移**（手动勾选 skip_migrations）',
+                '',
+                '表必须已经存在。换了新的空库请去掉这个开关重跑一次。',
+            ])
         else:
-            subprocess.run(
-                ['npx', 'wrangler', 'd1', 'migrations', 'apply', D1_NAME, '--remote'],
-                check=True,
-            )
-            log('d1 模式：迁移已应用')
+            apply_migrations()
 
 
 if __name__ == '__main__':
