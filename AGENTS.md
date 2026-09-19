@@ -77,6 +77,8 @@ api('/__api/sites').then(r => { const sites = (r.data && r.data.sites) || []; })
 
 **能做成就做成脚本**：把「故意改坏」这件事本身落成一条命令（`tools/tooth-storage.mjs` 是第一个），否则这一遍只在做它的当天有效。此类脚本改动源文件，必须在 `process.on('exit')` 与 `uncaughtException` 里挂还原钩子。
 
+**断言不要拿源码文本位置冒充运行时行为**。曾经用 `script.indexOf('A') < script.indexOf('B')` 判定「写盘排在迁移之前」，后来把迁移抽成一个函数，函数定义自然排到了写盘之前 —— 行为完全正确，行号却判定成违规。同理，比行号、比字符串出现先后、顺着源码 `grep` 某一行是否存在，都不能证明「运行时顺序／运行时发生了什么」。要验行为就把被测的东西真跑起来，然后对**它产生的副作用**下断言（比如迁移那一刻抄下来的文件内容，与最终产物逐字节比对）。做副作用采样时也要想清楚边界：那个假 `npx` 原本用覆盖写，于是「有人在写盘之前提前触发过一次迁移」这种退化反而被最后那份好内容掩盖了，改成只保留第一次才咬得住。
+
 ## 6. 异步与运行时约束
 
 - Workers 里 `ctx.waitUntil` 必须在 **Response 返回之前**注册；流式响应的字节计数用「Promise 占位 + TransformStream flush 里 resolve」模式（见 `worker.js` 的 `countResponseBytes`）。在 flush 里才调 `waitUntil` 会被运行时静默丢弃（症状：流量统计恒为 0 B）。
