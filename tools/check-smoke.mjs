@@ -479,6 +479,34 @@ console.log('\n[11] 注入页面的脚本必须是合法 JS（页面能渲染不
   }
 }
 
+// [12] 模式切换必须如实报告失败：绝不能「弹成功、实际没切」。
+//
+// 背景：STORAGE_BACKEND=memory 部署时，prepare-deploy 会把 D1 / KV 绑定整段删掉，
+// Worker 进程里根本没有 env.DB / env.SITES。这种状态下点面板的「切回存储模式」，
+// 切换必然失败。曾经 handler 把返回写死成 ok:true，于是面板弹「已切回存储模式」，
+// 而读回来的 mode 还是 memory —— 用户以为切了，一个字节都没动。
+console.log('\n[12] 模式切换失败必须如实上报（不能假装成功）');
+{
+  const { resetState } = await import('../src/memstore.js');
+  resetState(null, null);
+  const envNoStore = { PASSWORD, STORAGE_BACKEND: 'memory' };
+  bindRuntime(envNoStore);
+  const AUTH = 'ap_auth=' + Buffer.from(PASSWORD).toString('base64');
+  const res = await handleRequest(new Request(ORIGIN + '/__api/storage', {
+    method: 'POST',
+    headers: { Cookie: AUTH, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ mode: 'storage' }),
+  }), envNoStore, {});
+  let body = null;
+  try { body = JSON.parse(await res.text()); } catch { /* 非 JSON 也算失败 */ }
+  ok('没有存储绑定时切回：接口返回 4xx', res.status >= 400, `HTTP ${res.status}`);
+  ok('切回失败时 body.ok 必须是 false', !!(body && body.ok === false), body ? `ok=${body.ok}` : '(无 body)');
+  const msg = String((body && body.error) || (body && body.preload && body.preload.error) || '');
+  ok('错误信息要说明原因（而不是一句空话）', msg.includes('绑定'), msg.slice(0, 70) || '(没有错误信息)');
+  ok('只读状态依然拿得到（失败了也能看清楚现状）', !!(body && body.status && body.status.mode === 'memory'),
+    body && body.status ? body.status.mode : '(无 status)');
+}
+
 console.log(`\n=== ${fail === 0 ? '全部通过' : '存在失败'} ===`);
 console.log(`代理链路冒烟：${pass} 项，失败 ${fail} 项\n`);
 process.exit(fail ? 1 : 0);

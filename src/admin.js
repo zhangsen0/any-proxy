@@ -601,8 +601,15 @@ async function handleAdmin(request, url, env) {
         }
         if (body.mode === 'memory' || body.mode === 'storage') {
           const r = await setStorageMode(s, body.mode) || {};
+          // ok 不能写死：切回存储在「没有绑定」时会失败，而失败也必须照实送回去。
+          // 写死 true 的那一版表现很坏 —— 面板弹「已切回存储模式」，
+          // 可读回来的 mode 还是 memory。用户以为切了，其实一个字节都没动。
           afterModeSwitch();
-          return json({ ok: true, mode: s.mode, preload: r, status: getStatus(s) });
+          const ok = r.ok !== false;
+          return json(
+            { ok, mode: s.mode, preload: r, error: ok ? undefined : (r.error || '切换失败'), status: getStatus(s) },
+            ok ? 200 : 400,
+          );
         }
         return json({ error: '未知的 action / mode' }, 400);
       } catch (e) {
@@ -1798,6 +1805,11 @@ function setMsg(id, text, isErr) {
     }
     const res = await post({ mode: 'storage' });
     if (!res.data.ok) { alert('切换失败：' + (res.data.error || '')); return; }
+    // preload 也要看：切内存时它是「搬运了多少」的结果，
+    // 整体上就是这次切换到底成没成的另一半证据
+    if (res.data.preload && res.data.preload.ok === false) {
+      alert('切换未完成：' + (res.data.preload.error || '')); return;
+    }
     alert('已切回存储模式。');
     reload();
   });
