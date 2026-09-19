@@ -251,6 +251,26 @@ async function handleRequest(request, env, ctx) {
       headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store', ...extra },
     });
     try {
+      // --- 先自查身份，再去要数据 -------------------------------------------------
+      // 这条链接的 token = MD5MD5(host + uuid)（引擎第 334 行），uuid 的取值顺序是
+      // 「存储里的 config.json → 环境变量 UUID → 拿管理员密码临时派生」。
+      // 内存模式下**冷启动的实例**前两条都没有，引擎就安静地走到第三条 —— 派生出来的
+      // uuid 跟发出链接时用的不是同一个，于是 token 校验不过、请求落进伪装页，
+      // 一路传到这儿只剩「一行节点都没有」。症状（没数据）和病因（没身份）隔着三层，
+      // 2026-09-20 为找出它花了整整一轮。所以这里先把身份问出来：缺就直接说，
+      // 别再让伪装页把病因藏起来。
+      // 正文里只讲「没有」，不吐任何 uuid / 域名取值 —— 这个端点陌生人也能打到。
+      let ident = { uuid: '', host: '' };
+      try {
+        ident = await nodeIdentity(e, subUrl.hostname);
+      } catch { ident = { uuid: '', host: '' }; }
+      if (!ident.uuid) {
+        const why = '本实例未取到节点身份：存储里的引擎配置读不到，环境变量 UUID 也没配。'
+          + '这条链接的令牌由「节点 ID + 域名」推导，缺了前者必然校验不过。';
+        console.error('[native-sub] ' + why + ' kind=' + kind);
+        return say('订阅当前不可用：' + why
+          + '请到管理面板把存储切回 D1/KV，或用环境变量 UUID 注入节点 ID 后重新部署。', 503);
+      }
       const innerUrl = new URL(subUrl);
       for (const k of ['fmt', 'clash', 'clashyaml', 'singbox', 'sing-box', 'sing', 'b64', 'base64', 'target', 'surge', 'quanx', 'loon']) {
         innerUrl.searchParams.delete(k);
@@ -270,9 +290,13 @@ async function handleRequest(request, env, ctx) {
       const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
       const share = lines.filter(l => /^(vless|trojan|ss):\/\//i.test(l));
       if (!share.length) {
-        // 引擎连 mixed 都没给出来（token 不对 / 数据不在）：此时说什么都要比回 HTML 强
-        return say('订阅当前不可用：服务端没有取到节点清单（常见于存储降级中）。'
-          + '链接本身没错，稍后重试；若持续，请进管理面板看顶部运行模式。', 503);
+        // 走到这儿说明身份是有的、token 也过了，但引擎没吐出任何分享链接。
+        // 分布式里最常见的两句病因分开说：引擎在空配置下会退回随机 IP（不至于零个节点），
+        // 所以「一个都没有」多半是这条路之外出了错（异常已被下面 catch 成 503 除外）。
+        console.error('[native-sub] 身份可用但没有节点输出：kind=' + kind
+          + ' status=' + mixed.status + ' bytes=' + text.length);
+        return say('订阅当前不可用：服务端没有取到节点清单。'
+          + '链接没错，稍后重试；若持续，请进管理面板看顶部运行模式。', 503);
       }
       // 引擎在 mixed 响应上带的流量信息头（Subscription-Userinfo 等）原样透传
       const info = {};

@@ -19,6 +19,31 @@ const STATE_MAX = 20000;      // 内存键数上限（含影子副本）
 const EVENT_MAX = 20;         // 事件日志保留条数
 const DEFAULT_THRESHOLD = 3;  // 连续失败几次才降级（可被面板的 storage_fail_threshold 覆盖）
 
+/**
+ * 订阅这条链**赖以生存**的存储键 —— 少了其中任何一个，`/sub` 要么直接空、要么悄悄降级。
+ *
+ * 出处都是 vendor/vless.js（引擎自己读 env.KV，不走本项目的面板）：
+ *   - `config.json`  引擎的总配置：节点 ID / 地址 / 路径 / 传输协议 / 是否本地生成订阅。
+ *                    缺了它节点身份就没着落，token 校验必然不过（表现为伪装页）。
+ *   - `ADD.txt`      本地生成订阅时的优选 IP 池（第 400 行那一支）。缺了它不报错，
+ *                    而是退回「随机 IP」—— 策展好的节点与备注全部消失。
+ *   - `APP_CONFIG`   本项目自己的配置文档（开关、阈值、面板各段的取值）。
+ *   - `PREF_IPS` / `GOOD_IPS`  自动优选与健康检查的 IP 来源，节点列表的间接来源。
+ *
+ * 显式导出：tools/check-storage.mjs 用它跟 preload 的清单、跟引擎源码双向对齐，
+ * 不允许三处各写一份 —— 这个清单一旦分叉，丢的键又只能靠线上人肉看出来。
+ */
+export const SUB_MINIMAL_KEYS = ['APP_CONFIG', 'config.json', 'ADD.txt', 'PREF_IPS', 'GOOD_IPS'];
+
+/**
+ * 上表里由**引擎**自己去 KV 读的那几个（其余是本项目的键）。
+ *
+ * 为什么要单拎出来：这两个键不在任何单元买入接口后面，改它们的只有引擎自己的 admin 路由，
+ * 面板配置项也搜不到。所以 check-storage.mjs 拿它去跟引擎源码对一遍 —— 引擎哪天改了读法
+ * （或者我们写错了键名），那边会红；两边都对但它没进 preload 清单，另一条断言也会红。
+ */
+export const ENGINE_KV_KEYS = ['config.json', 'ADD.txt'];
+
 // ===================== 状态 =====================
 //
 // 状态**不挂在代理闭包上**：bindRuntime() 每个请求都调用一次，闭包每次都是新的，
@@ -200,11 +225,19 @@ export function setStorageMode(s, mode, opts = {}) {
 /**
  * 手动切内存时把控制面能读的都先读进来。
  * 跳过统计类前缀（量大且丢得起），只捞「没有就跑不起来」的那部分。
+ *
+ * ⚠️ `ADD.txt` 必须在这份清单里：它是**代理引擎**（vendor/vless.js，`/sub` 本地生成订阅
+ * 那一支）直接读的优选 IP 池，不归本项目的面板管，也不是 PREF_IPS / GOOD_IPS。
+ * 少了它，订阅不会报错，而是退化成「每次 16 个随机 IP」——策展好的节点全丢、
+ * 备注也全没了，看起来只像网速变差。2026-09-20 的教训：单看这条路，完全猜不到
+ * 是 preload 漏了一个键。
+ * 双向断言见 tools/check-storage.mjs 的「订阅必需的键」一段：那里既断言这些键在清单里，
+ * 也断言引擎源码确实还在读它们 —— 任一侧挪动都会红。
  */
 async function preload(s) {
   const raw = s.raw;
   if (!raw) return { ok: true, loaded: 0, failed: 0, truncated: false };
-  const wanted = ['APP_CONFIG', 'config.json', 'DISGUISE_CONFIG', 'PREF_IPS', 'GOOD_IPS', 'SITE_MODES'];
+  const wanted = SUB_MINIMAL_KEYS.concat(['DISGUISE_CONFIG', 'SITE_MODES']);
   const prefixes = ['site:', 'share:', 'tempsub:'];
   let loaded = 0;
   let failed = 0;

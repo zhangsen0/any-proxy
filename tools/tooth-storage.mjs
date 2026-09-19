@@ -32,6 +32,7 @@ const FILES = {
   prepare: join(ROOT, '.github/scripts/prepare-deploy.py'),
   admin: join(ROOT, 'src/admin.js'),
   native: join(ROOT, 'src/native-sub.js'),
+  router: join(ROOT, 'src/router.js'),
 };
 // 每个变异跑哪一套自检：改动落在哪个环节，就由盯那个环节的那套来咬。
 // 默认 storage —— 内存模式这条链路上大部分约束都由它看
@@ -111,6 +112,18 @@ const MUTANTS = [
     name: '不记 dirty（写回时无键可搬）',
     from: '  s.mem.set(k, value === null || value === undefined ? null : String(value));\n  s.dirty.add(k);',
     to: '  s.mem.set(k, value === null || value === undefined ? null : String(value));',
+  },
+  {
+    file: 'memstore',
+    name: '预捞清单漏掉 ADD.txt（策展好的节点静默退化成随机 IP）',
+    from: "export const SUB_MINIMAL_KEYS = ['APP_CONFIG', 'config.json', 'ADD.txt', 'PREF_IPS', 'GOOD_IPS'];",
+    to: "export const SUB_MINIMAL_KEYS = ['APP_CONFIG', 'config.json', 'PREF_IPS', 'GOOD_IPS'];",
+  },
+  {
+    file: 'router',
+    name: '订阅不查身份（缺节点 ID 时只说「没节点」，病因被藏起来）',
+    from: "      if (!ident.uuid) {",
+    to: "      if (false) {",
   },
   {
     file: 'memstore',
@@ -309,6 +322,11 @@ for (const m of MUTANTS) {
     console.log(`  ❌ ${m.name}\n      锚点已不在 ${key} 里，这条变异没法做了`);
     continue;
   }
+  // ⚠️ 每一轮开始先把**所有**文件还原：只还原当前这一个是不够的。
+  // 跨文件变异会叠加（改了 memstore 又跑 seedtool 的变异，前者仍带着伤），
+  // 于是「这一条变红了」可能其实是上一条的余威 —— 看着 40 个全抓住，实则在自欺。
+  // 每一次都必须只带着这一个伤口上场，红才是它自己咬出来的。
+  for (const [k, f] of Object.entries(FILES)) writeFileSync(f, original[k]);
   writeFileSync(file, original[key].replace(m.from, m.to));
   let out = '';
   let code = 0;

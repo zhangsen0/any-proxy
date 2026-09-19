@@ -14,6 +14,7 @@
  *
  * 用法：node tools/check-storage.mjs
  */
+import { readFile } from 'node:fs/promises';
 import { readSettings, invalidateSettings } from '../src/settings.js';
 import { invalidateDoc } from '../src/config.js';
 import { invalidateSite } from '../src/sites.js';
@@ -21,6 +22,7 @@ import { bindRuntime } from '../src/runtime.js';
 import { handleRequest } from '../src/router.js';
 import {
   wrapStorage, stateOf, getStatus, setStorageMode, flush, probe, setFailThreshold, resetState,
+  SUB_MINIMAL_KEYS, ENGINE_KV_KEYS,
 } from '../src/memstore.js';
 
 let pass = 0;
@@ -448,6 +450,13 @@ console.log('\n[14] 单个变量上限 5 KB：种子必须分片，且拼回来�
   check('拼回来与原串逐字节相同', Buffer.compare(Buffer.from(parts.join(''), 'utf8'), Buffer.from(json, 'utf8')) === 0);
   check('拼回来能解析成同一个对象', JSON.parse(parts.join('')).APP_CONFIG === big.APP_CONFIG);
   check('段数没超上限时不报警', overflow === false, `段数 ${parts.length} / 上限 ${MAX_PARTS}`);
+  // 反方向也要站得住：超限必须回信号。少了这一半，overflow 恒为 false 也照样全绿 ——
+  // 少了这一半，overflow 恒为 false 也照样全绿 —— 那种「静默不响」的失败
+  // 要等到部署那一刻才发现变量不够用。
+  const over = splitSeed(JSON.stringify({ APP_CONFIG: '{"x":"' + '站'.repeat(40000) + '"}' }), 400);
+  check('段数超上限时要给信号（不能等部署才发现变量不够用）',
+    over.parts.length > MAX_PARTS && over.overflow === true,
+    `段数 ${over.parts.length} / 上限 ${MAX_PARTS}，overflow=${over.overflow}`);
   check('短种子不分片', splitSeed('{"a":1}', 4096).parts.length === 1);
   check('变量名规则：主段不带后缀，其余两位数字',
     seedVarName(0) === 'SEED_JSON' && seedVarName(1) === 'SEED_JSON_01' && seedVarName(11) === 'SEED_JSON_11',
@@ -563,9 +572,15 @@ console.log('\n[15] 端到端：memory 后端 + 分片种子 —— 站点到底
   const home = await handleRequest(new Request(ORIGIN + '/__admin', { headers: H }), env, {});
   const html = await home.text();
   check('管理页打得开', home.status === 200, String(home.status));
-  check('顶部那条状态条渲染出来了', html.includes('membar'));
-  check('上头写明正跑在内存模式', /内存模式/.test(html));
-  check('也标明了影响范围（不许只写模式不写范围）', /全站|实例/.test(html));
+  // 状态条必须按**渲染出来的元素**判，不能只搜类名字符串：CSS 里那条 `.membar {…}`
+  // 让 `html.includes('membar')` 恒真 —— 状态条被拿掉之后这一项照样发绿，
+  // teeth 一直以为自己咬得住（2026-09-20 修「变异不还原」才暴露出来）。
+  const barAt = html.indexOf('<div class="membar');
+  const barHtml = barAt >= 0 ? html.slice(barAt, barAt + 900) : '';
+  check('顶部那条状态条真的渲染出来了（按元素判，不按类名字符串）',
+    barHtml.includes('membar-body'), (html.match(/<div class="membar /g) || []).length + ' 个状态条元素');
+  check('上头写明正跑在内存模式', /内存模式/.test(barHtml), barHtml.trim().slice(0, 60).replace(/\s+/g, ' '));
+  check('也标明了影响范围（不许只写模式不写范围）', /全站|实例/.test(barHtml));
 
   const api = await handleRequest(new Request(ORIGIN + '/__api/storage', { headers: H }), env, {});
   const body = await api.json();
@@ -599,6 +614,69 @@ console.log('\n[15] 端到端：memory 后端 + 分片种子 —— 站点到底
     `有种子 HTTP ${hit.status}，没种子 HTTP ${miss.status}`);
 
   check('这一段用的种子确实分了好几段（否则等于没验分段）', parts.length > 2, `${parts.length} 段`);
+}
+
+// ---------------------------------------------------------------------------
+// ⑦ 订阅必需的键：preload 的清单、导出的常量、引擎源码，三处必须对齐
+//
+// 2026-09-20 的订阅故障，最后揪出来的病因是 `ADD.txt` —— 内存模式切换时 preload 没捞它，
+// 于是「本地生成订阅」那一支静默退回随机 IP，策展好的 79 个节点连同备注全部消失，
+// 而且**不报任何错**。这种失败单看现象猜不到，只能靠双向对齐把它钉死：
+//   1. SubMinimalKeys 里的每一个键，preload 之后必须真的在内存里（行为层面）；
+//   2. 每一个键也必须真的出现在引擎源码里（否则常量写错了也没人知道）。
+// 牙齿（会变红的证明）在 tools/tooth-storage.mjs：从清单里摘掉 ADD.txt，这里必须红。
+{
+  const data = {};
+  for (const k of SUB_MINIMAL_KEYS) data[k] = '{"v":"' + k + '"}';
+  data['site:demo'] = '{"id":"demo"}';          // 顺手确认前缀那一路没被清单挤掉
+  data['stat:2026-09-20'] = '{"n":1}';          // 不该被 preload 带过来的那一类
+  const raw = makeRaw({ data: Object.entries(data) });
+  const env = { PASSWORD: 'dev', UUID: 'b1e6cc7c-9f8f-4f2c-9d2a-3b6f3f34d4b1' };
+  const proxy = wrapStorage(raw, env);
+  resetState(raw, env);
+  const p = wrapStorage(raw, env);
+  await setStorageMode(stateOf(p), 'memory');
+  const missing = [];
+  for (const k of SUB_MINIMAL_KEYS) if (!(await tryGet(p, k))) missing.push(k);
+  check('切内存时订阅必需的键都被预捞进来了', missing.length === 0,
+    missing.length ? '缺：' + missing.join('、') : SUB_MINIMAL_KEYS.join('、'));
+  check('预捞不把统计键也扫进来', !(await tryGet(p, 'stat:2026-09-20')));
+  check('站点前缀那一照旧有效', !!(await tryGet(p, 'site:demo')));
+
+  // 反向：清单里的键必须是引擎真的在用的。写错一个名字等于白捞一趟，
+  // 而且拼错不会被任何东西察觉 —— 只能把它跟源码对一遍。
+  const engineStrays = ENGINE_KV_KEYS.filter(k => !SUB_MINIMAL_KEYS.includes(k));
+  check('引擎键都进了预捞清单（漏一个就丢一类数据）', engineStrays.length === 0,
+    engineStrays.length ? '预捞漏了：' + engineStrays.join('、') : ENGINE_KV_KEYS.join('、'));
+  const vendorSrc = await readFile(new URL('../vendor/vless.js', import.meta.url), 'utf8');
+  const notInVendor = ENGINE_KV_KEYS.filter(k => !vendorSrc.includes(`'${k}'`));
+  check('引擎键在引擎源码里确实有人读（拼错键名在这里会红）', notInVendor.length === 0,
+    notInVendor.length ? '源码里找不到：' + notInVendor.join('、') : ENGINE_KV_KEYS.length + ' 个键全部命中');
+
+  // 身份闸门：这条链接的 token = MD5MD5(域名 + 节点 ID)，而节点 ID 只从
+  // 「存储里的 config.json → 环境变量 UUID」来。两条路都断的时候，绝不能让它
+  // 变成一句含糊的「没有节点清单」——那会把病因藏起来（2026-09-20 就藏了一整轮）。
+  const ORIGIN2 = 'https://proxy.example.com';
+  const askSub = async (e) => {
+    resetState(null, undefined);
+    invalidateDoc();
+    invalidateSettings();
+    invalidateSite();
+    bindRuntime(e);
+    const r = await handleRequest(new Request(ORIGIN2 + '/sub?token=x&fmt=clash', {
+      headers: { 'User-Agent': 'ClashX/1.0' },
+    }), e, {});
+    return { status: r.status, body: (await r.text()).slice(0, 500) };
+  };
+  const noId = await askSub({ PASSWORD: 'dev' });
+  check('没有节点身份时订阅明确说出病因', noId.status === 503 && noId.body.includes('节点身份'),
+    `HTTP ${noId.status} ${noId.body.slice(0, 60)}`);
+  check('病因里不吐任何身份取值（这个端点陌生人也能打到）',
+    !noId.body.includes('b1e6cc7c') && !noId.body.includes(ORIGIN2));
+  const withId = await askSub({ PASSWORD: 'dev', UUID: 'b1e6cc7c-9f8f-4f2c-9d2a-3b6f3f34d4b1' });
+  check('有节点身份时不再报「没身份」（闸门真的在上游生效）',
+    withId.body !== noId.body && !withId.body.includes('节点身份'),
+    `HTTP ${withId.status} ${withId.body.slice(0, 60)}`);
 }
 
 console.log(`\n=== ${fail === 0 ? '全部通过' : '存在失败'} ===`);
