@@ -1,0 +1,23 @@
+name: Panel Diagnose (temp)
+
+# 临时用：给线上面板做一次只读体检，定位「功能点不动」到底卡在哪一层。
+# 只用 Secrets 里的管理口令去打本站接口，不碰 Cloudflare 账号、不改任何数据。
+# 查完即删。
+
+on:
+  workflow_dispatch:
+
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Panel health check
+        env:
+          PROXY_HOST: ${{ vars.PROXY_HOST }}
+          PASSWORD: ${{ secrets.PASSWORD }}
+        run: node .github/scripts/diag-panel.mjs
