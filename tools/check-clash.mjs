@@ -152,8 +152,88 @@ section('3. sing-box JSON');
   }
 }
 
-// ===================== 4. 汇总 =====================
+// ===================== 4. /tsub 与 /sub 走同一条渲染 =====================
+//
+// 2026-09-20 的第二次故障：主订阅（/sub）改成本机渲染之后，临时订阅（/tsub/<id>）
+// 仍然把 clash / sing-box 交给外部订阅转换后端 —— 同一处单点故障，换了条路进来。
+// 判据不看源码里有没有那行调用，看运行时行为：引擎在本机（Node）必然因为 MD5 不可用
+// 抛错，只有 nativeSubResponse 会把异常兜成一条说人话的 503；
+// 走老路径的话异常会一路抛到调用方。所以「没抛 + 拿到 503」就是走了本机渲染的证据。
+{
+  const { bindRuntime, runtime } = await import(join(ROOT, 'src/runtime.js'));
+  const { handleRequest } = await import(join(ROOT, 'src/router.js'));
+  const { resetState } = await import(join(ROOT, 'src/memstore.js'));
+  const { invalidateDoc } = await import(join(ROOT, 'src/config.js'));
+  const { invalidateSite } = await import(join(ROOT, 'src/sites.js'));
+  const { invalidateSettings } = await import(join(ROOT, 'src/settings.js'));
+  const ORIGIN = 'https://proxy.example.com';
+  const PASSWORD = 'dev';
+  const UUID = 'b1e6cc7c-9f8f-4f2c-9d2a-3b6f3f34d4b1';
+
+  const boot = () => {
+    resetState(null, null);
+    invalidateDoc(); invalidateSite(); invalidateSettings();
+    const env = { PASSWORD, UUID };
+    bindRuntime(env);
+    return env;
+  };
+
+  // 4.1 临时订阅：带 Stash UA 的 clash 输出必须落在本机渲染上
+  {
+    const env = boot();
+    await runtime.KV.put('tempsub:t000000001', JSON.stringify({
+      id: 't000000001', name: '测试', uuid: 'c0ffee00-0000-4000-8000-000000000001',
+      created_at: new Date().toISOString(), expires_at: new Date(Date.now() + 86400000).toISOString(),
+      disabled: false,
+    }));
+    let res = null, thrown = null;
+    try {
+      res = await handleRequest(new Request(ORIGIN + '/tsub/t000000001', {
+        headers: { 'User-Agent': 'Stash/2.0 (iPhone; iOS 17.0)' },
+      }), env, {});
+    } catch (e) { thrown = e; }
+    ok('临时订阅不把异常往外抛（证明进了本机渲染那条路）', !thrown, thrown && thrown.message);
+    const body = res ? await res.text() : '';
+    ok('临时订阅的 clash 输出由本机渲染接管（不是外部转换后端的产物）',
+      !!res && res.status === 503 && /订阅本机渲染出错|节点身份/.test(body),
+      `HTTP ${res && res.status} ${body.slice(0, 60)}`);
+    ok('给客户端的是纯文本，不是伪装页 HTML',
+      !!res && (res.headers.get('content-type') || '').includes('text/plain')
+      && !body.trim().startsWith('<'), (res && res.headers.get('content-type')) || '');
+  }
+
+  // 4.2 主订阅同一条路：两边判据一致，以后改一头漏一头会被这里逮住
+  {
+    const env = boot();
+    const res = await handleRequest(new Request(ORIGIN + '/sub?token=x', {
+      headers: { 'User-Agent': 'Stash/2.0 (iPhone; iOS 17.0)' },
+    }), env, {});
+    const body = await res.text();
+    ok('主订阅同样由本机渲染接管', res.status === 503 && /订阅本机渲染出错|节点身份/.test(body),
+      `HTTP ${res.status} ${body.slice(0, 60)}`);
+  }
+
+  // 4.3 记录读不到时要响：响应仍是光秃秃的 404，但日志里说清是哪一种
+  {
+    const env = boot();
+    const errs = [];
+    const realErr = console.error;
+    console.error = (...a) => { errs.push(a.join(' ')); };
+    let res = null;
+    try {
+      res = await handleRequest(new Request(ORIGIN + '/tsub/t999999999', {
+        headers: { 'User-Agent': 'Stash/2.0 (iPhone; iOS 17.0)' },
+      }), env, {});
+    } finally { console.error = realErr; }
+    ok('记录不存在时响应是不解释原因的 404', res && res.status === 404 && (await res.text()) === 'Not Found');
+    ok('但病因进了日志（内存模式下「读不到记录」和「链接写错」长得一模一样）',
+      errs.some(l => l.includes('[tsub]') && l.includes('读不到该记录')),
+      errs.filter(l => l.includes('[tsub]')).join(' | ').slice(0, 90));
+  }
+}
+
+// ===================== 5. 汇总 =====================
 console.log(`\n=== ${fail === 0 ? '全部通过' : '存在失败'} ===`);
 if (fail) console.log('失败项：\n  - ' + failures.join('\n  - '));
-console.log(`本地订阅渲染：${pass + fail} 项，失败 ${fail} 项`);
+console.log(`本地订阅渲染：${pass + fail} 项，失败 ${fail} 项（含 /tsub 与 /sub 同路的运行时判据）`);
 process.exit(fail ? 1 : 0);

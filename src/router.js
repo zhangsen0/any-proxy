@@ -185,16 +185,9 @@ async function handleRequest(request, env, ctx) {
     // base64 与未识别的客户端维持原路径：引擎 mixed ＋ 国家标注 ＋ 延迟重排
     // （这两个增强只作用于原样输出，多格式响应已结构化，不做文本层面标注）。
     const fmt = String(url.searchParams.get('fmt') || '').toLowerCase();
-    const ua = (request.headers.get('User-Agent') || '').toLowerCase();
-    // UA 自动识别：客户端不用改链接就能拿到对的格式（Stash / mihomo / Clash 系
-    // 的 UA 都带自家名字；带 fmt 参数时以参数为准）。
-    const wantClash = fmt === 'clash' || fmt === 'clashyaml'
-      || (!fmt && /\b(clash|mihomo|stash|verge|meta)\b|clash\.(meta|verge)|mihomo\//.test(ua));
-    const wantSb = fmt === 'singbox' || fmt === 'sing-box' || fmt === 'sing'
-      || (!fmt && /sing-?box|\bsfa\b|\bsfm\b|\bsfi\b/.test(ua));
-    if (wantClash || wantSb) {
-      return await nativeSubResponse(request, url, env, ctx, wantClash ? 'clash' : 'singbox');
-    }
+    // 格式判定走 subOutputKind()（与 /tsub 共用一份），不再在这里自己判一遍 UA
+    const kind = subOutputKind(url, request);
+    if (kind) return await nativeSubResponse(request, url, env, ctx, kind);
     let subReq = request;
     if (fmt === 'base64' || fmt === 'b64') { url.searchParams.set('b64', '1'); subReq = new Request(url.toString(), request); }
     const resp = await vlessHandler.fetch(subReq, await engineEnv(env), ctx);
@@ -234,98 +227,23 @@ async function handleRequest(request, env, ctx) {
   }
 
   /**
+   * 订阅该输出成什么格式：'clash' / 'singbox' / ''（空 = 原样透传）。
+   *
+   * `/sub` 与 `/tsub/<id>` **共用这一份判定**。各写一份的话，「修好一头漏另一头」是
+   * 必然的结局：2026-09-20 把 `/sub` 的 clash 改成本机渲染之后，`/tsub` 仍然把 clash
+   * 交给外部订阅转换后端，于是主订阅好了、临时订阅照样坏 —— 同一处单点故障，换了条路进来。
+   */
+
+  /**
    * clash / sing-box 的本地渲染出口（native-sub.js 承担解析与渲染）。
    *
    * 内层再发一次 /sub、UA 定成浏览器：让引擎走 mixed 分支（本地生成、明文输出），
    * 这是整条订阅链里唯一不依赖外部服务的一环。token 原样带着 —— 引擎会校验，
    * 校验不过内层就是伪装页，那正好被下面「没有分享链接行」的判定接住，
    * 给客户端一个说人话的 503，而不是一份把客户端解析器炸掉的 HTML。
+   *
+   * @param {object} [opts] 临时订阅用：`token` 直接指定内层令牌、`uuid` 覆盖本请求的节点 ID。
    */
-  async function nativeSubResponse(req, subUrl, e, c2, kind) {
-    // 本函数的硬约束：**任何异常都不许往上抛**。抛上去的下场是 worker.js 的全局兜底
-    // 把它渲染成伪装 404 —— 客户端看到的不是「订阅没拿到」而是「链接不存在」，
-    // 排障的人会被引到完全错误的方向（2026-09-20 真实发生过）。所以这里自己兜：
-    // 出错回说人话的 503，异常摘要放进正文，看得见、查得到、不泄漏配置。
-    const say = (body, status, extra = {}) => new Response(body, {
-      status,
-      headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store', ...extra },
-    });
-    try {
-      // --- 先自查身份，再去要数据 -------------------------------------------------
-      // 这条链接的 token = MD5MD5(host + uuid)（引擎第 334 行），uuid 的取值顺序是
-      // 「存储里的 config.json → 环境变量 UUID → 拿管理员密码临时派生」。
-      // 内存模式下**冷启动的实例**前两条都没有，引擎就安静地走到第三条 —— 派生出来的
-      // uuid 跟发出链接时用的不是同一个，于是 token 校验不过、请求落进伪装页，
-      // 一路传到这儿只剩「一行节点都没有」。症状（没数据）和病因（没身份）隔着三层，
-      // 2026-09-20 为找出它花了整整一轮。所以这里先把身份问出来：缺就直接说，
-      // 别再让伪装页把病因藏起来。
-      // 正文里只讲「没有」，不吐任何 uuid / 域名取值 —— 这个端点陌生人也能打到。
-      let ident = { uuid: '', host: '' };
-      try {
-        ident = await nodeIdentity(e, subUrl.hostname);
-      } catch { ident = { uuid: '', host: '' }; }
-      if (!ident.uuid) {
-        const why = '本实例未取到节点身份：存储里的引擎配置读不到，环境变量 UUID 也没配。'
-          + '这条链接的令牌由「节点 ID + 域名」推导，缺了前者必然校验不过。';
-        console.error('[native-sub] ' + why + ' kind=' + kind);
-        return say('订阅当前不可用：' + why
-          + '请到管理面板把存储切回 D1/KV，或用环境变量 UUID 注入节点 ID 后重新部署。', 503);
-      }
-      const innerUrl = new URL(subUrl);
-      for (const k of ['fmt', 'clash', 'clashyaml', 'singbox', 'sing-box', 'sing', 'b64', 'base64', 'target', 'surge', 'quanx', 'loon']) {
-        innerUrl.searchParams.delete(k);
-      }
-      // cf 必须带上（inner 继承原请求的全部属性，再只改 UA）：引擎会读 request.cf.colo /
-      // cf.country（国家标注与运营商识别），手写 new Request(url, {headers}) 的话 cf 是
-      // undefined，引擎一读就 TypeError —— 「undefined (reading 'colo')」就是它。
-      const inner = new Request(innerUrl.toString(), {
-        method: 'GET',
-        headers: req.headers,
-        cf: req.cf,
-        redirect: 'manual',
-      });
-      inner.headers.set('User-Agent', 'Mozilla/5.0 (compatible; native-sub/1; +https://github.com/zhangsen0/any-proxy)');
-      const mixed = await vlessHandler.fetch(inner, await engineEnv(e), c2);
-      const text = await mixed.text();
-      const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
-      const share = lines.filter(l => /^(vless|trojan|ss):\/\//i.test(l));
-      if (!share.length) {
-        // 走到这儿说明身份是有的、token 也过了，但引擎没吐出任何分享链接。
-        // 分布式里最常见的两句病因分开说：引擎在空配置下会退回随机 IP（不至于零个节点），
-        // 所以「一个都没有」多半是这条路之外出了错（异常已被下面 catch 成 503 除外）。
-        console.error('[native-sub] 身份可用但没有节点输出：kind=' + kind
-          + ' status=' + mixed.status + ' bytes=' + text.length);
-        return say('订阅当前不可用：服务端没有取到节点清单。'
-          + '链接没错，稍后重试；若持续，请进管理面板看顶部运行模式。', 503);
-      }
-      // 引擎在 mixed 响应上带的流量信息头（Subscription-Userinfo 等）原样透传
-      const info = {};
-      for (const h of ['subscription-userinfo', 'profile-update-interval', 'profile-web-page-url']) {
-        const v = mixed.headers.get(h);
-        if (v) info[h] = v;
-      }
-      if (kind === 'clash') {
-        const r = renderClashYaml(share);
-        if (!r.yaml) return say(`订阅当前不可用：拿到 ${r.total} 行链接但一行都解析不出来。`, 503, info);
-        return say(r.yaml, 200, {
-          'Content-Type': 'application/x-yaml; charset=utf-8',
-          'Content-Disposition': `attachment; filename*=utf-8''${encodeURIComponent('config.yaml')}`,
-          ...(r.skipped ? { 'X-Sub-Skipped-Lines': String(r.skipped) } : {}),
-          ...info,
-        });
-      }
-      const r = renderSingboxJson(share);
-      if (!r.json) return say(`订阅当前不可用：拿到 ${r.total} 行链接但一行都解析不出来。`, 503, info);
-      return say(r.json, 200, {
-        'Content-Type': 'application/json; charset=utf-8',
-        ...(r.skipped ? { 'X-Sub-Skipped-Lines': String(r.skipped) } : {}),
-        ...info,
-      });
-    } catch (err) {
-      // 异常摘要进正文：这条 503 只会被拿着有效 token 的客户端（或排障的人）看到
-      return say('订阅本机渲染出错：' + String(err && err.message || err).slice(0, 160), 503);
-    }
-  }
 
   // ---- 陌生人：只允许「一个普通网站该有的东西」，其余一律伪装 404 ----
   if (stranger) {
@@ -480,30 +398,174 @@ const PUBLIC_GET = [
 ];
 
 /**
+ * 订阅该输出成什么格式：'clash' / 'singbox' / ''（空 = 原样透传）。
+ *
+ * `/sub` 与 `/tsub/<id>` **共用这一份判定**。各写一份的话，「修好一头漏另一头」是
+ * 必然的结局：2026-09-20 把 `/sub` 的 clash 改成本机渲染之后，`/tsub` 仍然把 clash
+ * 交给外部订阅转换后端，于是主订阅好了、临时订阅照样坏 —— 同一处单点故障，换了条路进来。
+ */
+function subOutputKind(url, request) {
+  const fmt = String(url.searchParams.get('fmt') || '').toLowerCase();
+  const ua = (request.headers.get('User-Agent') || '').toLowerCase();
+  if (fmt === 'clash' || fmt === 'clashyaml') return 'clash';
+  if (fmt === 'singbox' || fmt === 'sing-box' || fmt === 'sing') return 'singbox';
+  // 显式要原样的（含 base64）：一律不渲染
+  if (fmt) return '';
+  // 没有 fmt 时按 UA 自动识别 —— 客户端不用改链接就能拿到对的格式
+  if (/\b(clash|mihomo|stash|verge|meta)\b|clash\.(meta|verge)|mihomo\//.test(ua)) return 'clash';
+  if (/sing-?box|\bsfa\b|\bsfm\b|\bsfi\b/.test(ua)) return 'singbox';
+  return '';
+}
+
+async function nativeSubResponse(req, subUrl, e, c2, kind, opts = {}) {
+  // 本函数的硬约束：**任何异常都不许往上抛**。抛上去的下场是 worker.js 的全局兜底
+  // 把它渲染成伪装 404 —— 客户端看到的不是「订阅没拿到」而是「链接不存在」，
+  // 排障的人会被引到完全错误的方向（2026-09-20 真实发生过）。所以这里自己兜：
+  // 出错回说人话的 503，异常摘要放进正文，看得见、查得到、不泄漏配置。
+  const say = (body, status, extra = {}) => new Response(body, {
+    status,
+    headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store', ...extra },
+  });
+  try {
+    // --- 先自查身份，再去要数据 -------------------------------------------------
+    // 这条链接的 token = MD5MD5(host + uuid)（引擎第 334 行），uuid 的取值顺序是
+    // 「存储里的 config.json → 环境变量 UUID → 拿管理员密码临时派生」。
+    // 内存模式下**冷启动的实例**前两条都没有，引擎就安静地走到第三条 —— 派生出来的
+    // uuid 跟发出链接时用的不是同一个，于是 token 校验不过、请求落进伪装页，
+    // 一路传到这儿只剩「一行节点都没有」。症状（没数据）和病因（没身份）隔着三层，
+    // 2026-09-20 为找出它花了整整一轮。所以这里先把身份问出来：缺就直接说，
+    // 别再让伪装页把病因藏起来。
+    // 正文里只讲「没有」，不吐任何 uuid / 域名取值 —— 这个端点陌生人也能打到。
+    // 临时订阅自带节点 ID（记录在 tempsub:<id> 里），跳过派生路径那次自查。
+    let ident = { uuid: '', host: '' };
+    try {
+      ident = await nodeIdentity(e, subUrl.hostname);
+    } catch { ident = { uuid: '', host: '' }; }
+    if (opts.uuid) ident = { ...ident, uuid: opts.uuid };
+    if (!ident.uuid) {
+      const why = '本实例未取到节点身份：存储里的引擎配置读不到，环境变量 UUID 也没配。'
+        + '这条链接的令牌由「节点 ID + 域名」推导，缺了前者必然校验不过。';
+      console.error('[native-sub] ' + why + ' kind=' + kind);
+      return say('订阅当前不可用：' + why
+        + '请到管理面板把存储切回 D1/KV，或用环境变量 UUID 注入节点 ID 后重新部署。', 503);
+    }
+    const innerUrl = new URL(subUrl);
+    for (const k of ['fmt', 'clash', 'clashyaml', 'singbox', 'sing-box', 'sing', 'b64', 'base64', 'target', 'surge', 'quanx', 'loon']) {
+      innerUrl.searchParams.delete(k);
+    }
+    // 临时订阅的令牌是现算的（MD5MD5(host + 该记录的 UUID)），不是链接里带着的那个：
+    // 链接里的 /tsub/<id> 只是记录的门牌，引擎只认按 UUID 推出来的令牌。
+    // 用惰性函数而不是现成字符串传进来，是为了让「算令牌」这一步也落在兜底范围里 ——
+    // 算不出来同样是「订阅不可用」，不该变成一路抛上去、最后被渲染成伪装 404 的异常。
+    if (typeof opts.tokenOf === 'function') {
+      const t = await opts.tokenOf();
+      if (!t) {
+        return say('订阅当前不可用：本实例算不出这条临时订阅的令牌。', 503);
+      }
+      innerUrl.searchParams.set('token', t);
+    } else if (opts.token) {
+      innerUrl.searchParams.set('token', opts.token);
+    }
+    // cf 必须带上（inner 继承原请求的全部属性，再只改 UA）：引擎会读 request.cf.colo /
+    // cf.country（国家标注与运营商识别），手写 new Request(url, {headers}) 的话 cf 是
+    // undefined，引擎一读就 TypeError —— 「undefined (reading 'colo')」就是它。
+    const inner = new Request(innerUrl.toString(), {
+      method: 'GET',
+      headers: req.headers,
+      cf: req.cf,
+      redirect: 'manual',
+    });
+    inner.headers.set('User-Agent', 'Mozilla/5.0 (compatible; native-sub/1; +https://github.com/zhangsen0/any-proxy)');
+    const mixed = await vlessHandler.fetch(inner, await engineEnv(e, opts.uuid ? { UUID: opts.uuid } : {}), c2);
+    const text = await mixed.text();
+    const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
+    const share = lines.filter(l => /^(vless|trojan|ss):\/\//i.test(l));
+    if (!share.length) {
+      // 走到这儿说明身份是有的、token 也过了，但引擎没吐出任何分享链接。
+      // 分布式里最常见的两句病因分开说：引擎在空配置下会退回随机 IP（不至于零个节点），
+      // 所以「一个都没有」多半是这条路之外出了错（异常已被下面 catch 成 503 除外）。
+      console.error('[native-sub] 身份可用但没有节点输出：kind=' + kind
+        + ' status=' + mixed.status + ' bytes=' + text.length);
+      return say('订阅当前不可用：服务端没有取到节点清单。'
+        + '链接没错，稍后重试；若持续，请进管理面板看顶部运行模式。', 503);
+    }
+    // 引擎在 mixed 响应上带的流量信息头（Subscription-Userinfo 等）原样透传
+    const info = {};
+    for (const h of ['subscription-userinfo', 'profile-update-interval', 'profile-web-page-url']) {
+      const v = mixed.headers.get(h);
+      if (v) info[h] = v;
+    }
+    if (kind === 'clash') {
+      const r = renderClashYaml(share);
+      if (!r.yaml) return say(`订阅当前不可用：拿到 ${r.total} 行链接但一行都解析不出来。`, 503, info);
+      return say(r.yaml, 200, {
+        'Content-Type': 'application/x-yaml; charset=utf-8',
+        'Content-Disposition': `attachment; filename*=utf-8''${encodeURIComponent('config.yaml')}`,
+        ...(r.skipped ? { 'X-Sub-Skipped-Lines': String(r.skipped) } : {}),
+        ...info,
+      });
+    }
+    const r = renderSingboxJson(share);
+    if (!r.json) return say(`订阅当前不可用：拿到 ${r.total} 行链接但一行都解析不出来。`, 503, info);
+    return say(r.json, 200, {
+      'Content-Type': 'application/json; charset=utf-8',
+      ...(r.skipped ? { 'X-Sub-Skipped-Lines': String(r.skipped) } : {}),
+      ...info,
+    });
+  } catch (err) {
+    // 异常摘要进正文：这条 503 只会被拿着有效 token 的客户端（或排障的人）看到
+    return say('订阅本机渲染出错：' + String(err && err.message || err).slice(0, 160), 503);
+  }
+}
+
+/**
  * 临时订阅拉取 /tsub/<id>：客户端行为（订阅拉取不带任何本站 cookie），
  * 因此凭 id + 有效期自校验，不参与伪装门禁。
  */
 async function dispatchTempSub(request, url, env, ctx) {
   const m = url.pathname.match(/^\/tsub\/([^/]+)(\/.*)?$/);
   if (!m) return renderNotFoundFallback();
-  const rec = await getTempSub(decodeURIComponent(m[1]));
+  const sid = decodeURIComponent(m[1]);
+  const rec = await getTempSub(sid);
   if (!isTempSubActive(rec)) {
-    // 404 而非带明文原因的 403：不向探测者解释失败原因，也不暴露这是订阅端点
+    // 响应依旧是光秃秃的 404：不向探测者解释失败原因，也不暴露这是订阅端点。
+    // 但病因必须进日志 —— 「记录读不到」「已过期」「被停用」在客户端看起来一模一样，
+    // 不响就只能靠猜，而内存模式下冷启动实例恰恰全都读不到记录
+    // （与 docs/07-踩坑记录.md 第 30 条同源：失败要响，但不给陌生人看）。
+    console.error('[tsub] 临时订阅不可用 id=' + sid + '：'
+      + (!rec ? '读不到该记录（存储不可用，或记录根本不存在）'
+        : rec.disabled ? '已被手动停用' : '已过期 expires_at=' + rec.expires_at));
     return renderNotFoundFallback();
   }
   // 与主订阅同一口径计算 token：MD5MD5(host + uuid)。host 取「面板配的节点地址优先，
   // 否则本次请求的 hostname」—— 引擎拿到的身份由 engineEnv() 注入，两边必须同源，
   // 否则面板一配节点地址，临时订阅链接就会 404。
   const id = await nodeIdentity(env, url.hostname);
+  // 多格式输出走与主订阅**同一套**本机渲染（subOutputKind 两边共用）：
+  // 以前这里把 clash / sing-box 原样交给引擎，引擎再转给外部订阅转换后端 ——
+  // 于是 Stash（UA 带 clash）拉临时订阅时拿到的是那份坏掉的后端产物。
+  const kind = subOutputKind(url, request);
+  if (kind) {
+    const subUrl = new URL(request.url);
+    subUrl.pathname = '/sub';
+    return await nativeSubResponse(request, subUrl, env, ctx, kind, {
+      tokenOf: async () => await tempSubToken(id.host, rec.uuid),
+      uuid: rec.uuid,
+    });
+  }
+  // 令牌留到真要用的时候才算（上面那条路自己会算）：算它要动 MD5，任何一步失败
+  // 都不该变成一路抛上去、最后被全局兜底渲染成伪装 404 的异常。
   const token = await tempSubToken(id.host, rec.uuid);
   const subUrl = new URL(request.url);
   subUrl.pathname = '/sub';
   subUrl.searchParams.set('token', token);
-  const subReq = new Request(subUrl.toString(), request);
+  // cf 必须显式带上：`new Request(url, request)` 拿不拿得到 cf 取决于运行时实现，
+  // 而引擎一上来就要读 request.cf.colo（第 67 行拼默认反代地址），拿不到就是
+  // TypeError → 全局兜底 → 伪装页。宁可多写一行，也别赌。
+  const subReq = new Request(subUrl.toString(), {
+    method: request.method, headers: request.headers, cf: request.cf, redirect: 'manual',
+  });
   const resp = await vlessHandler.fetch(subReq, await engineEnv(env, { UUID: rec.uuid }), ctx);
-  // 临时订阅同样支持多格式输出：/tsub/<id>?fmt=clash|singbox|base64 → 引擎原生参数
-  const fmt = String(url.searchParams.get('fmt') || '').toLowerCase();
-  if (fmt === 'clash' || fmt === 'clashyaml' || fmt === 'singbox' || fmt === 'sing-box' || fmt === 'sing') return resp;
   // 临时订阅同样是订阅输出，备注规则与主订阅保持一致
   if (!(await subscriptionTaggingEnabled(env))) return resp;
   return await tagSubscriptionResponse(resp, await tagOpts(env, ctx));

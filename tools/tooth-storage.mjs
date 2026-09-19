@@ -122,8 +122,31 @@ const MUTANTS = [
   {
     file: 'router',
     name: '订阅不查身份（缺节点 ID 时只说「没节点」，病因被藏起来）',
-    from: "      if (!ident.uuid) {",
+    from: "    if (!ident.uuid) {",
     to: "      if (false) {",
+  },
+  {
+    file: 'router',
+    check: 'clash',
+    name: '临时订阅又改回交给外部转换后端（主订阅好了、/tsub 照样坏）',
+    from: "  const kind = subOutputKind(url, request);\n  if (kind) {\n    const subUrl = new URL(request.url);",
+    to: "  const kind = null;\n  if (kind) {\n    const subUrl = new URL(request.url);",
+  },
+  {
+    file: 'router',
+    check: 'clash',
+    name: '格式判定不再看 UA（Stash 这类客户端拿不到 YAML）',
+    from: "  if (/\\b(clash|mihomo|stash|verge|meta)\\b|clash\\.(meta|verge)|mihomo\\//.test(ua)) return 'clash';",
+    to: "  if (false) return 'clash';",
+  },
+  {
+    file: 'router',
+    check: 'clash',
+    // 改成 console.log 而不是删掉这行：删掉会把源码弄成语法错误，那属于「崩了」，
+    // 而这里要验的是「静默」—— 崩不崩是另一回事，混在一起反而验不出东西
+    name: '临时订阅读不到记录时不响（和「链接写错」长得一样，只能靠猜）',
+    from: "    console.error('[tsub] 临时订阅不可用 id=' + sid + '：'",
+    to: "    console.log('[tsub] 临时订阅不可用 id=' + sid + '：'",
   },
   {
     file: 'memstore',
