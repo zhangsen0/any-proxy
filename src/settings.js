@@ -34,6 +34,9 @@ import {
   sanitize, invalidateDoc, CONFIG_KEY, coerceBySpec, CONFIG_CACHE_TTL_MS,
 } from './config.js';
 import { runtime, notifyConfigChange, onConfigChange } from './runtime.js';
+// 单向依赖：settings → memstore。反过来不行（memstore 包着 runtime.KV，
+// 而读这张配置表也要过 runtime.KV，互相 import 就成环）。
+import { setFailThreshold } from './memstore.js';
 import { isUuid, parseIpv4List, parseDomainList } from './util.js';
 
 /** 配置文档里的分区名。整表存 APP_CONFIG[section]，与其它模块的分区同一份文档、同一份缓存。 */
@@ -53,6 +56,7 @@ export const SETTINGS_GROUPS = [
   { id: 'proxy', name: '代理与转发', desc: '优选目标域名与转发侧的可用性取舍。' },
   { id: 'cloudflare', name: 'Cloudflare 接口', desc: '「CF 用量」驾驶舱与 DNS 优选调用 CF API 所需的凭据与端点。凭据只回显「是否已配置」。' },
   { id: 'ops', name: '运维与隐私', desc: '面板上的运维入口与来访者哈希盐值。' },
+  { id: 'storage', name: '存储与降级', desc: '存储读写失败多久之后退到内存模式，以及这条降级对你意味着什么。' },
 ];
 
 // ===================== 字段表 =====================
@@ -434,6 +438,19 @@ export const SETTINGS_SPEC = {
     group: 'ops', label: '来访者哈希盐值', wide: true,
     hint: '只用于给来访 IP 做哈希，原始 IP 不出内存；留空则自动生成并长期保持不变',
   },
+
+  // ---------- 存储与降级 ----------
+  //
+  // 阈值**由这里统一定义**，再同步给 memstore.js（见文件末尾 setFailThreshold 的调用）。
+  // 之所以不直接让 memstore 来读这个表：memstore 包着 runtime.KV，而读这张表要过
+  // runtime.KV —— 让它们互相 import 就成环了。所以这里是定义处，那里是用处。
+  storage_fail_threshold: {
+    type: 'int', default: 3, min: 1, max: 20, env: 'STORAGE_FAIL_THRESHOLD',
+    legacyKey: 'STORAGE_FAIL_THRESHOLD', panel: 'storage-status',
+    group: 'storage', label: '降级阈值', unit: '次',
+    hint: '连续失败这么多次才切到内存模式；**任何一次成功都会把计数清零**，'
+      + '所以偶尔抖一下不会被误判。调小会更容易降级，调大则在存储真的坏掉时要多扛几次失败',
+  },
 };
 
 /** 只有这些字段的取值语义是「空 = 有意义的空」，其余空值一律视为「没配，用默认值」 */
@@ -679,6 +696,9 @@ export async function readSettings(env) {
   }
   const values = await computeSettings(env);
   settingsCache = { env, values, ts: Date.now() };
+  // 把降级阈值同步给 memstore。它不能自己读这张表（会与 runtime.KV 成环），
+  // 所以约定由这里——唯一会完整读一遍配置的地方——顺手喂进去。
+  setFailThreshold(values.storage_fail_threshold);
   return { ...values };
 }
 

@@ -270,6 +270,50 @@ export const API_CATALOG = [
     ],
   },
   {
+    id: 'storage',
+    name: '存储运行模式',
+    desc: '存储（D1 / KV）读写失败时 Worker 会自动切到内存模式，让服务继续可用 —— 这是逃生通道，'
+      + '不是第二套存储：内存里的东西实例回收就没了，所以恢复之后要「写回」才会真正留下。'
+      + '是否自动切换、连续失败几次才切，由下面这页的降级阈值决定。',
+    items: [
+      {
+        id: 'storage-status', name: '当前存储状态', kind: 'setting', method: 'GET', path: '/__api/storage',
+        desc: '当前运行模式（存储 / 内存）、后端、生效范围、内存键数与尚未写回的键数，以及最近 20 条降级 / 写回事件', auth: true,
+        params: [
+          {
+            key: 'storage_fail_threshold', label: '降级阈值', type: 'number', unit: '次',
+            hint: '连续失败这么多次才切到内存模式；任何一次成功都会把计数清零，偶尔抖一下不会被误判',
+          },
+        ],
+      },
+      {
+        id: 'storage-to-memory', name: '切到内存模式', kind: 'action', method: 'POST', path: '/__api/storage',
+        desc: '手动切入内存模式，并把此刻能读到的站点与配置先搬进内存；之后所有读写都不落盘', auth: true,
+        body: { mode: 'memory' },
+      },
+      {
+        id: 'storage-to-storage', name: '切回存储模式', kind: 'action', method: 'POST', path: '/__api/storage',
+        desc: '切回真实存储。**不会自动发生** —— 哪怕存储已经恢复，也必须手动点一次，避免半好的存储被反复切换', auth: true,
+        body: { mode: 'storage' },
+      },
+      {
+        id: 'storage-probe', name: '检测存储是否恢复', kind: 'action', method: 'POST', path: '/__api/storage',
+        desc: '只读地探一次存储的可用性，不动当前模式；面板用它决定切回之前要不要先提示', auth: true,
+        body: { action: 'probe' },
+      },
+      {
+        id: 'storage-flush', name: '写回（跳过冲突）', kind: 'action', method: 'POST', path: '/__api/storage',
+        desc: '把内存期间的改动搬回存储；某个键在存储里已被别处改过时**跳过并列出**冲突，不会覆盖别人的新数据', auth: true,
+        body: { action: 'flush' },
+      },
+      {
+        id: 'storage-flush-force', name: '写回（覆盖冲突）', kind: 'action', method: 'POST', path: '/__api/storage',
+        desc: '同上，但冲突时也以内存值为准强行覆盖 —— 确认降级期间没有别的实例写入过再点', auth: true,
+        body: { action: 'flush', force: true },
+      },
+    ],
+  },
+  {
     id: 'subscription',
     name: '代理节点与订阅',
     desc: '订阅里出现的节点身份、订阅链接、节点国家标注与临时订阅，在「代理节点」选项卡里管理。'

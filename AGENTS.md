@@ -63,6 +63,10 @@ api('/__api/sites').then(r => { const sites = (r.data && r.data.sites) || []; })
 
 写完检查脚本，把代码**故意还原成旧写法**，断言检查必须变红，再还原。没红过的检查是空转的摆设。历史事故：某条规则 `allow: ['src/subs.js']` 按文件放行，而合法声明与违规兜底同在一个文件里，退化悄悄通过。
 
+判定要分两种红：**干净的红**（打印出失败项）才算通过；**崩溃只是非 0 退出码**，读到的是一屏调用栈而不是哪一条约定被违反了，夜里排障时等于没提示。为此断言里的读取要用会吞异常的助手（见 `check-storage.mjs` 的 `read()`），让坏实现得到一个可读的哨兵值。写一批对照脚本时同理：先判退出码，再数失败项 —— 只数失败项会把崩溃误报成「这段检查没有牙齿」（详见 [07-踩坑记录](./docs/07-踩坑记录.md) 第 26 条）。
+
+**能做成就做成脚本**：把「故意改坏」这件事本身落成一条命令（`tools/tooth-storage.mjs` 是第一个），否则这一遍只在做它的当天有效。此类脚本改动源文件，必须在 `process.on('exit')` 与 `uncaughtException` 里挂还原钩子。
+
 ## 6. 异步与运行时约束
 
 - Workers 里 `ctx.waitUntil` 必须在 **Response 返回之前**注册；流式响应的字节计数用「Promise 占位 + TransformStream flush 里 resolve」模式（见 `worker.js` 的 `countResponseBytes`）。在 flush 里才调 `waitUntil` 会被运行时静默丢弃（症状：流量统计恒为 0 B）。
@@ -76,11 +80,11 @@ CF 边缘（workers.dev 与自定义域行为一致）会：① 改写入站 `Ac
 ## 7. 提交与部署纪律
 
 - 提交信息一律**中文**。
-- 提交前跑全套：仓库里的 `tools/check-*.mjs` **一套都不能漏**（当前 21 套纯离线：
+-   提交前跑全套：仓库里的 `tools/check-*.mjs` **一套都不能漏**（当前 22 套纯离线：
   `check-rewrite / check-disguise / check-nodetag / check-anycast / check-themes / check-compress /
   check-hls / check-media / check-path / check-heal / check-smoke / check-guard / check-stats /
   check-configui / check-single-source / check-settings / check-preferred / check-cf-panel /
-  check-site-modes / check-latency / check-wrangler`）+ `node tools/gen-manual.mjs --check`。
+  check-site-modes / check-latency / check-wrangler / check-storage`）+ `node tools/gen-manual.mjs --check`。
   一行搞定：`for f in tools/check-*.mjs; do node "$f" || echo "FAIL $f"; done`（`check-live` 需要参数会自动退出，忽略它的 usage 提示即可）。
 - **新增 check 脚本必须同时挂进 `.github/workflows/verify.yml` 的 unit job**，
   否则它只在写它的那个人本机跑过 —— 本地跑过 ≠ 明天也被拦住。历史上一次性漏了三套

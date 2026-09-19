@@ -173,9 +173,17 @@ def main():
         text = fh.read()
 
     # ---- 1. 裁剪：只留实际使用的后端 ----
+    #
+    # memory 是 D1 / KV 配额打满（或资源暂时建不出来）时的退路：两个绑定一起摘掉，
+    # Worker 起来后全部读写落在进程内内存里。这一路的收益是**连 D1 迁移都不跑了** ——
+    # 配额见底时 migrations apply 自己也会失败，本来学生证都办不下来，更别说部署。
     if backend == 'kv':
         text = cutSection(text, '[[d1_databases]]')
         log('kv 模式：已移除 D1 绑定，保留 KV')
+    elif backend == 'memory':
+        text = cutSection(text, '[[d1_databases]]')
+        text = cutSection(text, '[[kv_namespaces]]')
+        log('memory 模式：D1 与 KV 绑定都已移除，全部读写走进程内内存')
     else:
         text = cutSection(text, '[[kv_namespaces]]')
         log('d1 模式：已移除 KV 绑定，保留 D1')
@@ -183,7 +191,9 @@ def main():
     # ---- 2. 取值 ----
     values = {'WORKER_NAME': envOr('WORKER_NAME', DEFAULT_WORKER)}
     values['GH_ACTIONS_URL'] = resolveActionsUrl()
-    if local:
+    if local or backend == 'memory':
+        # 这两个占位符在 memory 模式下已经随整段被删掉了，填什么都不会出现在产物里；
+        # 但 render() 要求每个占位符都有人管，所以给一个明确的中性值，不留空串。
         values['D1_DATABASE_ID'] = LOCAL_ID
         values['KV_NAMESPACE_ID'] = LOCAL_ID
         values['R2_BUCKET_NAME'] = R2_NAME

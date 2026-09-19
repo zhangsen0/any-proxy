@@ -1,7 +1,10 @@
 import { json, esc, kvKey, validTarget, parseIpv4List, parseDomainList } from './util.js';
-import { toBool } from './config.js';
-import { runtime } from './runtime.js';
+import { toBool, invalidateDoc } from './config.js';
+import { runtime, notifyConfigChange } from './runtime.js';
 import { listSites, getSite, autoSlug, validSlug, buildTarget, addSite, invalidateSite } from './sites.js';
+import {
+  wrapStorage, stateOf, getStatus, setStorageMode, flush, probe,
+} from './memstore.js';
 import { DEFAULT_SITE_MODES, getSiteModes, saveSiteModes, resolveEngine, siteBadge, SITE_ENGINES, BADGE_CLASSES } from './site-modes.js';
 import { readR2Config, saveR2Config, R2_CACHE_SPEC, R2_PREFIX } from './media-r2.js';
 import { sweepMediaR2 } from './proxy.js';
@@ -84,6 +87,81 @@ function pickLimits(cfg) {
     concurrency: num('pick_concurrency'),
     timeout_ms: num('pick_timeout_ms'),
   };
+}
+
+/**
+ * 面板顶部的**运行模式状态条**。
+ *
+ * 为什么放在这里而不是某个选项卡里：内存模式下所有读写都不落盘，这关系到
+ * 「你现在改的东西明天还在不在」，属于第一眼就该知道的事。藏在选项卡里，
+ * 自动降级的那几分钟里没人会主动翻到那一屏。
+ *
+ * 服务端直接渲染（不等前端拉接口）—— 降级通常伴随存储不可用，
+ * 那一刻接口本身也可能是坏的，贵不了的「第一屏就对」比什么都重要。
+ *
+ * ⚠️ 文案上的硬约束：自动降级**不能**说成「全站内存模式」。Workers 有多少 isolate
+ * 不受我们控制，自动降级大概率只影响当前这一个实例。必须按 scope 说实话。
+ */
+function renderModeBar(env) {
+  const s = stateOf(runtime.KV);
+  const st = s ? getStatus(s) : null;
+  const backend = storageBackendName(env);
+  if (!st) return '';
+
+  if (st.mode !== 'memory') {
+    return `<div class="membar store">
+      <div class="membar-body">
+        <div>运行模式：<b>存储模式</b>（后端 <code>${esc(backend)}</code>）</div>
+        <div class="membar-sub">读写直接落到存储；连续失败 ${st.failThreshold} 次会自动切到内存模式。</div>
+      </div>
+      <div class="membar-acts">
+        <button type="button" id="memProbeBtn">检测存储</button>
+        <button type="button" id="memToMemBtn">切到内存模式</button>
+      </div>
+    </div>`;
+  }
+
+  // ⚠️ 每个 scope 的措辞都必须经得起推敲：global 说的是「模式」在全站生效，
+  // 不是说「数据」留得住 —— 内存的隔离失效/冷启动即丢，跟 scope 是哪一档无关。
+  const scopeText = {
+    global: '全站均为内存模式（模式来自环境变量；数据仍需写回才留得住）',
+    'global-best-effort': '已尽力让其它实例也跟进',
+    isolate: '仅当前边缘实例 —— 其它实例可能仍在读存储',
+  }[st.scope] || st.scope;
+
+  return `<div class="membar mem">
+    <div class="membar-body">
+      <div>⚠️ 运行模式：<b>内存模式</b>（后端 <code>${esc(backend)}</code>）</div>
+      <div class="membar-sub">
+        改动都在内存里，冷启动或实例回收即丢失 —— 恢复后要写回存储才会真正留下。
+        生效范围：${esc(scopeText)}。
+      </div>
+      <div class="membar-sub">
+        内存键 ${st.memKeys} 个，其中 <b>${st.dirtyKeys}</b> 个还没写回${st.reason ? '；降级原因：' + esc(st.reason) : ''}${st.overflow ? '；⚠️ 已达内存上限' : ''}
+      </div>
+    </div>
+    <div class="membar-acts">
+      <button type="button" id="memProbeBtn">检测存储</button>
+      <button type="button" id="memFlushBtn">写回存储</button>
+      <button type="button" id="memForceBtn">写回（覆盖冲突）</button>
+      <button type="button" id="memBackBtn">切回存储模式</button>
+    </div>
+  </div>`;
+}
+
+/** 当前配置的存储后端名（d1 / kv / memory），状态条与接口共用同一处口径 */
+function storageBackendName(env) {
+  return String((env && env.STORAGE_BACKEND) || 'd1').toLowerCase();
+}
+
+/**
+ * 切完存储模式之后必须做的三件事：把各级缓存从旧后端的数据里解放出来。
+ * 少清一层就等于「切了模式、行为没变」，而这类症状通常要过好几秒才被察觉。
+ */
+function afterModeSwitch() {
+  invalidateDoc();               // config.js 那份按 3 秒 TTL 复用的配置文档
+  notifyConfigChange('storage'); // 各模块注册进来的进程内快照（settings 缓存等）
+  invalidateSite();              // 站点缓存写的是站点分区，config 钩子管不到它
 }
 
 async function handleAdmin(request, url, env) {
@@ -490,6 +568,45 @@ async function handleAdmin(request, url, env) {
         return json({ ok: true, config: saved });
       } catch (e) {
         return json({ error: '保存失败：' + String(e && e.message || e).slice(0, 200) }, 400);
+      }
+    }
+  }
+
+  // GET / POST /__api/storage -> 存储模式与健康状态
+  //
+  // 刻意把三件事做成返回值，让面板没法替用户粉饰现状：
+  //   scope     —— 内存模式到底管多大范围（isolate = 只在这个边缘实例，别的可能还在读坏存储）
+  //   dirtyKeys —— 内存里改过、还没写回存储的键数（切回去之前必须让用户看见）
+  //   events    —— 最近 20 条降级 / 写回 / 探测事件
+  //
+  // ⚠️ 切完模式必须广播缓存失效：config.js 那份文档与各模块的进程内快照都还是按旧后端
+  // 建的，不清就等于「切了模式、行为没变」——正是本项目最忌讳的那类症状。
+  if (path === '/__api/storage') {
+    const s = stateOf(runtime.KV);
+    if (request.method === 'GET') {
+      return json({ ok: true, status: s ? getStatus(s) : null, backend: storageBackendName(env) });
+    }
+    if (request.method === 'POST') {
+      let body;
+      try { body = await request.json(); } catch { return json({ error: 'invalid json' }, 400); }
+      if (!s) return json({ error: '存储尚未绑定' }, 400);
+      try {
+        if (body.action === 'probe') {
+          const r = await probe(s);
+          return json({ ok: r.ok, probe: r, status: getStatus(s) });
+        }
+        if (body.action === 'flush') {
+          const r = await flush(s, { force: !!body.force });
+          return json({ ...r, status: getStatus(s) }, r.ok ? 200 : 400);
+        }
+        if (body.mode === 'memory' || body.mode === 'storage') {
+          const r = await setStorageMode(s, body.mode) || {};
+          afterModeSwitch();
+          return json({ ok: true, mode: s.mode, preload: r, status: getStatus(s) });
+        }
+        return json({ error: '未知的 action / mode' }, 400);
+      } catch (e) {
+        return json({ error: '操作失败：' + String(e && e.message || e).slice(0, 200) }, 400);
       }
     }
   }
@@ -1140,6 +1257,19 @@ async function adminPage(authed, origin, env) {
   h1 { font-size:22px; margin:0 0 6px; letter-spacing:-.01em; }
   .sub { color:var(--muted); font-size:13px; margin:0 0 var(--sp-4); line-height:1.7; }
   .card { background:var(--card); border:1px solid var(--line); border-radius:var(--radius); padding:var(--card-pad); margin-bottom:var(--sp-3); box-shadow:var(--shadow); transition:border-color .15s, box-shadow .15s; }
+  /* 运行模式状态条：放在 topbar 正下方、常驻每一屏，不下某个选项卡 ——
+     存储是不是还在方案 A 上跑着，属于「第一眼就该知道」的事，
+     藏在某个选项卡里等于没说（而且自动降级时没人会主动去翻那一屏）。 */
+  .membar { display:flex; align-items:flex-start; gap:12px; flex-wrap:wrap; padding:12px 16px; border-radius:var(--radius); margin-bottom:var(--sp-3); border:1px solid; font-size:13px; line-height:1.7; }
+  .membar.mem  { background:var(--err-bg); border-color:var(--err); color:var(--err); }
+  .membar.store { background:var(--ok-bg); border-color:var(--ok); color:var(--ok); }
+  .membar b { font-weight:700; }
+  .membar-body { flex:1 1 320px; min-width:0; }
+  .membar-sub { opacity:.85; font-size:12px; margin-top:2px; }
+  .membar-acts { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+  .membar-acts button { padding:7px 12px; font-size:12px; font-weight:600; background:transparent; border:1px solid currentColor; }
+  .membar-acts button:hover { background:rgba(127,127,127,.12); }
+  .membar code { font-size:11px; }
   .card > h2:first-child { margin-top:0; }
   .card h2 { font-size:15px; margin:0 0 var(--sp-3); font-weight:600; }
   /* 站点/代理等页的栅格与配置页 .cfg-grid 用同一套列公式（都走 --field-min），
@@ -1241,6 +1371,8 @@ ${themeScript}
         : '<a class="ghost-link" href="/__login">登录</a>'}
     </div>
   </div>
+
+  ${authed ? renderModeBar(env) : ''}
 
   ${authed ? `
   <nav class="tabs" id="paneTabs">
@@ -1610,6 +1742,60 @@ function setMsg(id, text, isErr) {
   el.textContent = text;
   el.className = 'msg ' + (isErr ? 'err' : 'ok');
 }
+
+// ---------- 顶部的运行模式状态条 ----------
+//
+// 它要回答用户真正关心的三件事：现在跑在什么模式上、我改的东西会不会丢、什么时候能切回去。
+// 所以每个动作的**结果都要报数字**（写了几个 / 跳过几个 / 还剩几个没写回），
+// 不能只说「操作成功」——那句「成功」跟用户想知道的完全不是一回事。
+(function initModeBar() {
+  const post = (body) => api('/__api/storage', { method: 'POST', body: JSON.stringify(body) });
+  const reload = () => setTimeout(() => location.reload(), 800);
+  const on = (id, fn) => { const el = document.getElementById(id); if (el) el.onclick = fn; };
+
+  on('memProbeBtn', async () => {
+    const r = await post({ action: 'probe' });
+    const p = r.data.probe || {};
+    alert(p.ok ? '存储已可用：' + (p.detail || '') : '存储仍不可用：' + (p.error || r.data.error || '未知原因'));
+  });
+
+  on('memToMemBtn', async () => {
+    if (!confirm('切到内存模式后，改动只写在内存里，实例回收或冷启动即丢失。确定吗？')) return;
+    const r = await post({ mode: 'memory' });
+    if (!r.data.ok) { alert('切换失败：' + (r.data.error || '')); return; }
+    const ld = r.data.preload || {};
+    alert('已切到内存模式。预加载 ' + (ld.loaded || 0) + ' 个键'
+      + (ld.failed ? '，失败 ' + ld.failed + ' 个' : '')
+      + (ld.truncated ? '（列表被截断，部分键没搬过来）' : ''));
+    reload();
+  });
+
+  const doFlush = (force) => async () => {
+    if (force && !confirm('覆盖模式会把内存值强行写回，可能盖掉降级期间别的实例写入的新数据。确定吗？')) return;
+    const r = await post({ action: 'flush', force: !!force });
+    const d = r.data || {};
+    alert('写回 ' + ((d.written || []).length) + ' 个'
+      + '\n跳过（存储里已被改过）' + ((d.skipped || []).length) + ' 个'
+      + '\n失败 ' + ((d.failed || []).length) + ' 个'
+      + '\n还剩 ' + (d.pending || 0) + ' 个没写回'
+      + ((d.error ? '\n\n错误：' + d.error : '')));
+    reload();
+  };
+  on('memFlushBtn', doFlush(false));
+  on('memForceBtn', doFlush(true));
+
+  on('memBackBtn', async () => {
+    const r = await post({ action: 'probe' });
+    if (!(r.data.probe && r.data.probe.ok)) {
+      // 切回去之前先替用户问一句：存储还坏着的时候切回去，等于下一秒再降级一次
+      if (!confirm('存储此刻还不可用，切回去很可能立刻又降级。仍要切吗？')) return;
+    }
+    const res = await post({ mode: 'storage' });
+    if (!res.data.ok) { alert('切换失败：' + (res.data.error || '')); return; }
+    alert('已切回存储模式。');
+    reload();
+  });
+})();
 
 function copyText(text, btn, doneMsgId) {
   const done = () => {

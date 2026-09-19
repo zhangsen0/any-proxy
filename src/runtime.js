@@ -1,13 +1,26 @@
 // Cloudflare 注入的运行时绑定集中放在这里：所有模块共享同一份引用，避免各处各存一份副本
 
 import { createD1KV } from './storage.js';
+import { wrapStorage } from './memstore.js';
 
 export const runtime = { KV: undefined, PASSWORD: undefined };
 
-/** 每个请求进来时把平台注入的绑定挂到共享容器上。STORAGE_BACKEND 由 GitHub 环境变量控制。 */
+/**
+ * 每个请求进来时把平台注入的绑定挂到共享容器上。STORAGE_BACKEND 由 GitHub 环境变量控制。
+ *
+ * 三个后端：d1（默认）/ kv / memory。第三个不碰任何存储，全部落在进程内内存里，
+ * 用在 D1 / KV 配额打满或绑定缺失的时候 —— 宁可退化运行，也不要整站不可用。
+ *
+ * 三个后端之上都套一层 wrapStorage：它在真实存储读写出问题时自动切到内存，
+ * 保证上层拿到的永远是一个「能用的」KV 同形对象。
+ */
 export function bindRuntime(env) {
-  const backend = String(env && env.STORAGE_BACKEND || 'd1').toLowerCase();
-  runtime.KV = backend === 'kv' ? env && env.SITES : (env && env.DB ? createD1KV(env.DB) : env && env.SITES);
+  const backend = String((env && env.STORAGE_BACKEND) || 'd1').toLowerCase();
+  let raw = null;
+  if (backend === 'kv') raw = env && env.SITES;
+  else if (backend === 'memory') raw = null;      // 显式不用存储
+  else raw = env && env.DB ? createD1KV(env.DB) : env && env.SITES;
+  runtime.KV = wrapStorage(raw, env);
   runtime.PASSWORD = env && env.PASSWORD;
   return runtime;
 }
