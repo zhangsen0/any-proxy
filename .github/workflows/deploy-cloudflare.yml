@@ -4,6 +4,14 @@ on:
   push:
     branches: [master]
   workflow_dispatch:
+    inputs:
+      skip_migrations:
+        # 正常情况下不要勾：迁移负责建表，新环境没表会缺功能。
+        # 只在「表早就存在、且 D1 配额打满导致连 wrangler migrations apply 都跑不动」时，
+        # 用它把部署本身完成掉 —— 跳过的是重复的建表动作，不是数据迁移。
+        description: '跳过 d1 迁移（默认关。仅在表已存在且 D1 配额打满时用）'
+        type: boolean
+        default: false
 
 concurrency:
   group: workers-deploy
@@ -50,6 +58,11 @@ jobs:
       # 部署脚本从这里拿完整变量清单、只挑出种子那几段 —— 所以新增分段不用改这个文件。
       # ⚠️ 只写进 /tmp 的文件，不往日志里打印（里面有站点配置）。
       REPO_VARS_JSON: ${{ toJSON(vars) }}
+      # 只有「手动触发＋勾选 skip_migrations」才跳过 d1 迁移；push 触发这里恒为空（不跳过）。
+      # 迁移的作用是建表；跳过它不等于跳过数据，表在配额打满前早就建好了。
+      # 它能派上用场的唯一场景：配额打满时连 wrangler migrations apply 都跑不动，
+      # 但 Worker 本身还想带着 d1 绑定重新部署上线。
+      ANYPROXY_SKIP_MIGRATIONS: "${{ github.event.inputs.skip_migrations == 'true' && '1' || '' }}"
     steps:
       - name: Checkout
         uses: actions/checkout@v4

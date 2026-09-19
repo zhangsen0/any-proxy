@@ -312,12 +312,20 @@ def main():
         log('内存模式种子：%d 段，共 %d 字节' % (len(seed), sum(len(v) for _, v in seed)))
 
     # ---- 4. d1 模式：建表 ----
-    if backend == 'd1' and not local and not os.environ.get('ANYPROXY_SKIP_MIGRATIONS'):
-        subprocess.run(
-            ['npx', 'wrangler', 'd1', 'migrations', 'apply', D1_NAME, '--remote'],
-            check=True,
-        )
-        log('d1 模式：迁移已应用')
+    if backend == 'd1' and not local:
+        if os.environ.get('ANYPROXY_SKIP_MIGRATIONS'):
+            # 只能由「手动触发 ＋ 勾选 skip_migrations」走到这里（开关怎么用写在
+            # deploy-cloudflare.yml 的 inputs 说明里）。跳过必须在日志里喊一声：
+            # 静默跳过的下场是 —— 哪天真的换了新库，部署一片绿，上去才发现没表。
+            log('警告：已跳过 d1 迁移（ANYPROXY_SKIP_MIGRATIONS）。'
+                '本次部署不会建表，前提是目标库里的表早就存在；'
+                '换了新的空库请务必去掉这个开关重跑一次。')
+        else:
+            subprocess.run(
+                ['npx', 'wrangler', 'd1', 'migrations', 'apply', D1_NAME, '--remote'],
+                check=True,
+            )
+            log('d1 模式：迁移已应用')
 
 
 if __name__ == '__main__':
