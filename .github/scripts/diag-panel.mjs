@@ -78,6 +78,45 @@ async function main() {
   console.log('\n=== 存储探测（只读）===');
   const probe = await call('POST', '/__api/storage', { action: 'probe' });
   console.log('  probe →', probe.status, probe.text.slice(0, 300).replace(/\s+/g, ' '));
+
+  // ---- 多 isolate 判定：连写连读，看改动能不能稳定读回来 ----
+  //
+  // 内存模式最大的隐患是「每个实例各有一份内存」：Cloudflare 不会把同一个访客
+  // 固定钉在一个 isolate 上，于是「写进 A、读回 B」时改动就像没发生过。
+  // 单进程本地测不出来，只能在线上拿多轮统计说话。
+  console.log('\n=== 写入→读回 一致性（30 轮）===');
+  const base = await call('GET', '/__api/settings?t=' + Date.now());
+  const orig = (JSON.parse(base.text).config || {}).pool_limit;
+  console.log('  原 pool_limit =', orig);
+  let same = 0, diff = 0, errs = 0;
+  const seen = new Set();
+  for (let i = 1; i <= 30; i++) {
+    const want = 20 + (i % 7);
+    try {
+      const w = await call('POST', '/__api/settings', { pool_limit: want });
+      if (w.status !== 200) { errs++; seen.add('写 HTTP ' + w.status); continue; }
+      const g = await call('GET', '/__api/settings?t=' + Date.now());
+      const got = (JSON.parse(g.text).config || {}).pool_limit;
+      if (got === want) same++; else { diff++; seen.add(`写 ${want} 读回 ${got}`); }
+    } catch (e) { errs++; seen.add('EXC ' + String(e && e.message).slice(0, 60)); }
+  }
+  console.log(`  一致 ${same} / 不一致 ${diff} / 出错 ${errs}`);
+  for (const s of seen) console.log('    ·', s);
+
+  // 恢复原值（尽力而为）
+  try { await call('POST', '/__api/settings', { pool_limit: orig }); } catch { /* 忽略 */ }
+  const after = await call('GET', '/__api/settings?t=' + Date.now());
+  console.log('  已尝试恢复原值，当前读到:', (JSON.parse(after.text).config || {}).pool_limit);
+
+  // ---- 站点改动的一致性（更能代表用户实际操作）----
+  console.log('\n=== 站点列表一致性（20 轮）===');
+  const counts = new Map();
+  for (let i = 0; i < 20; i++) {
+    const r = await call('GET', '/__api/sites?t=' + Date.now());
+    const n = (JSON.parse(r.text).sites || []).length;
+    counts.set(n, (counts.get(n) || 0) + 1);
+  }
+  console.log('  站点数量分布:', [...counts.entries()].map(([n, c]) => `${n}个×${c}`).join('  '));
 }
 
 await main();

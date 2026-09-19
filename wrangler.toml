@@ -11,7 +11,7 @@
 #   - 健康检查链接 → 按 GITHUB_REPOSITORY 拼成你自己仓库的地址
 # 所以 fork 之后**不用改这个文件**，也不用去控制台抄 ID。
 # 本地 `wrangler dev` 前先跑一次同一脚本（加 --local，用占位 ID，不碰云端资源）。
-name = "__WORKER_NAME__"
+name = "any-proxy"
 main = "worker.js"
 compatibility_date = "2025-01-01"
 
@@ -31,30 +31,18 @@ crons = ["*/5 * * * *"]
 
 # 双绑定为模板：部署时由 GitHub Actions 按 STORAGE_BACKEND 裁剪，只保留使用的后端（d1 默认 / kv 可选）
 # D1 为默认后端：kv 表由 migrations/0001_init.sql 建立，部署时自动应用
-[[d1_databases]]
-binding = "DB"
-database_name = "any-proxy-db"
-database_id = "__D1_DATABASE_ID__"
-migrations_dir = "migrations"
 
-[[kv_namespaces]]
-binding = "SITES"
-id = "__KV_NAMESPACE_ID__"
 
-# 流媒体模式的分片持久缓存（R2）：Cache API 存不下的大分片（>4MB）与 206 分片
-# 落 R2，命中即满速返回、零回源。对象带 media:ts 元数据，由 cron 定时清理过期项；
-# 未绑定（本地测试/未配置）时自动降级为纯 Cache API 行为 —— 所以 R2 建不出来时
-# 部署脚本会直接删掉这一段，而不是让部署失败。
 [[r2_buckets]]
 binding = "MEDIA_R2"
-bucket_name = "__R2_BUCKET_NAME__"
+bucket_name = "anyproxy-media"
 
 
 # 可配置变量（非敏感）。全部可留空 —— Worker 侧均有「按请求推导或明确报错」的降级策略，
 # 不会悄悄回退到任何写死的域名 / IP / IP 段。以上变量也可由 GitHub Actions 用 --var 注入（见 deploy-cloudflare.yml）。
 [vars]
 # 管理页「手动触发健康检查」跳转链接（部署脚本按仓库地址自动填；留空则主页不显示该按钮）
-GH_ACTIONS_URL = "__GH_ACTIONS_URL__"
+GH_ACTIONS_URL = "https://github.com/zhangsen0/any-proxy/actions/workflows/healthcheck.yml"
 # PREF_DOMAINS    = "www.cloudflare.com speed.cloudflare.com"  # 候选域名池种子，优选用；留空则由面板填写
 # CF_IP_RANGES    = "104.16.0.0/13 172.64.0.0/13"              # 自定义边缘 IP 段；留空则运行时拉取官方列表并缓存
 # CF_IP_RANGES_URL = "https://api.cloudflare.com/client/v4/ips" # 边缘 IP 段数据源，可换成自建镜像

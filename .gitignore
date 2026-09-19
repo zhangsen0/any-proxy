@@ -11,3 +11,7 @@ tools/.worker.local.mjs
 # Python
 __pycache__/
 *.pyc
+
+# 本地 wrangler dev 的密钥（不要提交）
+.dev.vars
+wrangler.local.toml
