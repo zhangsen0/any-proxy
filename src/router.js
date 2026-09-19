@@ -242,50 +242,59 @@ async function handleRequest(request, env, ctx) {
    * 给客户端一个说人话的 503，而不是一份把客户端解析器炸掉的 HTML。
    */
   async function nativeSubResponse(req, subUrl, e, c2, kind) {
-    const innerUrl = new URL(subUrl);
-    for (const k of ['fmt', 'clash', 'clashyaml', 'singbox', 'sing-box', 'sing', 'b64', 'base64', 'target', 'surge', 'quanx', 'loon']) {
-      innerUrl.searchParams.delete(k);
-    }
-    const inner = new Request(innerUrl.toString(), {
-      method: 'GET',
-      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; native-sub/1; +https://github.com/zhangsen0/any-proxy)' },
-    });
-    const mixed = await vlessHandler.fetch(inner, await engineEnv(e), c2);
-    const text = await mixed.text();
-    const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
-    const share = lines.filter(l => /^(vless|trojan|ss):\/\//i.test(l));
+    // 本函数的硬约束：**任何异常都不许往上抛**。抛上去的下场是 worker.js 的全局兜底
+    // 把它渲染成伪装 404 —— 客户端看到的不是「订阅没拿到」而是「链接不存在」，
+    // 排障的人会被引到完全错误的方向（2026-09-20 真实发生过）。所以这里自己兜：
+    // 出错回说人话的 503，异常摘要放进正文，看得见、查得到、不泄漏配置。
     const say = (body, status, extra = {}) => new Response(body, {
       status,
       headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store', ...extra },
     });
-    if (!share.length) {
-      // 引擎连 mixed 都没给出来（token 不对 / 数据不在）：此时说什么都要比回 HTML 强
-      return say('订阅当前不可用：服务端没有取到节点清单（常见于存储降级中）。'
-        + '链接本身没错，稍后重试；若持续，请进管理面板看顶部运行模式。', 503);
-    }
-    // 引擎在 mixed 响应上带的流量信息头（Subscription-Userinfo 等）原样透传
-    const info = {};
-    for (const h of ['subscription-userinfo', 'profile-update-interval', 'profile-web-page-url']) {
-      const v = mixed.headers.get(h);
-      if (v) info[h] = v;
-    }
-    if (kind === 'clash') {
-      const r = renderClashYaml(share);
-      if (!r.yaml) return say(`订阅当前不可用：拿到 ${r.total} 行链接但一行都解析不出来。`, 503, info);
-      return say(r.yaml, 200, {
-        'Content-Type': 'application/x-yaml; charset=utf-8',
-        'Content-Disposition': `attachment; filename*=utf-8''${encodeURIComponent('config.yaml')}`,
+    try {
+      const innerUrl = new URL(subUrl);
+      for (const k of ['fmt', 'clash', 'clashyaml', 'singbox', 'sing-box', 'sing', 'b64', 'base64', 'target', 'surge', 'quanx', 'loon']) {
+        innerUrl.searchParams.delete(k);
+      }
+      const inner = new Request(innerUrl.toString(), {
+        method: 'GET',
+        headers: { 'User-Agent': 'Mozilla/5.0 (compatible; native-sub/1; +https://github.com/zhangsen0/any-proxy)' },
+      });
+      const mixed = await vlessHandler.fetch(inner, await engineEnv(e), c2);
+      const text = await mixed.text();
+      const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
+      const share = lines.filter(l => /^(vless|trojan|ss):\/\//i.test(l));
+      if (!share.length) {
+        // 引擎连 mixed 都没给出来（token 不对 / 数据不在）：此时说什么都要比回 HTML 强
+        return say('订阅当前不可用：服务端没有取到节点清单（常见于存储降级中）。'
+          + '链接本身没错，稍后重试；若持续，请进管理面板看顶部运行模式。', 503);
+      }
+      // 引擎在 mixed 响应上带的流量信息头（Subscription-Userinfo 等）原样透传
+      const info = {};
+      for (const h of ['subscription-userinfo', 'profile-update-interval', 'profile-web-page-url']) {
+        const v = mixed.headers.get(h);
+        if (v) info[h] = v;
+      }
+      if (kind === 'clash') {
+        const r = renderClashYaml(share);
+        if (!r.yaml) return say(`订阅当前不可用：拿到 ${r.total} 行链接但一行都解析不出来。`, 503, info);
+        return say(r.yaml, 200, {
+          'Content-Type': 'application/x-yaml; charset=utf-8',
+          'Content-Disposition': `attachment; filename*=utf-8''${encodeURIComponent('config.yaml')}`,
+          ...(r.skipped ? { 'X-Sub-Skipped-Lines': String(r.skipped) } : {}),
+          ...info,
+        });
+      }
+      const r = renderSingboxJson(share);
+      if (!r.json) return say(`订阅当前不可用：拿到 ${r.total} 行链接但一行都解析不出来。`, 503, info);
+      return say(r.json, 200, {
+        'Content-Type': 'application/json; charset=utf-8',
         ...(r.skipped ? { 'X-Sub-Skipped-Lines': String(r.skipped) } : {}),
         ...info,
       });
+    } catch (err) {
+      // 异常摘要进正文：这条 503 只会被拿着有效 token 的客户端（或排障的人）看到
+      return say('订阅本机渲染出错：' + String(err && err.message || err).slice(0, 160), 503);
     }
-    const r = renderSingboxJson(share);
-    if (!r.json) return say(`订阅当前不可用：拿到 ${r.total} 行链接但一行都解析不出来。`, 503, info);
-    return say(r.json, 200, {
-      'Content-Type': 'application/json; charset=utf-8',
-      ...(r.skipped ? { 'X-Sub-Skipped-Lines': String(r.skipped) } : {}),
-      ...info,
-    });
   }
 
   // ---- 陌生人：只允许「一个普通网站该有的东西」，其余一律伪装 404 ----
