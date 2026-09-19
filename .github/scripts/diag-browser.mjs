@@ -42,6 +42,11 @@ page.on('console', (msg) => {
 page.on('requestfailed', (r) => {
   errors.push('[requestfailed] ' + r.url().slice(0, 120) + ' — ' + ((r.failure() && r.failure().errorText) || ''));
 });
+// 顺便记账所有非 2xx 响应：那条 404 到底是什么，说清楚比猜好
+page.on('response', (r) => {
+  const s = r.status();
+  if (s >= 400) errors.push('[http ' + s + '] ' + r.url().slice(0, 140));
+});
 
 await page.setCookie({ name: 'ap_auth', value: authValue, domain: HOST, path: '/' });
 const resp = await page.goto(ORIGIN + '/__admin', { waitUntil: 'networkidle2', timeout: 45000 });
