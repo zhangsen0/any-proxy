@@ -1,7 +1,7 @@
 name: Panel Diagnose (temp)
 
-# 临时用：给线上面板做一次只读体检，定位「功能点不动」到底卡在哪一层。
-# 只用 Secrets 里的管理口令去打本站接口，不碰 Cloudflare 账号、不改任何数据。
+# 临时用：定位线上面板「点什么都没反应」的根因。
+# 只用 Secrets 里的管理口令去读本站页面，不碰 Cloudflare 账号、不改任何线上数据。
 # 查完即删。
 
 on:
@@ -10,14 +10,26 @@ on:
 jobs:
   diag:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
-      - name: Panel health check
+      - name: Install puppeteer
+        run: |
+          npm init -y >/dev/null 2>&1
+          echo "安装 puppeteer..."
+          npm i puppeteer@23 2>&1 | tail -5
+          echo "--- 校验 ---"
+          node -e "require.resolve('puppeteer'); console.log('puppeteer 可用')" || echo "puppeteer 不可用"
+      - name: API & consistency check
         env:
           PROXY_HOST: ${{ vars.PROXY_HOST }}
           PASSWORD: ${{ secrets.PASSWORD }}
         run: node .github/scripts/diag-panel.mjs
+      - name: Browser render check (capture console errors)
+        env:
+          PROXY_HOST: ${{ vars.PROXY_HOST }}
+          PASSWORD: ${{ secrets.PASSWORD }}
+        run: node .github/scripts/diag-browser.mjs
