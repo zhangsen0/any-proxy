@@ -212,6 +212,42 @@ const MUTANTS = [
     from: '    text = appendSeedVars(text, seed)',
     to: '    text = text',
   },
+  // ---- 配额打满时还能不能发版（迁移失败不许再退回到「发不了版」）----
+  {
+    file: 'prepare',
+    check: 'wrangler',
+    name: '迁移失败就退出（配额打满直接发不了版）',
+    from: '        check=False,\n        capture_output=True,',
+    to: '        check=True,\n        capture_output=True,',
+  },
+  {
+    file: 'prepare',
+    check: 'wrangler',
+    name: '迁移失败了却一声不响（放行变成静默失败）',
+    from: "        print('::error::[d1 migrations] ' + line)",
+    to: '        pass',
+  },
+  {
+    file: 'prepare',
+    check: 'wrangler',
+    name: '写盘排到迁移之后（wrangler 读到没渲染的占位符）',
+    from: "    with open(path, 'w', encoding='utf-8') as fh:\n        fh.write(text)",
+    to: "    apply_migrations()\n    with open(path, 'w', encoding='utf-8') as fh:\n        fh.write(text)",
+  },
+  {
+    file: 'prepare',
+    check: 'wrangler',
+    name: '迁移之后又把配置重写一遍（迁移时读到的不是最终产物）',
+    from: "        log('d1 模式：迁移已应用')\n        return",
+    to: "        log('d1 模式：迁移已应用')\n        _f = open('wrangler.toml', 'a'); _f.write('\\n# 变异\\n'); _f.close()\n        return",
+  },
+  {
+    file: 'prepare',
+    check: 'wrangler',
+    name: '摘要写成空操作（运行详情页上看不出这次没建表）',
+    from: 'def summarize(lines):\n    """写进 Actions 的运行摘要。日志看不看随缘，摘要是这次部署躲不掉的一页。"""',
+    to: 'def summarize(lines):\n    return\n    """写进 Actions 的运行摘要。日志看不看随缘，摘要是这次部署躲不掉的一页。"""',
+  },
   // ---- 面板：用户提出的原话是「在网站显眼的位置显示当前的运行模式」----
   {
     file: 'admin',

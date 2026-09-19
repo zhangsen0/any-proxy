@@ -147,7 +147,11 @@ section('5. 真跑：迁移时磁盘上已经是渲染好的配置');
   const bin = join(dir, 'bin');
   const dump = join(dir, 'seen.toml');
   mkdirSync(bin, { recursive: true });
-  writeFileSync(join(bin, 'npx'), '#!/bin/sh\ncat wrangler.toml > "' + dump + '"\nexit 0\n', { mode: 0o755 });
+  // 只记录**第一次**被调用时看到的内容：关心的是「迁移被触发那一刻磁盘上是什么」。
+  // 用覆盖写的话，万一有人在写盘之前提前触发了一次迁移，最后留下的反而是好的那份。
+  writeFileSync(join(bin, 'npx'),
+    '#!/bin/sh\nif [ ! -f "' + dump + '" ]; then cat wrangler.toml > "' + dump + '"; fi\nexit 0\n',
+    { mode: 0o755 });
   const file = join(dir, 'wrangler.toml');
   copyFileSync(join(ROOT, 'wrangler.toml'), file);
   const r = spawnSync('python3', [SCRIPT], {
@@ -160,18 +164,62 @@ section('5. 真跑：迁移时磁盘上已经是渲染好的配置');
     },
     encoding: 'utf8',
   });
+  const out5 = ((r.stdout || '') + (r.stderr || '')).trim();
   const seen = (() => { try { return readFileSync(dump, 'utf8'); } catch { return ''; } })();
+  const finalText = readFileSync(file, 'utf8');
   rmSync(dir, { recursive: true, force: true });
 
-  ok('脚本正常退出', r.status === 0, ((r.stdout || '') + (r.stderr || '')).trim());
+  ok('脚本正常退出', r.status === 0, out5);
   ok('迁移确实被调用了（假 npx 拿到了文件）', seen.length > 0);
   ok('迁移时读到的 D1 ID 已经是真值', seen.includes(D1_TEST));
   ok('迁移时读到的配置里没有占位符', placeholdersOf(seen).length === 0, placeholdersOf(seen).join(',') || '—');
-  // 顺序本身也钉一下：写盘必须排在迁移之前，否则上面三条迟早被改回去
-  const atWrite = script.indexOf('fh.write(text)');
-  const atMigrate = script.indexOf("'migrations', 'apply'");
-  ok('写盘语句排在迁移之前（不是靠巧合）', atWrite > 0 && atMigrate > 0 && atWrite < atMigrate,
-    `write@${atWrite} / migrate@${atMigrate}`);
+  // 顺序不靠行号证明（曾经用源码里两句的出现先后判过，后来把迁移抽成函数、
+  // 函数定义自然排到写盘之前，行号就「判定」成违规了，可行为完全正确）——
+  // 真正的证据是：迁移那一刻磁盘上的内容，必须与脚本最终写出的内容逐字节相同。
+  // 写盘若晚于迁移，npx 抄到的就是没渲染的占位符版本，两者必然不同。
+  ok('迁移时读到的已经是最终产物（写盘在迁移之前且之后没被覆写）',
+    seen.length > 0 && seen === finalText,
+    `seen ${seen.length}B / final ${finalText.length}B`);
+}
+
+// ===================== 5.5 迁移失败不许让发版停在这里 =====================
+section('5.5 真跑：迁移失败不阻断部署（配额打满时仍能发版）');
+{
+  // 真事故：D1 配额打满时 wrangler 连迁移都跑不通，整个 workflow 就红在建表这步，
+  // 于是 Worker 既没更新、d1 绑定也没上去 —— 一次额度超限升级成「发不了版」。
+  // 这里用会砸锅的假 npx 复现它，要求部署照样执行完，只是必须喊得够响。
+  const dir = mkdtempSync(join(tmpdir(), 'ap-wrangler-migfail-'));
+  const bin = join(dir, 'bin');
+  mkdirSync(bin, { recursive: true });
+  writeFileSync(join(bin, 'npx'), '#!/bin/sh\necho "exceeded quota" >&2\nexit 1\n', { mode: 0o755 });
+  const file = join(dir, 'wrangler.toml');
+  const summary = join(dir, 'summary.md');
+  copyFileSync(join(ROOT, 'wrangler.toml'), file);
+  const r = spawnSync('python3', [SCRIPT], {
+    cwd: dir,
+    env: {
+      PATH: bin + ':' + (process.env.PATH || '/usr/bin:/bin'),
+      STORAGE_BACKEND: 'd1',
+      D1_DATABASE_ID: D1_TEST,
+      GITHUB_REPOSITORY: 'alice/any-proxy',
+      GITHUB_STEP_SUMMARY: summary,
+    },
+    encoding: 'utf8',
+  });
+  const outF = ((r.stdout || '') + (r.stderr || '')).trim();
+  const finalText = readFileSync(file, 'utf8');
+  const sum = (() => { try { return readFileSync(summary, 'utf8'); } catch { return ''; } })();
+  rmSync(dir, { recursive: true, force: true });
+
+  ok('迁移失败时脚本仍然正常退出（部署不被卡住）', r.status === 0, outF.slice(-240));
+  ok('wrangler.toml 照样渲染完成（还能带着 d1 绑定上线）',
+    finalText.includes('[[d1_databases]]') && finalText.includes(D1_TEST));
+  // 「允许失败」的前提是躲不掉：annotation 让运行详情页标红，摘要写明后果与收尾动作
+  ok('日志里打出了 error annotation', outF.includes('::error::'), '');
+  ok('运行摘要写下了这次没建表', sum.includes('没跑成') || sum.includes('跳过'), sum.slice(0, 60) || '（摘要是空的）');
+  ok('摘要里给了配额恢复后的三步收尾',
+    sum.includes('检测存储') && sum.includes('写回存储') && sum.includes('切回存储模式'),
+    '缺哪一步就看这里');
 }
 
 section('6. 真跑：本地模式');
