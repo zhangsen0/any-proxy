@@ -26,8 +26,17 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
-const TARGET = join(ROOT, 'src/memstore.js');
-const CHECK = join(ROOT, 'tools/check-storage.mjs');
+const FILES = {
+  memstore: join(ROOT, 'src/memstore.js'),
+  seedtool: join(ROOT, 'tools/export-seed.mjs'),
+  prepare: join(ROOT, '.github/scripts/prepare-deploy.py'),
+};
+// 每个变异跑哪一套自检：改动落在哪个环节，就由盯那个环节的那套来咬。
+// 默认 storage —— 内存模式这条链路上大部分约束都由它看
+const CHECKS = {
+  storage: join(ROOT, 'tools/check-storage.mjs'),
+  wrangler: join(ROOT, 'tools/check-wrangler.mjs'),
+};
 
 // ===================== 变异清单 =====================
 //
@@ -35,6 +44,7 @@ const CHECK = join(ROOT, 'tools/check-storage.mjs');
 // 加新约束时，请同时在这张表里加一行 —— 没有牙齿的约定等于没写。
 const MUTANTS = [
   {
+    file: 'memstore',
     name: '一次成功不清零（抖动会被误判成挂了）',
     from: 'const ok = () => { s.fails = 0; };',
     to: 'const ok = () => { };',
@@ -100,19 +110,93 @@ const MUTANTS = [
     to: '  s.mem.set(k, value === null || value === undefined ? null : String(value));',
   },
   {
+    file: 'memstore',
     name: '手动切内存不预加载（面板一片空白）',
     from: 'async function preload(s) {\n  const raw = s.raw;',
     to: 'async function preload(s) {\n  return { ok: true, loaded: 0, failed: 0, truncated: false };\n  const raw = s.raw;',
+  },
+  {
+    file: 'memstore',
+    name: '只认单个 SEED_JSON（分片全部被忽略，站点起不来却没有报错）',
+    from: 'const m = /^SEED_JSON(?:_(\\d+))?$/i.exec(name);',
+    to: "const m = /^SEED_JSON$/i.exec(name);",
+  },
+  {
+    file: 'memstore',
+    name: '分片不按序号排（灌进内存的内容前后颠倒）',
+    from: 'hit.sort((a, b) => a.seq - b.seq);',
+    to: 'void hit;',
+  },
+  {
+    file: 'seedtool',
+    name: '分片从多字节字符中间切开（汉字过一趟变量存储就坏掉）',
+    from: 'while (end > start && (bytes[end] & 0xc0) === 0x80) end--;',
+    to: 'while (false) end--;',
+  },
+  {
+    file: 'seedtool',
+    name: '不过滤统计类键（几百 KB 的流水被当成种子）',
+    from: 'if (skip.some((p) => k.startsWith(p))) { dropped.push(k); continue; }',
+    to: 'if (false) { dropped.push(k); continue; }',
+  },
+  {
+    file: 'seedtool',
+    name: 'SQL 里的转义引号不还原（每个值都被拦腰截断）',
+    from: `if (tuple[i + 1] === "'") { out += "'"; i += 2; continue; }`,
+    to: 'if (false) { i += 2; continue; }',
+  },
+  {
+    file: 'seedtool',
+    name: '分片数超上限不给信号（部署才发现变量不够用）',
+    from: 'return { parts, overflow: parts.length > maxParts };',
+    to: 'return { parts, overflow: false };',
+  },
+  // ---- 部署环节：把种子写进 wrangler.toml 这一步，错一点都不会报错 ----
+  {
+    file: 'prepare',
+    check: 'wrangler',
+    name: '漏贴一段也不查（部署出一个读着半份数据的站点）',
+    from: '    if used:\n        missing =',
+    to: '    if False:\n        missing =',
+  },
+  {
+    file: 'prepare',
+    check: 'wrangler',
+    name: '把仓库变量一股脑塞进 [vars]（部署时与命令行 --var 打架）',
+    from: "    names = ['SEED_JSON'] + ['SEED_JSON_%02d' % i for i in range(1, SEED_MAX_PARTS + 1)]",
+    to: '    names = sorted(env.keys())',
+  },
+  {
+    file: 'prepare',
+    check: 'wrangler',
+    name: '种子追加到 [vars] 之外（TOML 里出现同名表，部署直接失败）',
+    from: "    if marker in text:\n        # 必须插进已有的 [vars] 表里面：TOML 不允许同名表出现两次\n        return text.replace(marker, marker + block, 1)",
+    to: '    if False:\n        return text.replace(marker, marker + block, 1)',
+  },
+  {
+    file: 'prepare',
+    check: 'wrangler',
+    name: '种子值不转义（值里的引号把配置文件写坏）',
+    from: "lines.append('%s = %s' % (name, json.dumps(value)))",
+    to: "lines.append('%s = \"%s\"' % (name, value))",
+  },
+  {
+    file: 'prepare',
+    check: 'wrangler',
+    name: '根本不把种子写进配置（站点起来却读不到任何数据）',
+    from: '    text = appendSeedVars(text, seed)',
+    to: '    text = text',
   },
 ];
 
 // ===================== 执行 =====================
 
-const original = readFileSync(TARGET, 'utf8');
+const original = {};
+for (const [k, f] of Object.entries(FILES)) original[k] = readFileSync(f, 'utf8');
 let restored = false;
 function restore() {
   if (restored) return;
-  writeFileSync(TARGET, original);
+  for (const [k, f] of Object.entries(FILES)) writeFileSync(f, original[k]);
   restored = true;
 }
 // 无论怎么退出的（含 Ctrl-C、断言抛错），都不能把改坏的实现留在磁盘上
@@ -125,17 +209,19 @@ let fail = 0;
 const failures = [];
 
 for (const m of MUTANTS) {
-  if (!original.includes(m.from)) {
+  const key = m.file || 'memstore';
+  const file = FILES[key];
+  if (!original[key].includes(m.from)) {
     fail++;
-    failures.push(m.name + '（锚点失效，改了吗？）');
-    console.log(`  ❌ ${m.name}\n      锚点已不在 memstore.js 里，这条变异没法做了`);
+    failures.push(m.name + '（锚点失效，这条约束改了吗？）');
+    console.log(`  ❌ ${m.name}\n      锚点已不在 ${key} 里，这条变异没法做了`);
     continue;
   }
-  writeFileSync(TARGET, original.replace(m.from, m.to));
+  writeFileSync(file, original[key].replace(m.from, m.to));
   let out = '';
   let code = 0;
   try {
-    out = execFileSync('node', [CHECK], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+    out = execFileSync('node', [CHECKS[m.check || 'storage']], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
   } catch (e) {
     out = String((e.stdout || '') + (e.stderr || ''));
     code = e.status === undefined ? 1 : e.status;

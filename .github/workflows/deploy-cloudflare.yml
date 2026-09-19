@@ -43,6 +43,13 @@ jobs:
       DISGUISE_CONTACT: ${{ vars.DISGUISE_CONTACT }}
       DISGUISE_PATH: ${{ secrets.DISGUISE_PATH }}
       DISGUISE_TOKEN: ${{ secrets.DISGUISE_TOKEN }}
+      # 内存模式的种子：D1 / KV 配额打满时用它把数据灌回内存，让站点不依赖任何存储也能起来。
+      # 单个环境变量上限 5 KB（付费计划同样是 5 KB），所以种子要分成若干段 ——
+      # 用 node tools/export-seed.mjs --chunk 4096 导出，再按它给出的变量名依次填到仓库的
+      # Variables 里（SEED_JSON、SEED_JSON_01、SEED_JSON_02 ……，最多 24 段约 120 KB）。
+      # 部署脚本从这里拿完整变量清单、只挑出种子那几段 —— 所以新增分段不用改这个文件。
+      # ⚠️ 只写进 /tmp 的文件，不往日志里打印（里面有站点配置）。
+      REPO_VARS_JSON: ${{ toJSON(vars) }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -59,7 +66,14 @@ jobs:
       - name: Prepare config
         # 渲染 wrangler.toml 的占位符（缺的自动创建 Cloudflare 资源），并按 STORAGE_BACKEND
         # 裁剪绑定、d1 模式应用迁移；控制逻辑见 .github/scripts/prepare-deploy.py
-        run: python3 .github/scripts/prepare-deploy.py
+        run: |
+          # 仓库变量整份交给脚本，脚本自己挑种子那几段（新增分段不必改这里）。
+          # 走文件而不是命令行参数：内容里有站点配置，不该出现在进程列表或日志里。
+          printf '%s' "$REPO_VARS_JSON" > /tmp/repo-vars.json
+          python3 .github/scripts/prepare-deploy.py
+          rm -f /tmp/repo-vars.json
+        env:
+          REPO_VARS_FILE: /tmp/repo-vars.json
 
       - name: Deploy Worker
         # 非敏感配置用 --var 注入；缺失的变量不传（Worker 侧回退到请求 hostname / 面板配置，不会写到别人的域名上）

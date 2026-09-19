@@ -396,6 +396,89 @@ console.log('\n[13] 写失败要抛出去：调用方靠这个异常做重试');
   resetState(raw, env);
 }
 
+// ===================== 14. 种子分片：绕不过去的 5 KB =====================
+console.log('\n[14] 单个变量上限 5 KB：种子必须分片，且拼回来要与原来逐字节相同');
+{
+  const { pickEntries, splitSeed, parseSqlDump, seedVarName, MAX_PARTS } =
+    await import('./export-seed.mjs');
+
+  // ① 导出工具不会被 import 带起来跑 CLI —— 否则下面这些断言会去联网
+  check('import 导出工具没有副作用（没跑命令行）', true);
+
+  // ② 过滤：统计类默认丢掉（量大、重建一次就有），要留也能留
+  const entries = [['APP_CONFIG', '{"a":1}'], ['site:d', '{"id":"d"}'], ['stats:2026', '一堆流水']];
+  check('默认跳过统计类键', pickEntries(entries, {}).picked.length === 2,
+    pickEntries(entries, {}).picked.map((p) => p[0]).join(','));
+  check('要留也能留下来', pickEntries(entries, { keepStats: true }).picked.length === 3);
+  check('只导出指定前缀时其它键会被丢掉',
+    pickEntries(entries, { only: ['site:'] }).picked.every(([k]) => k.startsWith('site:'))
+    && pickEntries(entries, { only: ['site:'] }).picked.length === 1);
+
+  // ③ SQL dump 解析：值里带引号是常态（站点本身就是 JSON），-split("'") 会拦腰截断
+  const dump = [
+    'CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT);',
+    "INSERT INTO kv (key,value,updated_at) VALUES ('APP_CONFIG','{\"title\":''演示''}','2026-01-01');",
+    "INSERT INTO `kv` (`key`,`value`) VALUES ('site:d','{\"id\":\"d\",\"note\":\"it''s ok\"}');",
+  ].join('\n');
+  const { rows, skipped } = parseSqlDump(dump);
+  check('两行 INSERT 都解析出来了', rows.length === 2, `解析出 ${rows.length} 行，跳过 ${skipped.length} 行`);
+  // SQL 里 '' 是转义的单引号，还原成单个 ' 才对 —— 保留两个就说明没处理转义
+  check('键与值对得上', rows.some(([k, v]) => k === 'APP_CONFIG' && v === '{"title":\'演示\'}'),
+    JSON.stringify(rows[0]));
+  check('值里的引号没有被截断（整份 JSON 都在）',
+    rows.some(([k, v]) => k === 'site:d' && v === '{"id":"d","note":"it\'s ok"}'),
+    JSON.stringify(rows[1]));
+
+  // ④ 分片：多字节字符不许被劈成两半
+  const big = { APP_CONFIG: '{"title":"' + '演示站点'.repeat(600) + '"}' };
+  const json = JSON.stringify(big);
+  const { parts, overflow } = splitSeed(json, 2048);
+  check('长了就分片', parts.length > 1, `切成 ${parts.length} 段`);
+  check('每段都不超过指定大小', parts.every((p) => Buffer.byteLength(p, 'utf8') <= 2048),
+    `最大 ${Math.max(...parts.map((p) => Buffer.byteLength(p, 'utf8')))} 字节`);
+  check('没有一段出现乱码替换符（多字节字符被劈开的特征）',
+    !parts.some((p) => p.includes('�')), parts.filter((p) => p.includes('�')).length + ' 段含 U+FFFD');
+  check('拼回来与原串逐字节相同', Buffer.compare(Buffer.from(parts.join(''), 'utf8'), Buffer.from(json, 'utf8')) === 0);
+  check('拼回来能解析成同一个对象', JSON.parse(parts.join('')).APP_CONFIG === big.APP_CONFIG);
+  check('段数没超上限时不报警', overflow === false, `段数 ${parts.length} / 上限 ${MAX_PARTS}`);
+  check('短种子不分片', splitSeed('{"a":1}', 4096).parts.length === 1);
+  check('变量名规则：主段不带后缀，其余两位数字',
+    seedVarName(0) === 'SEED_JSON' && seedVarName(1) === 'SEED_JSON_01' && seedVarName(11) === 'SEED_JSON_11',
+    [seedVarName(0), seedVarName(1), seedVarName(11)].join(','));
+
+  // ⑤ memstore 侧：把分片拼灌回内存
+  const obj2 = { APP_CONFIG: '{"x":1}', 'site:big': JSON.stringify({ id: 'big', name: '大'.repeat(300) }) };
+  const text2 = JSON.stringify(obj2);
+  const parts2 = splitSeed(text2, 300).parts;   // 300 字节 —— 必须切出好几段，否则下面一组会被跳过
+  check('测试用的种子确实被切成了多段（否则「漏一段」那一组会被静默跳过）', parts2.length > 2,
+    `切成 ${parts2.length} 段`);
+  const env2 = {};
+  // 故意**倒着**往 env 里塞：按插入顺序拼也能对上只是巧合，
+  // 换成乱序就必须靠显式排序 —— 否则这一组是全绿的假象
+  for (let i = parts2.length - 1; i >= 0; i--) env2[seedVarName(i)] = parts2[i];
+  const p3 = wrapStorage(null, env2);
+  check('分片种子被拼灌进内存', await read(p3, 'APP_CONFIG') === '{"x":1}', String(await read(p3, 'APP_CONFIG')));
+  check('跨分的那个长值完好无损', await read(p3, 'site:big') === obj2['site:big'],
+    String(await read(p3, 'site:big')).slice(0, 40) + '…');
+  check('事件里写明是几段拼的',
+    getStatus(stateOf(p3)).events.some((e) => e.kind === 'seed' && new RegExp(`${parts2.length} 段`).test(e.detail)),
+    getStatus(stateOf(p3)).events.map((e) => e.detail).join(' | '));
+  resetState(null, env2);
+
+  // ⑥ 少贴一段必须报警 —— 静默灌一半比报错难查得多
+  const env3 = { SEED_JSON: parts2[0] };
+  if (parts2.length > 1) {
+    const p4 = wrapStorage(null, env3);
+    const st4 = getStatus(stateOf(p4));
+    check('漏一段会报错而不是静默灌一半', st4.events.some((e) => e.kind === 'seed-bad-json'),
+      st4.events.map((e) => e.kind).join(','));
+    check('报错里写到「几段、共多少字节」——光说 JSON 不合法，看不出是漏贴了一段',
+      st4.events.some((e) => e.kind === 'seed-bad-json' && /1 段共 \d+ 字节/.test(e.detail)),
+      st4.events.map((e) => e.detail).join(' | '));
+    resetState(null, env3);
+  }
+}
+
 console.log(`\n=== ${fail === 0 ? '全部通过' : '存在失败'} ===`);
 if (fail) console.log('失败项：\n  - ' + failures.join('\n  - '));
 console.log(`存储降级自检：${pass} 项，失败 ${fail} 项\n`);

@@ -177,6 +177,49 @@ section('6. 真跑：本地模式');
   ok('R2 绑定在本地保留（wrangler dev 用得上）', r.text.includes('[[r2_buckets]]'));
 }
 
+// ===================== 6.5 内存模式的种子确实被写进了产物 =====================
+section('6.5 真跑：内存模式 + 种子分段');
+{
+  // 为什么这一段必须真跑：单个环境变量上限 5 KB，种子只能分段传。
+  // 分段这件事错一点点都不会报错 —— 少写一段，站点照样起得来、照样返回 200，
+  // 只是读到的站点数据是残缺的。这种失败只有在这里才拦得住。
+  const dir = mkdtempSync(join(tmpdir(), 'ap-wrangler-seed-'));
+  const varsFile = join(dir, 'repo-vars.json');
+  const head = '{"APP_CONFIG":"{\\"a\\":1}","site:d';
+  const tail = '":"{\\"id\\":\\"d\\",\\"name\\":\\"演示站\\"}"}';
+  writeFileSync(varsFile, JSON.stringify({
+    STORAGE_BACKEND: 'memory',
+    PROXY_HOST: 'p.example.com',     // 不相干的变量：不该被顺手塞进 [vars]
+    SEED_JSON: head,
+    SEED_JSON_01: tail,
+  }));
+
+  const r = runPrepare({ STORAGE_BACKEND: 'memory', REPO_VARS_FILE: varsFile });
+  ok('脚本正常退出', r.code === 0, r.log);
+  ok('渲染产物仍是合法 TOML（分段没把配置文件写坏）', r.valid);
+  ok('两段种子都进了 [vars]', r.text.includes('SEED_JSON = ') && r.text.includes('SEED_JSON_01 = '));
+  ok('拼回来正好是原本那份 JSON', (() => {
+    const m = (name) => ((new RegExp('^' + name + ' = "((?:[^"\\\\]|\\\\.)*)"$', 'm').exec(r.text) || [, ''])[1]);
+    const join = JSON.parse('"' + m('SEED_JSON') + '"') + JSON.parse('"' + m('SEED_JSON_01') + '"');
+    return join === head + tail;
+  })());
+  ok('中文站点名没被转义写坏', JSON.parse('"' + (/^SEED_JSON_01 = "((?:[^"\\]|\\.)*)"$/.exec(r.text.split('\n').find(l => l.startsWith('SEED_JSON_01')))[1]) + '"').includes('演示站'));
+  ok('只挑种子那几段（PROXY_HOST 不被重复塞进 [vars]）', !/^PROXY_HOST = /m.test(r.text));
+  ok('memory 模式下两个存储绑定都没了', !r.text.includes('[[d1_databases]]') && !r.text.includes('[[kv_namespaces]]'));
+
+  // 漏贴中间一段：必须当场报错，而不是部署出一个读着半份数据的站点
+  writeFileSync(varsFile, JSON.stringify({ SEED_JSON: head, SEED_JSON_02: tail }));
+  const missing = runPrepare({ STORAGE_BACKEND: 'memory', REPO_VARS_FILE: varsFile });
+  ok('分段编号不连续时直接报错退出', missing.code !== 0, missing.code + '');
+  ok('报错里点名缺失的到底是哪一段', /SEED_JSON_01/.test(missing.log), missing.log.slice(0, 160));
+
+  // 完全没配种子：不该留下任何多余的痕迹
+  const none = runPrepare({ STORAGE_BACKEND: 'memory' });
+  ok('没配种子时产物干净（不塞空变量）', none.code === 0 && !/SEED_JSON/.test(none.text), none.log.slice(0, 120));
+  ok('没配种子时也不报错', none.code === 0, none.log.slice(0, 120));
+  rmSync(dir, { recursive: true, force: true });
+}
+
 // ===================== 7. 部署流程接上了 =====================
 section('7. 部署流程把变量接进了脚本');
 {

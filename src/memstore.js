@@ -107,14 +107,25 @@ export function logEvent(s, kind, detail) {
 // 诚实边界：SEED_JSON 之外的键（本实例从没读过的冷门键）内存里依然没有，
 // status.memKeys 是如实给出的数字，不假装什么都救回来了。
 
+// ⚠️ 平台限制（决定了这一层的形态）：**每个环境变量上限 5 KB**，Free 计划一个 Worker
+// 只能带 64 个变量（见 Cloudflare Workers 的 Limits 页，付费计划同样是 5 KB/个）。
+// 所以「把数据灌进内存」不能指望一个大 JSON —— 站点稍多一点就装不下，而且超限是在
+// 部署那一刻才炸，错误信息里也看不出是种子太大。做法是分片：SEED_JSON 之外允许
+// SEED_JSON_01 / SEED_JSON_02 ……，按序号拼起来再解析。
+
 function seed(s, env) {
-  const rawSeed = env && (env.SEED_JSON || env.seed_json);
-  if (!rawSeed || typeof rawSeed !== 'string') return;
+  const parts = collectSeedParts(env);
+  if (!parts.length) return;
+  const rawSeed = parts.map((p) => p.value).join('');
   let obj = null;
   try {
     obj = JSON.parse(rawSeed);
   } catch (e) {
-    logEvent(s, 'seed-bad-json', String(e && e.message).slice(0, 200));
+    // 漏贴 / 串行错贴一段是最容易犯的错：这里必须把「总共几段、拼了多少字节」说清楚，
+    // 否则用户面对的只是一个 JSON 解析错误，看不出是哪一段没到位
+    const names = parts.map((p) => p.name).join(' + ');
+    logEvent(s, 'seed-bad-json',
+      `拼接后不是合法 JSON（${parts.length} 段共 ${rawSeed.length} 字节：${names}）：${String(e && e.message).slice(0, 160)}`);
     return;
   }
   if (!obj || typeof obj !== 'object' || Array.isArray(obj)) {
@@ -126,7 +137,23 @@ function seed(s, env) {
     s.mem.set(String(k), v === null || v === undefined ? null : String(v));
     n++;
   }
-  logEvent(s, 'seed', `从 SEED_JSON 灌入 ${n} 个键`);
+  logEvent(s, 'seed', `从 SEED_JSON 灌入 ${n} 个键（${parts.length} 段）`);
+}
+
+/** 收集 SEED_JSON 与它的分片，按序号排好；不存在的段不会被跳过计数 */
+export function collectSeedParts(env) {
+  if (!env) return [];
+  const hit = [];
+  for (const [name, value] of Object.entries(env)) {
+    if (typeof value !== 'string' || !value) continue;
+    const m = /^SEED_JSON(?:_(\d+))?$/i.exec(name);
+    if (!m) continue;
+    hit.push({ name, value, seq: m[1] === undefined ? -1 : Number(m[1]) });
+  }
+  // 主段在最前，其余按序号升序 —— 两段顺序错开的话，拼接结果一定解析失败并报错，
+  // 而不是悄悄灌进一半，那样比报错难查得多
+  hit.sort((a, b) => a.seq - b.seq);
+  return hit;
 }
 
 // ===================== 降级 =====================

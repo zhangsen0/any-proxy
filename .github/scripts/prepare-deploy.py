@@ -157,12 +157,86 @@ def render(text, values):
         text = text.replace('__%s__' % key, value)
     # 只查「真正生效的配置值」：注释里也会写 __XXX__ 这种泛指的说明文字，
     # 拿它当判据会让每次部署都失败在一个根本不存在的占位符上。
+    # 查只查到这一步为止 —— 后面追加的种子是**数据**不是配置：
+    # 站点配置里出现 __XXX__ 这种字面量是完全正常的，不该让整个部署失败。
     effective = re.sub(r'#[^\n]*', '', text)
     leftover = sorted(set(PLACEHOLDER_RE.findall(effective)))
     if leftover:
         sys.exit('[prepare-deploy] 还有没人管的占位符：%s（本脚本只认：%s）'
                  % ('、'.join(leftover), '、'.join(MANAGED_PLACEHOLDERS)))
     return text
+
+
+# ===================== 内存模式的种子 =====================
+#
+# D1 / KV 配额打满之后，站点凭什么还能起来：把数据导出成种子、塞进环境变量，
+# Worker 启动时直接灌进内存。它绕得开配额，是因为**环境变量不占 D1 / KV 的读写额度**。
+#
+# 平台有个绕不过去的限制：**单个环境变量上限 5 KB**，所以 `tools/export-seed.mjs`
+# 会把种子切成 SEED_JSON / SEED_JSON_01 / SEED_JSON_02 …… 若干段，这里按顺序收进来。
+# 最容易犯的错是「一段一段粘贴时漏了其中一段」——那种情况下站点照样起得来、照样返回 200，
+# 但读到的内容是残缺的，比起不来更难查。所以编号必须连续，中间断掉就直接报错退出。
+
+SEED_MAX_PARTS = 24
+
+
+def collectSeedVars(sourceEnv=None):
+    """
+    收集种子分段。
+
+    有两个来源：**优先**读「仓库变量整份」——CI 把 `toJSON(vars)` 落到一个临时文件里，
+    路径放在 REPO_VARS_FILE，这里按名字挑出 SEED_JSON* 那几段；没有这份清单时回落到
+    逐个环境变量（本地手动部署属于这一类）。走文件而不走命令行参数，是因为里面有
+    站点配置，不该出现在进程列表或日志里。
+    """
+    env = {}
+    path = (sourceEnv or os.environ).get('REPO_VARS_FILE')
+    if path and os.path.exists(path):
+        try:
+            with open(path, encoding='utf-8') as fh:
+                loaded = json.load(fh)
+            if isinstance(loaded, dict):
+                env = {str(k): str(v) for k, v in loaded.items() if isinstance(v, (str, int, float))}
+                log('从 %s 读到 %d 个仓库变量' % (path, len(env)))
+        except Exception as exc:  # noqa: BLE001 —— 读不出来就当没有，回到环境变量
+            log('仓库变量清单读不出来（%s），回落到环境变量' % exc)
+    for name, value in (sourceEnv or os.environ).items():
+        if name.startswith('SEED_JSON'):
+            env[name] = str(value)
+
+    names = ['SEED_JSON'] + ['SEED_JSON_%02d' % i for i in range(1, SEED_MAX_PARTS + 1)]
+    found = {}
+    for name in names:
+        value = str(env.get(name) or '').strip()
+        if value:
+            found[name] = value
+    if not found:
+        return []
+    used = sorted(int(n[len('SEED_JSON_'):]) for n in found if n != 'SEED_JSON')
+    if used:
+        missing = [i for i in range(1, max(used) + 1) if i not in used]
+        if missing:
+            sys.exit('[prepare-deploy] 种子的分段编号不连续，缺 %s。'
+                     '请用 node tools/export-seed.mjs --chunk 4096 重新导出，'
+                     '再按它的提示把每一段填到对应的变量里。'
+                     % '、'.join('SEED_JSON_%02d' % i for i in missing))
+    order = ['SEED_JSON'] + ['SEED_JSON_%02d' % i for i in used]
+    return [(n, found[n]) for n in order if n in found]
+
+
+def appendSeedVars(text, pairs):
+    if not pairs:
+        return text
+    lines = ['', '# 内存模式的种子（由仓库 Variables 注入；导出工具 node tools/export-seed.mjs）']
+    for name, value in pairs:
+        # json.dumps 出来的就是合法的 TOML 基本字符串（非 ASCII 会转成 \uXXXX）
+        lines.append('%s = %s' % (name, json.dumps(value)))
+    block = '\n'.join(lines) + '\n'
+    marker = '\n[vars]\n'
+    if marker in text:
+        # 必须插进已有的 [vars] 表里面：TOML 不允许同名表出现两次
+        return text.replace(marker, marker + block, 1)
+    return text.rstrip() + '\n\n[vars]\n' + block
 
 
 def main():
@@ -225,9 +299,14 @@ def main():
     # 拿到的是还没渲染的占位符，报「Expected "name" to be of type string … but got
     # "__WORKER_NAME__"」—— 而脚本自己的日志一片绿，看着像 wrangler 坏了。
     text = render(text, values)
+    # 种子是数据不是配置，所以排在占位符检查之后 —— 站点配置里出现 __XXX__ 不该让部署失败
+    seed = collectSeedVars()
+    text = appendSeedVars(text, seed)
     with open(path, 'w', encoding='utf-8') as fh:
         fh.write(text)
     log('已渲染 %s（Worker 名 %s）' % (path, values['WORKER_NAME']))
+    if seed:
+        log('内存模式种子：%d 段，共 %d 字节' % (len(seed), sum(len(v) for _, v in seed)))
 
     # ---- 4. d1 模式：建表 ----
     if backend == 'd1' and not local and not os.environ.get('ANYPROXY_SKIP_MIGRATIONS'):
