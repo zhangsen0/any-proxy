@@ -255,10 +255,16 @@ async function handleRequest(request, env, ctx) {
       for (const k of ['fmt', 'clash', 'clashyaml', 'singbox', 'sing-box', 'sing', 'b64', 'base64', 'target', 'surge', 'quanx', 'loon']) {
         innerUrl.searchParams.delete(k);
       }
+      // cf 必须带上（inner 继承原请求的全部属性，再只改 UA）：引擎会读 request.cf.colo /
+      // cf.country（国家标注与运营商识别），手写 new Request(url, {headers}) 的话 cf 是
+      // undefined，引擎一读就 TypeError —— 「undefined (reading 'colo')」就是它。
       const inner = new Request(innerUrl.toString(), {
         method: 'GET',
-        headers: { 'User-Agent': 'Mozilla/5.0 (compatible; native-sub/1; +https://github.com/zhangsen0/any-proxy)' },
+        headers: req.headers,
+        cf: req.cf,
+        redirect: 'manual',
       });
+      inner.headers.set('User-Agent', 'Mozilla/5.0 (compatible; native-sub/1; +https://github.com/zhangsen0/any-proxy)');
       const mixed = await vlessHandler.fetch(inner, await engineEnv(e), c2);
       const text = await mixed.text();
       const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
