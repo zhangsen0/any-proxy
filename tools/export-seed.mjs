@@ -29,8 +29,16 @@ import { execFileSync } from 'node:child_process';
 
 // ===================== 纯函数部分（可离线自检；这里不许出现网络调用） =====================
 
-/** 默认跳过的键：量大、且丢得起的那一类（统计重建一次就有） */
-export const DEFAULT_SKIP = ['stats:', 'st:', 'visit:', 'latency:'];
+/**
+ * 默认跳过的键：量大、且丢得起的那一类（断了也是重建一次就有）。
+ *
+ * 前缀必须照真实键名写。库里实际是 `stat:`（单数）——只写 `stats:` 的话，
+ * 整类键会静默逃过过滤，导出来的种子里混着一堆流水。这是拿线上数据真跑一遍才发现的。
+ *
+ * `geoip:` 是 IP 归属缓存（实测 2959 条），`log.json` 是访问日志（实测 88 KB）：
+ * 两者都能再生，塞进种子只会把本来就不宽裕的分片额度吃光。
+ */
+export const DEFAULT_SKIP = ['stats:', 'stat:', 'st:', 'visit:', 'latency:', 'geoip:', 'log.json'];
 
 /** Worker 的变量个数也有上限（Free 64 个，给它留几个给别的用途） */
 export const MAX_PARTS = 60;
@@ -57,6 +65,113 @@ export function pickEntries(entries, opts = {}) {
     picked.push([k, String(v)]);
   }
   return { picked, dropped };
+}
+
+/**
+ * 会被当成凭据的字段名。**默认就是从这一份里剔出去**，理由是：
+ * 种子最终要填进 GitHub 仓库的 Variables，而 Variables 是**明文**的 ——
+ * 跟 Secrets 不一样，仓库里有读权限的人就能看到，CI 日志也可能把它打出来。
+ * 生产库里的订阅令牌、伪装页令牌一旦躺进去，等于半公开。
+ */
+export const SENSITIVE_LEAF = [
+  'token', 'password', 'passwd', 'secret', 'apikey', 'api_key', 'globalapikey',
+  'apitoken', 'bottoken', 'accesskey', 'secretaccesskey', 'salt', 'email', 'accountid',
+];
+
+/**
+ * 把命中的叶子换成空串。
+ *
+ * 为什么是「清空」而不是「删掉整条键」：这些键里大多还混着普通配置
+ * （config.json 既有订阅令牌也有 HOST / UUID / 路径模板），整条删掉会让订阅功能
+ * 连带消失，反而更难看出缺了什么；清空之后前端表单是空的、功能还在，
+ * 用户照着清单补一遍就行。
+ *
+ * 为什么数组原样放过：命中路径也不处理数组成员 —— 数组里通常是 IP 列表、
+ * 白名单这类批量值，清成空串会让上层拿到一个长度不变但内容全空的列表，比留着更难查。
+ *
+ * @param {Array<[string,string]>} entries [键, 值] 列表
+ * @param {{names?: string[], except?: string[]}} [opts]
+ * @returns {{entries: Array<[string,string]>, hits: Array<{key:string,path:string,len:number}>}}
+ */
+export function scrubSecrets(entries, opts = {}) {
+  const names = Array.isArray(opts.names) ? opts.names : SENSITIVE_LEAF;
+  const except = Array.isArray(opts.except) ? opts.except : [];
+  const out = [];
+  const hits = [];
+
+  const isSecret = (path) => {
+    const low = String(path).toLowerCase();
+    if (except.some((p) => low === String(p).toLowerCase())) return false;
+    // 路径的任意一段命中都算：`CF.APIToken`、`TG.BotToken` 这种父节点已经说明性质了
+    return names.some((n) => low.split('.').some((seg) => seg.includes(n)));
+  };
+
+  for (const [k, v] of entries) {
+    if (k === null || k === undefined) continue;
+    const raw = String(v);
+    let obj = null;
+    try { obj = JSON.parse(raw); } catch { obj = null; }
+
+    // 整个值不是 JSON（比如 STATS_SALT 就是一串裸字符串）：按键名判，命中就整条清空
+    if (obj === null || typeof obj !== 'object') {
+      if (isSecret(k) && raw !== '') {
+        hits.push({ key: String(k), path: '(整条)', len: raw.length });
+        out.push([k, '']);
+      } else {
+        out.push([k, raw]);
+      }
+      continue;
+    }
+
+    let touched = false;
+    const walk = (node, path) => {
+      if (Array.isArray(node)) return node;
+      if (node && typeof node === 'object') {
+        const next = {};
+        for (const [f, sub] of Object.entries(node)) next[f] = walk(sub, path ? path + '.' + f : f);
+        return next;
+      }
+      if (node === null || node === '' || typeof node === 'boolean' || typeof node === 'number') return node;
+      if (isSecret(path)) {
+        touched = true;
+        hits.push({ key: String(k), path, len: String(node).length });
+        return '';
+      }
+      return node;
+    };
+    const next = walk(obj, '');
+    // 没动过就保留原始字符串，别为了走一趟 JSON 把用户原来的缩进/键序改掉
+    out.push([k, touched ? JSON.stringify(next) : raw]);
+  }
+  return { entries: out, hits };
+}
+
+/**
+ * 把查询接口的返回剥成 [键, 值] 列表。
+ *
+ * 这一层必须单独存在，因为它同时要吃三种形态：
+ *   · D1 的 `/raw`：行是**数组** `[k, v]`，外面还套着 results / meta
+ *   · D1 的 `/query` 与某些 SDK：行是**对象** `{ key, value }`
+ *   · 网络部分已经剥掉最外层那层壳之后剩下的部分
+ *
+ * 踩过的坑：最早把 `/raw` 当对象数组处理（`row.key`），跑起来直接
+ * `map is not a function` —— 这条路径从来没被真实响应咬过，
+ * 只看代码怎么读都像对的。现在一律按 columns 定位，不去猜第几列。
+ */
+export function cfRowsToEntries(result) {
+  const one = Array.isArray(result) ? result[0] : result;
+  const res = (one && one.results) ? one.results : one;
+  const cols = Array.isArray(res && res.columns) ? res.columns : [];
+  const rows = Array.isArray(res && res.rows) ? res.rows : [];
+  const iKey = cols.indexOf('key');
+  const iVal = cols.indexOf('value');
+  return rows
+    .map((row) => {
+      const k = Array.isArray(row) ? row[iKey < 0 ? 0 : iKey] : row.key;
+      const v = Array.isArray(row) ? row[iVal < 0 ? 1 : iVal] : row.value;
+      return [k, v];
+    })
+    .filter(([k, v]) => k !== undefined && v !== undefined);
 }
 
 /**
@@ -194,7 +309,7 @@ async function fromD1({ token, account, db, proxy }) {
     body: JSON.stringify({ sql: 'SELECT key, value FROM kv' }),
   });
   const body = parseCf(r, 'D1');
-  return (body.results || []).map((row) => [row.key, row.value]);
+  return cfRowsToEntries(body);
 }
 
 async function fromKV({ token, account, ns, proxy }) {
@@ -226,7 +341,10 @@ function fromSql(file) {
 // ===================== 命令行 =====================
 
 function parseArgs(argv) {
-  const a = { chunk: 0, out: '', proxy: process.env.HTTPS_PROXY || '', keepStats: false };
+  const a = {
+    chunk: 0, out: '', proxy: process.env.HTTPS_PROXY || '',
+    keepStats: false, scrub: true,
+  };
   for (let i = 0; i < argv.length; i++) {
     const k = argv[i];
     if (k === '--from-d1') a.src = 'd1';
@@ -240,6 +358,7 @@ function parseArgs(argv) {
     else if (k === '--out') a.out = argv[++i];
     else if (k === '--chunk') a.chunk = Number(argv[++i]);
     else if (k === '--keep-stats') a.keepStats = true;
+    else if (k === '--keep-secrets') a.scrub = false;
     else if (k === '--only') a.only = String(argv[++i]).split(',').map((s) => s.trim()).filter(Boolean);
     else if (k === '--help' || k === '-h') a.help = true;
     else die('未知参数：' + k);
@@ -257,6 +376,7 @@ const HELP = `
   --out seed.json   同时写一份完整 JSON（给本地备份用；通常超过单变量 5 KB 上限）
   --chunk 4096      按字节分片打印，并标明每段该填进哪个变量
   --keep-stats      连统计类键一起导出（默认跳过：量大且丢得起）
+  --keep-secrets    凭据也导出（默认脱敏 —— 变量是明文，见文件头说明）
   --only a,b        只导出这些前缀 / 键
   --proxy HOST:PORT 本机能出网的那条路（默认读 HTTPS_PROXY）
   -h / --help       看这个
@@ -280,8 +400,16 @@ async function main() {
   const { picked, dropped } = pickEntries(entries, { keepStats: a.keepStats, only: a.only });
   if (!picked.length) die('一个键都没取到 —— 看看过滤条件是不是太严，或者数据本来就不在这份来源里');
 
+  let list = picked;
+  let hits = [];
+  if (a.scrub) {
+    const r = scrubSecrets(picked);
+    list = r.entries;
+    hits = r.hits;
+  }
+
   const obj = {};
-  for (const [k, v] of picked) obj[k] = v;
+  for (const [k, v] of list) obj[k] = v;
   const json = JSON.stringify(obj);
   const bytes = Buffer.byteLength(json, 'utf8');
 
@@ -289,6 +417,15 @@ async function main() {
     ? `（跳过 ${dropped.length} 个：${dropped.slice(0, 5).join('、')}${dropped.length > 5 ? '…' : ''}）`
     : '';
   console.log(`\n取到 ${Object.keys(obj).length} 个键，共 ${bytes} 字节${tail}`);
+
+  // 脱敏清单必须显式打出来：清空之后功能是「还在但不好使」，不打出来就没人知道要补
+  if (hits.length) {
+    console.log(`\n  已脱敏 ${hits.length} 处凭据（Variables 是明文，这些东西不能躺进去）——`
+      + `部署后到管理面板补一遍，或加 --keep-secrets 明知故犯：`);
+    for (const h of hits) console.log(`    · ${h.key} → ${h.path}（${h.len} 位）`);
+  } else if (a.scrub) {
+    console.log('\n  没有发现凭据类字段，无需脱敏。');
+  }
 
   if (a.out) { writeFileSync(a.out, json); console.log(`已写 ${a.out}`); }
 

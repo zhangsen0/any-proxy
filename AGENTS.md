@@ -80,11 +80,11 @@ CF 边缘（workers.dev 与自定义域行为一致）会：① 改写入站 `Ac
 ## 7. 提交与部署纪律
 
 - 提交信息一律**中文**。
--   提交前跑全套：仓库里的 `tools/check-*.mjs` **一套都不能漏**（当前 22 套纯离线：
+-   提交前跑全套：仓库里的 `tools/check-*.mjs` **一套都不能漏**（当前 23 套纯离线：
   `check-rewrite / check-disguise / check-nodetag / check-anycast / check-themes / check-compress /
   check-hls / check-media / check-path / check-heal / check-smoke / check-guard / check-stats /
   check-configui / check-single-source / check-settings / check-preferred / check-cf-panel /
-  check-site-modes / check-latency / check-wrangler / check-storage`）+ `node tools/gen-manual.mjs --check`。
+  check-site-modes / check-latency / check-wrangler / check-storage / check-seed`）+ `node tools/gen-manual.mjs --check`。
   一行搞定：`for f in tools/check-*.mjs; do node "$f" || echo "FAIL $f"; done`（`check-live` 需要参数会自动退出，忽略它的 usage 提示即可）。
 - **新增 check 脚本必须同时挂进 `.github/workflows/verify.yml` 的 unit job**，
   否则它只在写它的那个人本机跑过 —— 本地跑过 ≠ 明天也被拦住。历史上一次性漏了三套
@@ -103,6 +103,16 @@ CF 边缘（workers.dev 与自定义域行为一致）会：① 改写入站 `Ac
 - **同一件事不要在多个地方各做一遍**：为了保险在三条路径上重复清理 / 重复校验，
   结果是彼此互相掩护 —— 砍掉任何一份检查都照样全绿，谁都没有资格自称是那条保证。
   要就收拢到一处，并只对那一处做牙齿验证。详见 [07-踩坑记录](./docs/07-踩坑记录.md) 第 25 条。
+- **带上真实数据跑一遍，推演出来的约束多半是错的**：
+  凡是涉及外部数据的环节（导出接口、上报格式、站内数据结构），至少拿一份真实样本跑一次。
+  本轮一次性撞出三处只有真数据才看得到的问题 —— 过滤前缀写成了 `stats:`
+  而库里实际是 `stat:`（整类键静默漏过）、D1 `/raw` 返回的行是数组而不是对象
+  （紧接着就是 `map is not a function`）、目标站自己会返回 404
+  （于是「种子完全正常」被判成失败），以及用例里的站点少给了 `host`
+  （代理根本没走，那条断言一直在验空响应）。详见 [07-踩坑记录](./docs/07-踩坑记录.md) 第 27 条。
+- **状态码不能单独当判据**：下游那个目标站自己返回的东西，状态码可能恰好也是 200/404。
+  要验「有没有用到我给的这份数据」，就用「灌数据前后打同一条请求、两边必须不同」这种相对判据 ——
+  它不依赖目标返回什么，也不依赖项目自身的兜底规则。
 - **文档里的累加数字（断言总数、清单条目数）不要手抄**：`node tools/count-asserts.mjs`
   是唯一真源。手工累加的偏差已经出过两轮 —— 一轮是三套检查从来没挂 CI 却照样登记为「全覆盖」，
   一轮是对着脚本数出来差 8 项。详见 [04-测试体系](./docs/04-测试体系.md)。

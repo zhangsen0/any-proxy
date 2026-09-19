@@ -16,6 +16,7 @@
  */
 import { readSettings, invalidateSettings } from '../src/settings.js';
 import { invalidateDoc } from '../src/config.js';
+import { invalidateSite } from '../src/sites.js';
 import { bindRuntime } from '../src/runtime.js';
 import { handleRequest } from '../src/router.js';
 import {
@@ -414,6 +415,11 @@ console.log('\n[14] 单个变量上限 5 KB：种子必须分片，且拼回来�
   check('只导出指定前缀时其它键会被丢掉',
     pickEntries(entries, { only: ['site:'] }).picked.every(([k]) => k.startsWith('site:'))
     && pickEntries(entries, { only: ['site:'] }).picked.length === 1);
+  // 库里实际的前缀是 `stat:`（单数）。只写 `stats:` 的话整类键会静默逃过过滤 ——
+  // 这不是推演出来的，是拿线上数据跑一遍才撞见的
+  check('统计键的单数前缀 stat: 也真的被跳过',
+    pickEntries([['stat:sub:2026-09-18', '一堆流水'], ['APP_CONFIG', '{"a":1}']], {}).picked.length === 1,
+    pickEntries([['stat:sub:2026-09-18', '一堆流水'], ['APP_CONFIG', '{"a":1}']], {}).picked.map((p) => p[0]).join(','));
 
   // ③ SQL dump 解析：值里带引号是常态（站点本身就是 JSON），-split("'") 会拦腰截断
   const dump = [
@@ -478,6 +484,50 @@ console.log('\n[14] 单个变量上限 5 KB：种子必须分片，且拼回来�
       st4.events.map((e) => e.detail).join(' | '));
     resetState(null, env3);
   }
+
+  // ⑦ 导出时的脱敏：Variables 是明文，凭据不能跟着躺进去
+  const { scrubSecrets, SENSITIVE_LEAF } = await import('./export-seed.mjs');
+  const secretCfg = JSON.stringify({ TOKEN: 'd662b808e0a23961eb81ce8d40647f4d', HOST: 'proxy.example.com', PORT: 443 });
+  check('词表里确实含 token / salt 这类（写错名字就一条也拦不住）',
+    SENSITIVE_LEAF.includes('token') && SENSITIVE_LEAF.includes('salt'));
+  {
+    const { entries, hits } = scrubSecrets([
+      ['APP_CONFIG', secretCfg],
+      ['DISGUISE_CONFIG', JSON.stringify({ title: '维护中', token: 'abcd1234', items: ['a', 'b'] })],
+      ['STATS_SALT', 'b13c191c183722635ae4ced8ca511311'],
+      ['PREF_IPS', '104.16.0.1\n104.16.0.2'],
+    ]);
+    const after = Object.fromEntries(entries);
+    check('凭据被识别出来并报了数', hits.length === 3, `${hits.length} 处：${hits.map((h) => h.key + '→' + h.path).join('，')}`);
+    check('对象里的凭据字段被清空', JSON.parse(after.APP_CONFIG).TOKEN === '', JSON.parse(after.APP_CONFIG).TOKEN);
+    check('同一对象里的普通字段原样保留（不能图省事整条删掉）',
+      JSON.parse(after.APP_CONFIG).HOST === 'proxy.example.com' && JSON.parse(after.APP_CONFIG).PORT === 443);
+    check('数组不被牵连（清了内容但长度不变的列表比原样更难查）',
+      JSON.parse(after.DISGUISE_CONFIG).items.length === 2);
+    check('整个值就是凭据的那种也被清掉（STATS_SALT 不是 JSON）', after.STATS_SALT === '',
+      JSON.stringify(after.STATS_SALT));
+    check('跟凭据无关的键一个都没动', after.PREF_IPS === '104.16.0.1\n104.16.0.2');
+    check('被清掉的那几位长度都要 >0（说明判据命中的是有值的字段，不是空字段）',
+      hits.every((h) => h.len > 0), hits.map((h) => h.len).join(','));
+    // 嵌套也要咬得到：`CF.APIToken` 这种父节点已经说明性质的情况最常见
+    const nested = scrubSecrets([['cf.json', JSON.stringify({ CF: { APIToken: 'cfat_x', UsageAPI: null } })]]);
+    check('嵌套在里面的凭据也躲不掉', JSON.parse(Object.fromEntries(nested.entries)['cf.json']).CF.APIToken === '',
+      JSON.stringify(Object.fromEntries(nested.entries)['cf.json']));
+    check('嵌套对象里的其它字段留着', JSON.parse(Object.fromEntries(nested.entries)['cf.json']).CF.UsageAPI === null);
+  }
+  // ⑧ D1 / KV 接口的返回形态：这一层剥错了，导出来的种子就是空的
+  const { cfRowsToEntries } = await import('./export-seed.mjs');
+  check('行是数组时按 columns 定位（/raw 端点的形态）',
+    JSON.stringify(cfRowsToEntries({ results: { columns: ['key', 'value'], rows: [['a', '1'], ['b', '2']] } })) === '[["a","1"],["b","2"]]');
+  check('行是对象时也认（/query 与 SDK 的形态）',
+    JSON.stringify(cfRowsToEntries({ results: { columns: ['key', 'value'], rows: [{ key: 'a', value: '1' }] } })) === '[["a","1"]]');
+  check('还带着最外层那层壳也剥得动（刚从接口拿回来的样子）',
+    JSON.stringify(cfRowsToEntries([{ results: { columns: ['key', 'value'], rows: [['a', '1']] }, success: true }])) === '[["a","1"]]');
+  check('列的顺序不固定也不会取错',
+    JSON.stringify(cfRowsToEntries({ results: { columns: ['value', 'key'], rows: [['1', 'a']] } })) === '[["a","1"]]',
+    JSON.stringify(cfRowsToEntries({ results: { columns: ['value', 'key'], rows: [['1', 'a']] } })));
+  check('没有 columns 时按第 0、1 位兜底',
+    JSON.stringify(cfRowsToEntries({ results: { rows: [['a', '1']] } })) === '[["a","1"]]');
 }
 
 // ===================== 15. 端到端：真的没有一个存储绑定也能跑 =====================
@@ -494,7 +544,14 @@ console.log('\n[15] 端到端：memory 后端 + 分片种子 —— 站点到底
   const { splitSeed, seedVarName } = await import('./export-seed.mjs');
 
   const appConfig = JSON.stringify({ uuid: UUID, sub_token: 'tok' });
-  const demo = JSON.stringify({ id: 'demo', slug: 'demo', name: '演示站', target: 'https://example.com', mode: 'proxy' });
+  // 字段要齐：代理引擎靠 host / scheme 拼目标地址，早期这里只给了 target，
+  // 结果整条代理路径走不下去、直接返回空 204 —— 而断言写的是「不是 500/404」，
+  // 于是**这条检查这么多次一直在验一个空响应**，从来没真的碰到站点。
+  const demo = JSON.stringify({
+    id: 'demo', slug: 'demo', name: '演示站',
+    scheme: 'https', host: 'example.com', port: null,
+    target: 'https://example.com', proxyMode: 'proxy',
+  });
   // 切得碎一点：这么小的数据也要走好几段，顺带把分段路径一起跑进去
   const { parts } = splitSeed(JSON.stringify({ APP_CONFIG: appConfig, 'site:demo': demo }), 60);
 
@@ -519,9 +576,27 @@ console.log('\n[15] 端到端：memory 后端 + 分片种子 —— 站点到底
   check('种子灌进来的事被记下了', (st.events || []).some((e) => e.kind === 'seed'),
     (st.events || []).map((e) => e.kind).join(','));
 
-  const site = await handleRequest(new Request(ORIGIN + '/p/demo/', { headers: H }), env, {});
-  check('种子里的站点真的能访问（不再依赖任何存储）', site.status !== 500 && site.status !== 404,
-    String(site.status));
+  // 判据：灌种子前后，同一条请求的响应必须不一样。
+  // 只看状态码（!= 500/404）会被目标站自己返回的东西带到沟里 —— 拿真实数据跑那一遍时，
+  // 目标站返回的就是 nginx 的 404，于是「种子正常、代理也通」被判成失败
+  // （详见 [07-踩坑记录](./docs/07-踩坑记录.md) 第 27 条）。
+  // 另外项目有「前缀丢失自愈」，未知路径会被拼到第一个站点上再代理，
+  // 所以「站点不存在」那张友好错误页通常也不会出现 —— 也不能拿它当标记。
+  const shoot = async (withParts) => {
+    const e = { PASSWORD, UUID, STORAGE_BACKEND: 'memory' };
+    if (withParts) parts.forEach((v, i) => { e[seedVarName(i)] = v; });
+    resetState(null, null);
+    invalidateSite();      // 站点与配置都有进程内缓存，不清的话第二次会读到上一次的结果
+    invalidateDoc();
+    bindRuntime(e);
+    const r = await handleRequest(new Request(ORIGIN + '/p/demo/', { headers: H }), e, {});
+    return { status: r.status, body: (await r.text()).slice(0, 4000) };
+  };
+  const hit = await shoot(true);
+  const miss = await shoot(false);
+  check('种子里的站点真的在用（不灌种子时这条请求的表现明显不同）',
+    hit.status !== miss.status || hit.body !== miss.body,
+    `有种子 HTTP ${hit.status}，没种子 HTTP ${miss.status}`);
 
   check('这一段用的种子确实分了好几段（否则等于没验分段）', parts.length > 2, `${parts.length} 段`);
 }

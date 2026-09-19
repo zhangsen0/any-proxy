@@ -229,7 +229,10 @@ def appendSeedVars(text, pairs):
         return text
     lines = ['', '# 内存模式的种子（由仓库 Variables 注入；导出工具 node tools/export-seed.mjs）']
     for name, value in pairs:
-        # json.dumps 出来的就是合法的 TOML 基本字符串（非 ASCII 会转成 \uXXXX）
+        # 变量名这里可以裸写：[vars] 里只会出现 SEED_JSON / SEED_JSON_01 这种受控的名字，
+        # 种子内容整体躺在**值**里面，不参与 TOML 结构（一度以为键名里的冒号和点会惹事，
+        # 跑真数据验过才知道担心错了，别再往这里加防御）。
+        # 值必须用 json.dumps：非 ASCII 会转成 \uXXXX，引号与反斜杠也一并转义好。
         lines.append('%s = %s' % (name, json.dumps(value)))
     block = '\n'.join(lines) + '\n'
     marker = '\n[vars]\n'

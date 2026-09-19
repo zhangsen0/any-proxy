@@ -142,6 +142,30 @@ const MUTANTS = [
   },
   {
     file: 'seedtool',
+    name: '词表里没有 stat: 这个单数前缀（线上数据就是它，整类键漏过去）',
+    from: "export const DEFAULT_SKIP = ['stats:', 'stat:', 'st:', 'visit:', 'latency:', 'geoip:', 'log.json'];",
+    to: "export const DEFAULT_SKIP = ['stats:', 'st:', 'visit:', 'latency:', 'geoip:', 'log.json'];",
+  },
+  {
+    file: 'seedtool',
+    name: '脱敏不动对象里的凭据字段（订阅令牌明文进了仓库变量）',
+    from: '      if (isSecret(path)) {',
+    to: '      if (false) {',
+  },
+  {
+    file: 'seedtool',
+    name: '脱敏不管「整个值就是凭据」那种（STATS_SALT 原样带出去）',
+    from: "      if (isSecret(k) && raw !== '') {",
+    to: '      if (false) {',
+  },
+  {
+    file: 'seedtool',
+    name: '把 D1 /raw 的返回当对象数组处理（导出直接崩，或导出来是空的）',
+    from: '      const k = Array.isArray(row) ? row[iKey < 0 ? 0 : iKey] : row.key;',
+    to: '      const k = row.key;',
+  },
+  {
+    file: 'seedtool',
     name: 'SQL 里的转义引号不还原（每个值都被拦腰截断）',
     from: `if (tuple[i + 1] === "'") { out += "'"; i += 2; continue; }`,
     to: 'if (false) { i += 2; continue; }',

@@ -96,8 +96,15 @@ function runPrepare(env, args = []) {
   });
   const text = readFileSync(file, 'utf8');
   const parsed = spawnSync('python3', ['-c', 'import sys,tomllib;tomllib.load(open(sys.argv[1],"rb"))', file], { encoding: 'utf8' });
+  // 顺手把 [vars] 整表读回来：光「能解析」还不够 —— 键名带点的时候 TOML 会
+  // 把它拆成嵌套表，照样合法，但值已经跑到 `{"config": {"json": ...}}` 里去了
+  const dumped = spawnSync('python3', ['-c',
+    'import sys,tomllib,json;print(json.dumps(tomllib.load(open(sys.argv[1],"rb")).get("vars",{}),ensure_ascii=False))',
+    file], { encoding: 'utf8' });
+  let vars = null;
+  try { vars = JSON.parse(dumped.stdout); } catch { vars = null; }
   rmSync(dir, { recursive: true, force: true });
-  return { code: r.status, log: ((r.stdout || '') + (r.stderr || '')).trim(), text, valid: parsed.status === 0 };
+  return { code: r.status, log: ((r.stdout || '') + (r.stderr || '')).trim(), text, valid: parsed.status === 0, vars };
 }
 
 section('3. 真跑：d1 模式');
@@ -194,18 +201,40 @@ section('6.5 真跑：内存模式 + 种子分段');
     SEED_JSON_01: tail,
   }));
 
+  // 键名现在是加了引号的字符串键，所以取值的正则必须两边都认（"?name"? = "…"）。
+  // 直接写 exec(...)[1] 的话，一旦匹配不上就是 null 解引用 —— 脚本崩在半路，
+  // 看的人都读不出到底哪一条坏了（见 07-踩坑记录 第 26 条）。
+  const SEED_VAL = (name) => new RegExp('^"?' + name + '"? = "((?:[^"\\\\]|\\\\.)*)"$', 'm');
+  const seedValue = (text, name) => {
+    const m = SEED_VAL(name).exec(text);
+    return m ? JSON.parse('"' + m[1] + '"') : null;
+  };
+
   const r = runPrepare({ STORAGE_BACKEND: 'memory', REPO_VARS_FILE: varsFile });
   ok('脚本正常退出', r.code === 0, r.log);
   ok('渲染产物仍是合法 TOML（分段没把配置文件写坏）', r.valid);
-  ok('两段种子都进了 [vars]', r.text.includes('SEED_JSON = ') && r.text.includes('SEED_JSON_01 = '));
-  ok('拼回来正好是原本那份 JSON', (() => {
-    const m = (name) => ((new RegExp('^' + name + ' = "((?:[^"\\\\]|\\\\.)*)"$', 'm').exec(r.text) || [, ''])[1]);
-    const join = JSON.parse('"' + m('SEED_JSON') + '"') + JSON.parse('"' + m('SEED_JSON_01') + '"');
-    return join === head + tail;
-  })());
-  ok('中文站点名没被转义写坏', JSON.parse('"' + (/^SEED_JSON_01 = "((?:[^"\\]|\\.)*)"$/.exec(r.text.split('\n').find(l => l.startsWith('SEED_JSON_01')))[1]) + '"').includes('演示站'));
+  ok('两段种子都进了 [vars]', SEED_VAL('SEED_JSON').test(r.text) && SEED_VAL('SEED_JSON_01').test(r.text));
+  ok('拼回来正好是原本那份 JSON',
+    (seedValue(r.text, 'SEED_JSON') || '') + (seedValue(r.text, 'SEED_JSON_01') || '') === head + tail,
+    String(seedValue(r.text, 'SEED_JSON')).slice(0, 60));
+  ok('中文站点名没被转义写坏', String(seedValue(r.text, 'SEED_JSON_01')).includes('演示站'),
+    String(seedValue(r.text, 'SEED_JSON_01')).slice(0, 60));
   ok('只挑种子那几段（PROXY_HOST 不被重复塞进 [vars]）', !/^PROXY_HOST = /m.test(r.text));
   ok('memory 模式下两个存储绑定都没了', !r.text.includes('[[d1_databases]]') && !r.text.includes('[[kv_namespaces]]'));
+
+  // 「键名带冒号/点」那一组曾经被当成缺陷写进来过，跑真数据验完发现是误会：
+  // TOML 的键永远只是 SEED_JSON / SEED_JSON_01 这种受控名字，种子内容整体躺在值里。
+  // 断言留不得 —— 它在验一件不可能发生的事，绿了也是假的。
+  // 真正要盯的是**值**：中文会被 json.dumps 转成 \uXXXX，错一步就是部署成功但内容坏掉。
+  writeFileSync(varsFile, JSON.stringify({
+    STORAGE_BACKEND: 'memory',
+    SEED_JSON: JSON.stringify({ 'config.json': '{"HOST":"p.example.com"}', 'site:uhdnow': '{"id":"uhdnow","name":"演示站"}' }),
+  }));
+  const rk = runPrepare({ STORAGE_BACKEND: 'memory', REPO_VARS_FILE: varsFile });
+  ok('种子里含中文与嵌套 JSON 时产物仍是合法 TOML', rk.valid, rk.log.slice(0, 160));
+  ok('种子值读回来跟原文逐字节相同（中文没在上一步被转义两次）',
+    seedValue(rk.text, 'SEED_JSON') === JSON.stringify({ 'config.json': '{"HOST":"p.example.com"}', 'site:uhdnow': '{"id":"uhdnow","name":"演示站"}' }),
+    String(seedValue(rk.text, 'SEED_JSON')).slice(0, 90));
 
   // 漏贴中间一段：必须当场报错，而不是部署出一个读着半份数据的站点
   writeFileSync(varsFile, JSON.stringify({ SEED_JSON: head, SEED_JSON_02: tail }));
