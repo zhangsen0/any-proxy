@@ -66,7 +66,9 @@ api('/__api/sites').then(r => { const sites = (r.data && r.data.sites) || []; })
 
 - **伪装（cloaking）把一切未捕获异常渲染成 404**。「某接口 404」≠「被拦截」，先怀疑 handler 抛异常。判别法：同秒同 colo 同 cookie，对比只差一个字符的兄弟路径——兄弟正常而它 404 ⇒ handler 内部问题。
 - **看路径的行为，不看名字**：路径跟着代码改名一起变，就一定是代码问题。
-- `git status` 的 `ahead N` 不可信（本机 `refs/remotes` 不落盘），核对远端一律用 `api.github.com/repos/zhangsen0/any-proxy/commits/master`。
+- `git status` 的 `ahead N` 不可信（本机 `refs/remotes` 不落盘），核对远端一律用 `api.github.com/repos/zhangsen0/any-proxy/commits/master`。用显式 URL 推送后要把引用同步回来，否则会一直显示 ahead：`git fetch <带凭据的远端 URL> master && git update-ref refs/remotes/origin/master FETCH_HEAD`。
+- **取不到数不等于没办法：优先找一条「能通的执行通道」，别退回去靠猜。** 沙箱把 `api.cloudflare.com` 与 `github.com` 都劫持到 `198.18.x`（CF API 一律 `http=000`），`gh-proxy.com` 也只代理 GitHub 自家域名；但 GitHub Actions 的 runner 网络不受此限。可行做法是「一次性 workflow 在 runner 上调外部 API → 把结果 commit 到另一个临时分支 → 本机用 git 通道 fetch 回来读」，用完删干净（结果与工作分支必须分开，否则 `on: push` 会把它自己再触发一遍）。真实案例：D1 配额被打爆的根因，靠猜连续三轮全部落空（甚至已经准备按错误的假设去改索引），取到真数后发现爆的是每日 rows read 总量，与三条猜测全没关系 —— 详见 `docs/07-踩坑记录.md` 第 32 条。
+- 调第三方 GraphQL 前**先用内省问字段名，不要猜**；分组聚合类接口（adaptive groups）返回的是采样桶而非日汇总，必须二次聚合，且时间跨度通常有硬上限。
 - 自检只断言「HTML 含某字符串」抓不到运行时错误（漏 import、契约不对、元素没填充）。**新增接口/区块一律从渲染产物里把脚本抠出来沙箱真跑一遍**（见 check-configui 第 11 段、check-stats 第 8 段的先例），或上 Puppeteer 真浏览器。真实案例：router.js 的 OPTIONS 预检分支用了 `cors()` 却漏 import，所有预检静默变成伪装 404，上线多月才被全类型实测发现（回归：check-smoke 第 8 组）。
 
 ## 5. 新写的检查必须先证明它会红（牙齿验证）
