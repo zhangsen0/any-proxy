@@ -81,6 +81,12 @@ api('/__api/sites').then(r => { const sites = (r.data && r.data.sites) || []; })
 
 **每一轮开始要把所有文件还原干净**。只还原本轮改的那一个是不够的：跨文件的变异会叠加（改了 `memstore.js` 又跑 `export-seed.mjs` 的变异，前者仍带着伤），于是「这一条变红了」可能其实是上一条的余威 —— 40 个全抓的漂亮数字底下藏着两条根本没被咬住的约束（`tools/tooth-storage.mjs` 补上逐轮全量还原后才暴露出来，连带查出「状态条是否存在」这条断言去搜类名字符串，而 CSS 里那条 `.membar {…}` 让它恒真）。每一次必须只带着这一个伤口上场。
 
+**检查要驱动真正的实现，不能誊一份副本过来比对。** 在检查脚本里重写一份被测逻辑（比如把被测的 SQL 原样抄进测试），看着是「对照」，实际是把被测物换成了一个永不变的影子 —— 实现怎么改坏，检查都全绿。`tools/check-d1list.mjs` 第一版就是这样：`tooth-d1list.mjs` 当场发现 7 个变异漏了 3 个，全是被 SQL 那条路。正确做法是给被测模块喂一个假句柄（这里是假 `db`，背后接真的 SQLite），**断言它实际下发的那条语句**。
+
+**性能／成本类约束的判据不能只看返回值。** 有一整类退化是「结果仍然正确，只是代价变了」——D1 的 `key LIKE 'x%'` 在本表索引形态下会退化成 `SCAN`，表里有多少行就扫多少行，返回的行却和索引查找一模一样，于是所有只看返回值的测试恒绿。这类约定要靠 `EXPLAIN QUERY PLAN`（断言 `SEARCH` 而不是 `SCAN`）、计数、或者定时器来验。详见 [07-踩坑记录](./docs/07-踩坑记录.md) 第 33 条：这次 rows read 打爆 500 万日限额、两条订阅同时失效，就是这么来的。
+
+**断言里的期望值交给代码算，别手打。** 手打 `'站点'` 末字符码位 +1 得到什么，第一版写成了「站奀」（实际是「站為」）—— 期望值一旦失真，红的时候人先怀疑的是数据不是断言，排障时间翻倍。
+
 **断言不要拿源码文本位置冒充运行时行为**。曾经用 `script.indexOf('A') < script.indexOf('B')` 判定「写盘排在迁移之前」，后来把迁移抽成一个函数，函数定义自然排到了写盘之前 —— 行为完全正确，行号却判定成违规。同理，比行号、比字符串出现先后、顺着源码 `grep` 某一行是否存在，都不能证明「运行时顺序／运行时发生了什么」。要验行为就把被测的东西真跑起来，然后对**它产生的副作用**下断言（比如迁移那一刻抄下来的文件内容，与最终产物逐字节比对）。做副作用采样时也要想清楚边界：那个假 `npx` 原本用覆盖写，于是「有人在写盘之前提前触发过一次迁移」这种退化反而被最后那份好内容掩盖了，改成只保留第一次才咬得住。
 
 **同一类判定只写一份，改一处之前先找同类的其它入口**。`/sub` 与 `/tsub/<id>` 各自写了一遍「要不要本机渲染」的判定，于是把 `/sub` 修好之后，临时订阅仍把 clash 交给坏掉的外部转换后端 —— 同一处单点故障，换了条路进来，「修好一头」从来不等于「修好了」。共用判定是唯一能防止这种漏网的手段。
@@ -98,11 +104,12 @@ CF 边缘（workers.dev 与自定义域行为一致）会：① 改写入站 `Ac
 ## 7. 提交与部署纪律
 
 - 提交信息一律**中文**。
--   提交前跑全套：仓库里的 `tools/check-*.mjs` **一套都不能漏**（当前 23 套纯离线：
+-   提交前跑全套：仓库里的 `tools/check-*.mjs` **一套都不能漏**（当前 25 套纯离线：
   `check-rewrite / check-disguise / check-nodetag / check-anycast / check-themes / check-compress /
   check-hls / check-media / check-path / check-heal / check-smoke / check-guard / check-stats /
   check-configui / check-single-source / check-settings / check-preferred / check-cf-panel /
-  check-site-modes / check-latency / check-wrangler / check-storage / check-seed`）+ `node tools/gen-manual.mjs --check`。
+  check-site-modes / check-latency / check-clash / check-wrangler / check-storage / check-seed /
+  check-d1list`）+ `node tools/gen-manual.mjs --check`。
   一行搞定：`for f in tools/check-*.mjs; do node "$f" || echo "FAIL $f"; done`（`check-live` 需要参数会自动退出，忽略它的 usage 提示即可）。
 - **新增 check 脚本必须同时挂进 `.github/workflows/verify.yml` 的 unit job**，
   否则它只在写它的那个人本机跑过 —— 本地跑过 ≠ 明天也被拦住。历史上一次性漏了三套
