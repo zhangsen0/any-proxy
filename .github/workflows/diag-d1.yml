@@ -1,0 +1,110 @@
+name: Diag D1 Row Count (一次性)
+
+# 一次性诊断：数清楚 kv 表到底有多少行、按前缀怎么分布。
+#
+# 为什么非得查它：任何一次 `list()` 都写成 `WHERE key LIKE 'x%' ORDER BY key`，
+# SQLite 走不到索引时就是整表扫，计费按**扫描行数**算。所以「表里几行」直接决定了
+# 一次 list 的成本 —— 不知道这个数，就没法解释 9-18 那天 rowsRead/readQueries ≈ 64。
+#
+# 上一版同样的 SQL 全部返回「(异常) 0」，原因没打印出来。这次把 HTTP 状态码和原始响应
+# 一起带出来，不再盲跑。
+#
+# 全程只读（SELECT）。查完即删：本文件与两个分支一并清掉。
+# 结果推 diag/d1-count-result 而非本分支：本分支上的 push 会再次触发本工作流。
+
+on:
+  push:
+    branches: ['diag/**']
+
+permissions:
+  contents: write
+
+jobs:
+  count:
+    runs-on: ubuntu-latest
+    env:
+      CF_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CF_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      DB_UUID: 2d033029-8ed0-4d2b-8291-b261d21bb5d6
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 统计行数与前缀分布
+        run: |
+          set -u
+          OUT=diag-result.txt
+          : > "$OUT"
+          export CF_API_TOKEN CF_ACCOUNT_ID DB_UUID
+          cat > /tmp/probe.py <<'PYEOF'
+          import json, os, sys, urllib.request, urllib.parse
+
+          TOK = os.environ['CF_API_TOKEN']
+          ACCT = os.environ['CF_ACCOUNT_ID']
+          DBID = os.environ['DB_UUID']
+          BASE = ('https://api.cloudflare.com/client/v4/accounts/%s/d1/database/%s/raw'
+                  % (ACCT, DBID))
+
+
+          def sql(q):
+              payload = json.dumps({'sql': q}).encode()
+              req = urllib.request.Request(
+                  BASE, data=payload,
+                  headers={'Authorization': 'Bearer ' + TOK,
+                           'Content-Type': 'application/json'})
+              try:
+                  with urllib.request.urlopen(req, timeout=60) as r:
+                      return r.status, json.loads(r.read())
+              except urllib.error.HTTPError as e:
+                  body = e.read()[:800]
+                  try:
+                      return e.code, json.loads(body)
+                  except Exception:
+                      return e.code, {'raw': body.decode('utf-8', 'replace')}
+              except Exception as e:
+                  return -1, {'exception': repr(e)}
+
+
+          def show(title, q):
+              print('')
+              print('== %s ==' % title)
+              code, d = sql(q)
+              print('http=%s' % code)
+              if not d.get('success'):
+                  print('  失败:', json.dumps(d.get('errors') or d, ensure_ascii=False)[:900])
+                  return
+              res = d.get('result') or []
+              rows = res[0].get('results') if res else []
+              if not rows:
+                  print('  (无结果)')
+                  return
+              cols = list(rows[0].keys())
+              w = {c: max(len(str(c)), max(len(str(r.get(c))) for r in rows)) for c in cols}
+              print('  ' + ' | '.join(str(c).ljust(w[c]) for c in cols))
+              for r in rows:
+                  print('  ' + ' | '.join(str(r.get(c)).ljust(w[c]) for c in cols))
+
+
+          show('1) 总行数', 'SELECT COUNT(*) AS n FROM kv')
+          show('2) 索引与表结构', "SELECT type, name, tbl_name FROM sqlite_master")
+          show('3) 按前缀分布（冒号前）',
+               "SELECT CASE WHEN instr(key,':')>0 THEN substr(key,1,instr(key,':')-1) "
+               "ELSE '(无冒号)' END AS pfx, COUNT(*) AS n, SUM(LENGTH(value)) AS bytes "
+               "FROM kv GROUP BY pfx ORDER BY n DESC LIMIT 40")
+          show('4) 体积最大的 12 个键',
+               'SELECT key, LENGTH(value) AS len FROM kv ORDER BY LENGTH(value) DESC LIMIT 12')
+          show('5) 键名样本 20 条', 'SELECT key FROM kv LIMIT 20')
+          PYEOF
+          python3 /tmp/probe.py 2>&1 | tee -a "$OUT"
+
+          echo "" | tee -a "$OUT"
+          echo "== 完成 $(date -u +%FT%TZ) ==" | tee -a "$OUT"
+
+      - name: 结果写回 diag/d1-count-result 分支
+        run: |
+          set -eu
+          git config user.name "diag-bot"
+          git config user.email "diag-bot@users.noreply.github.com"
+          git checkout -B diag/d1-count-result
+          git add diag-result.txt
+          git commit -m "diag: kv 表行数统计（一次性）" || echo "(无变化)"
+          git push -f origin diag/d1-count-result
