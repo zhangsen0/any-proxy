@@ -267,6 +267,13 @@ async function main() {
   if (fail) {
     console.log('\n失败项：');
     failures.forEach((f) => console.log('  - ' + f));
+    // 这套检查跑在真实的多实例环境上，而 Worker 的进程内缓存是 per-isolate 的：
+    // 上一步写进 isolate A 的值，下一步落到刚从种子灌完的 isolate B 里就读不到，
+    // 于是「写 → 立刻读」类的断言会随机红。实测同一份部署连跑三次：47/2、47/2、49/0。
+    // 再加上脚本自己的限流测试会留 429 余波，打到后面的步骤上。
+    // 所以「这次红了」不等于「有 bug」——**判据是能否稳定复现，不是单次结果**。
+    console.log('\n注意：失败项可能是单例缓存抖动，未必是真 bug。');
+    console.log('建议先重跑一两次：只有能稳定复现的失败才值得追（详见 AGENTS.md 第 5 节）。');
     process.exit(1);
   }
   console.log('线上校验全部通过');
