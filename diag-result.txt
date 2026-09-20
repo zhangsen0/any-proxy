@@ -1,0 +1,13 @@
+
+== 1) 总行数 ==
+http=200
+  RAW: [{"results": {"columns": ["n"], "rows": [[2994]]}, "success": true, "meta": {"served_by": "v3-prod", "served_by_region": "WNAM", "served_by_colo": "SJC", "served_by_primary": true, "timings": {"sql_duration_ms": 0.219}, "duration": 0.219, "changes": 0, "last_row_id": 0, "changed_db": false, "size_after": 528384, "rows_read": 2994, "rows_written": 0, "total_attempts": 1}}]
+Traceback (most recent call last):
+  File "/tmp/probe.py", line 63, in <module>
+    show('1) 总行数', 'SELECT COUNT(*) AS n FROM kv')
+  File "/tmp/probe.py", line 56, in show
+    cols = list(rows[0].keys())
+                ^^^^^^^^^^^^
+AttributeError: 'str' object has no attribute 'keys'
+
+== 完成 2026-09-20T02:53:31Z ==
