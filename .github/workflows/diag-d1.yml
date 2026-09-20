@@ -69,6 +69,9 @@ jobs:
               print('== %s ==' % title)
               code, d = sql(q)
               print('http=%s' % code)
+              # 先把原始结构打出来再解析：D1 /raw 的 result 形状已经猜错三次了，
+              # 与其一次次修解析，不如让数据自己说话。
+              print('  RAW: ' + json.dumps(d.get('result'), ensure_ascii=False)[:1200])
               if not d.get('success'):
                   print('  失败:', json.dumps(d.get('errors') or d, ensure_ascii=False)[:900])
                   return
