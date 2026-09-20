@@ -73,9 +73,20 @@ jobs:
                   print('  失败:', json.dumps(d.get('errors') or d, ensure_ascii=False)[:900])
                   return
               res = d.get('result') or []
-              rows = res[0].get('results') if res else []
+              # D1 的 /raw 返回的 result 可能是列表也可能是单个对象，两种都得认。
+              # 上一次就是死在这里（res[0] 对 dict 抛 KeyError），别再猜形状了。
+              if isinstance(res, dict):
+                  res = [res]
+              if not res:
+                  print('  (result 为空)  原始响应前 400 字:',
+                        json.dumps(d, ensure_ascii=False)[:400])
+                  return
+              rows = []
+              for part in res:
+                  rows.extend(part.get('results') or [])
               if not rows:
-                  print('  (无结果)')
+                  print('  (无结果)  原始响应前 400 字:',
+                        json.dumps(d, ensure_ascii=False)[:400])
                   return
               cols = list(rows[0].keys())
               w = {c: max(len(str(c)), max(len(str(r.get(c))) for r in rows)) for c in cols}
